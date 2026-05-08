@@ -13,7 +13,7 @@ def build_database_url(
     db_password: str,
     db_sqlite_path: str,
 ) -> str:
-    """拼接数据库连接字符串。
+    """拼接数据库连接URL字符串。
 
     Args:
         db_engine: 数据库引擎类型。
@@ -26,10 +26,10 @@ def build_database_url(
         db_sqlite_path: SQLite 数据文件路径。
 
     Returns:
-        str: 可用于 SQLModel/SQLAlchemy 的数据库连接 URL。
+        str: 可用于 SQLModel 的数据库连接 URL。
     """
     if db_engine.lower() == "sqlite":
-        return f"sqlite:///{db_sqlite_path}"
+        return f"{db_engine}+{db_driver}:///{db_sqlite_path}"
 
     return f"{db_engine.lower()}+{db_driver}://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
 
