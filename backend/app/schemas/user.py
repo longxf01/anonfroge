@@ -28,6 +28,7 @@ class UserCreate(UserBase):
             raise ValueError("两次输入的密码不一致")
         return self
 
+
 class UserUpdate(BaseModel):
     """更新用户请求模型。"""
 
@@ -57,3 +58,26 @@ class UserRead(BaseModel):
     last_login_at: datetime | None
     created_at: datetime
     updated_at: datetime
+
+
+class UserLogin(BaseModel):
+    """用户登录请求。"""
+    username: str = Field(min_length=1, max_length=50, description="用户名")
+    password: str = Field(min_length=8, max_length=128, description="密码")
+
+
+class LoginUserInfo(BaseModel):
+    """登录成功后返回的用户信息。"""
+
+    public_id: str
+    username: str
+    nickname: str | None = None
+
+
+class UserLoginResponse(BaseModel):
+    """用户登录响应。"""
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    user: LoginUserInfo
