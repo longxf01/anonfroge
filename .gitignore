@@ -24,3 +24,4 @@ dist-ssr
 *.sw?
 #data
 /docker/*/data
+data/skills

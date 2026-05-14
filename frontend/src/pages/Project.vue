@@ -388,7 +388,7 @@
         element-loading-background="rgba(13, 17, 23, 0.55)"
         size="small"
       >
-        <el-table-column prop="user_public_id" label="成员 ID" min-width="240" />
+        <el-table-column prop="user_email" label="成员 邮箱" min-width="240" />
         <el-table-column label="角色" width="160">
           <template #default="{ row }">
             <el-select
