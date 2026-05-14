@@ -14,8 +14,6 @@ const routes = [
     path: '/project',
     component: () => import('@/pages/Project.vue')
   },
-
-
 ]
 
 
