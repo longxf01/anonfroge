@@ -40,46 +40,6 @@ class UserUpdate(BaseModel):
     is_superuser: bool | None = None
     disabled_at: datetime | None = None
 
-class UserRead(BaseModel):
-    """用户响应模型。"""
-
-    model_config = ConfigDict(from_attributes=True)
-
-    public_id: str
-    username: str
-    nickname: str | None
-    email: str | None
-    avatar_url: str | None
-    sort_order: int
-    is_superuser: bool
-    disabled_at: datetime | None
-    last_login_at: datetime | None
-    created_at: datetime
-    updated_at: datetime
-
-
-class UserLogin(BaseModel):
-    """用户登录请求。"""
-    username: str = Field(min_length=1, max_length=50, description="用户名")
-    password: str = Field(min_length=8, max_length=128, description="密码")
-
-
-class LoginUserInfo(BaseModel):
-    """登录成功后返回的用户详细信息。"""
-
-    public_id: str
-    username: str
-    nickname: str | None = None
-
-
-class UserLoginResponse(BaseModel):
-    """用户登录响应。"""
-    access_token: str
-    refresh_token: str
-    token_type: str = "bearer"
-    expires_in: int
-    user: LoginUserInfo
-
 
 class UserProfileUpdate(BaseModel):
     """当前登录用户资料更新请求模型。"""
@@ -129,3 +89,63 @@ class UserAvatarUpdate(BaseModel):
         max_length=512,
         validation_alias=AliasChoices("avatar_url", "avatarUrl"),
     )
+
+
+class UserRead(BaseModel):
+    """用户响应模型。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    public_id: str
+    username: str
+    nickname: str | None
+    email: str | None
+    avatar_url: str | None
+    sort_order: int
+    is_superuser: bool
+    disabled_at: datetime | None
+    last_login_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class UserLogin(BaseModel):
+    """用户登录请求。"""
+    username: str = Field(min_length=1, max_length=50, description="用户名")
+    password: str = Field(min_length=8, max_length=128, description="密码")
+
+
+class LoginUserInfo(BaseModel):
+    """登录成功后返回的用户详细信息。"""
+
+    public_id: str
+    username: str
+    nickname: str | None = None
+
+
+class UserLoginResponse(BaseModel):
+    """用户登录响应。"""
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    user: LoginUserInfo
+
+
+class TokenRefreshRequest(BaseModel):
+    """刷新 access token 的请求。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    refresh_token: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices("refresh_token", "refreshToken"),
+    )
+
+
+class TokenRefreshResponse(BaseModel):
+    """刷新 access token 的响应。"""
+
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int

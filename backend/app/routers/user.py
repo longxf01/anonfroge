@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
+import jwt
 from fastapi import Depends, File, HTTPException, Request, Response, UploadFile, status
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -13,11 +14,13 @@ from app.schemas.user import (
     UserPasswordUpdate,
     UserProfileUpdate,
     UserRead,
+    TokenRefreshRequest,
+    TokenRefreshResponse,
     UserUpdate,
 )
 from app.services import user as user_service
 from app.schemas.user import LoginUserInfo, UserLogin, UserLoginResponse
-from app.utils.jwt_tools import create_login_tokens
+from app.utils.jwt_tools import create_access_token_from_refresh_token, create_login_tokens
 from app.utils.string_tools import verify_password
 from app.middlewares import common
 
@@ -187,6 +190,30 @@ class UserView(BaseView):
             return await user_service.upload_current_user_avatar(session, current_user_public_id, file)
         except user_service.UserServiceError as exc:
             self._raise_as_http(exc)
+
+    @route(
+        "/refresh-token",
+        methods=["POST"],
+        response_model=TokenRefreshResponse,
+        middlewares=[Depends(common.request_duration_middleware)],
+        summary="刷新 access token",
+        description="使用 refresh token 签发新的 access token。",
+    )
+    async def refresh_token(self, payload: TokenRefreshRequest) -> TokenRefreshResponse:
+        """使用 refresh token 签发新的 access token。"""
+        try:
+            tokens = await create_access_token_from_refresh_token(payload.refresh_token)
+        except (jwt.PyJWTError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="refresh token 无效或已过期",
+                headers=common.BEARER_AUTH_HEADER,
+            ) from exc
+
+        return TokenRefreshResponse(
+            access_token=str(tokens["access_token"]),
+            expires_in=int(tokens["expires_in"]),
+        )
 
     @route(
         "/{public_id}",
