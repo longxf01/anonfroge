@@ -26,7 +26,7 @@
           </el-tooltip>
 
           <el-tooltip content="设置" placement="right">
-            <button class="nav-btn" aria-label="设置" @click="showComingSoon">
+            <button class="nav-btn" aria-label="设置" @click="settingsVisible = true">
               <el-icon><Setting /></el-icon>
             </button>
           </el-tooltip>
@@ -509,6 +509,8 @@
       teleported
       @close="previewVisible = false"
     />
+
+    <Settings v-model="settingsVisible" />
   </main>
 </template>
 
@@ -557,6 +559,7 @@ import {
   type VisualStyleImageRecord,
   type VisualStyleRecord,
 } from '@/api/project'
+import Settings from '../components/Settings.vue'
 
 type ProjectDialogMode = 'create' | 'edit'
 
@@ -596,6 +599,8 @@ const candidatesLoading = ref(false)
 const inviteRole = ref<ProjectMemberRole>('editor')
 const artStylesLoading = ref(false)
 const directorStylesLoading = ref(false)
+
+const settingsVisible = ref(false)
 
 const previewVisible = ref(false)
 const previewUrls = ref<string[]>([])
