@@ -97,7 +97,7 @@
 
             <div class="tag-row">
               <el-tag class="model-tag" type="primary" effect="plain" round>
-                {{ project.art_style || '未设置风格' }}
+                {{ getArtStyleLabel(project.art_style) || project.art_style || '未设置风格' }}
               </el-tag>
               <el-tag class="ratio-tag" effect="plain" round>
                 {{ project.video_ratio }}
@@ -284,20 +284,56 @@
                 <span class="panel-card__hint">{{ activeArtStyleLabel || '未选择' }}</span>
               </header>
               <el-form-item prop="art_style" class="panel-card__field">
-                <div class="style-grid">
+                <div
+                  v-loading="artStylesLoading"
+                  class="style-grid"
+                  element-loading-background="rgba(13, 17, 23, 0.55)"
+                >
+                  <el-empty
+                    v-if="!artStylesLoading && artStylePresets.length === 0"
+                    class="style-empty"
+                    description="暂无视觉风格"
+                  />
                   <button
                     v-for="preset in artStylePresets"
-                    :key="preset.value"
+                    :key="preset.style_path"
                     type="button"
                     class="style-card"
-                    :class="{ 'is-active': projectForm.art_style === preset.value }"
-                    :style="{ '--card-bg': preset.gradient }"
-                    @click="projectForm.art_style = preset.value"
+                    :class="{ 'is-active': projectForm.art_style === preset.style_path }"
+                    @click="projectForm.art_style = preset.style_path"
                   >
-                    <span class="style-card__badge"></span>
+                    <span
+                      class="style-card__image"
+                      :style="{ backgroundImage: getArtStyleBackground(preset) }"
+                    ></span>
+                    <span class="style-card__overlay"></span>
+                    <span
+                      class="style-card__zoom"
+                      role="button"
+                      tabindex="0"
+                      aria-label="预览图片"
+                      title="预览图片"
+                      @click.stop="openStylePreview(preset)"
+                      @keydown.enter.stop.prevent="openStylePreview(preset)"
+                      @keydown.space.stop.prevent="openStylePreview(preset)"
+                    >
+                      <el-icon><ZoomIn /></el-icon>
+                    </span>
+                    <span
+                      class="style-card__edit"
+                      role="button"
+                      tabindex="0"
+                      aria-label="编辑视觉风格"
+                      title="编辑视觉风格"
+                      @click.stop="showComingSoon"
+                      @keydown.enter.stop.prevent="showComingSoon"
+                      @keydown.space.stop.prevent="showComingSoon"
+                    >
+                      <el-icon><EditPen /></el-icon>
+                    </span>
                     <span class="style-card__text">
-                      <strong>{{ preset.label }}</strong>
-                      <em>{{ preset.desc }}</em>
+                      <strong class="style-card__title">{{ preset.style_path }}</strong>
+                      <em class="style-card__subtitle">{{ preset.name }}</em>
                     </span>
                   </button>
                 </div>
@@ -315,12 +351,35 @@
                     v-for="preset in directorStylePresets"
                     :key="preset.label"
                     type="button"
-                    class="director-item"
+                    class="director-card"
                     :class="{ 'is-active': projectForm.director_manual === preset.text }"
                     @click="projectForm.director_manual = preset.text"
                   >
-                    <span class="director-item__name">{{ preset.label }}</span>
-                    <span class="director-item__chip">{{ preset.text }}</span>
+                    <span
+                      class="director-card__image"
+                      :style="{ backgroundImage: preset.gradient }"
+                    >
+                      <span class="director-card__placeholder" aria-hidden="true">
+                        <el-icon><Picture /></el-icon>
+                      </span>
+                    </span>
+                    <span class="director-card__overlay"></span>
+                    <span
+                      class="director-card__edit"
+                      role="button"
+                      tabindex="0"
+                      aria-label="编辑导演风格"
+                      title="编辑导演风格"
+                      @click.stop="showComingSoon"
+                      @keydown.enter.stop.prevent="showComingSoon"
+                      @keydown.space.stop.prevent="showComingSoon"
+                    >
+                      <el-icon><EditPen /></el-icon>
+                    </span>
+                    <span class="director-card__text">
+                      <strong class="director-card__title">{{ preset.label }}</strong>
+                      <em class="director-card__subtitle">{{ preset.text }}</em>
+                    </span>
                   </button>
                 </div>
               </el-form-item>
@@ -423,6 +482,15 @@
         </el-table-column>
       </el-table>
     </el-dialog>
+
+    <el-image-viewer
+      v-if="previewVisible"
+      :url-list="previewUrls"
+      :initial-index="previewIndex"
+      hide-on-click-modal
+      teleported
+      @close="previewVisible = false"
+    />
   </main>
 </template>
 
@@ -439,11 +507,13 @@ import {
   EditPen,
   Folder,
   List,
+  Picture,
   Plus,
   Search,
   Setting,
   SwitchButton,
   UserFilled,
+  ZoomIn,
 } from '@element-plus/icons-vue'
 import {
   createProjectApi,
@@ -453,6 +523,7 @@ import {
   inviteProjectMemberApi,
   listProjectMembersApi,
   listProjectsApi,
+  listVisualStylesApi,
   removeProjectMemberApi,
   searchProjectMemberCandidatesApi,
   searchProjectsByNameApi,
@@ -464,9 +535,19 @@ import {
   type ProjectRecord,
   type ProjectVideoMode,
   type UserRecord,
+  type VisualStyleImageRecord,
+  type VisualStyleRecord,
 } from '@/api/project'
 
 type ProjectDialogMode = 'create' | 'edit'
+
+interface ArtStylePreset {
+  style_path: string
+  name: string
+  images: VisualStyleRecord['images']
+}
+
+const DEFAULT_ART_STYLE = ''
 
 const router = useRouter()
 const projectFormRef = ref<FormInstance>()
@@ -490,13 +571,18 @@ const candidateKeyword = ref('')
 const candidates = ref<UserRecord[]>([])
 const candidatesLoading = ref(false)
 const inviteRole = ref<ProjectMemberRole>('editor')
+const artStylesLoading = ref(false)
+
+const previewVisible = ref(false)
+const previewUrls = ref<string[]>([])
+const previewIndex = ref(0)
 
 const projectForm = reactive<ProjectPayload>({
   name: '',
   intro: '',
   project_type: 'novel',
   content_type: '',
-  art_style: '3D_chinese_traditional',
+  art_style: DEFAULT_ART_STYLE,
   director_manual: '',
   video_ratio: '9:16',
   image_model: '',
@@ -505,16 +591,7 @@ const projectForm = reactive<ProjectPayload>({
   mode: 'text',
 })
 
-const artStylePresets = [
-  { value: 'japanese_anime_90s', label: '90年代日式动画', desc: '怀旧赛璐璐手绘风', gradient: 'linear-gradient(135deg, #f5d0fe, #93c5fd)' },
-  { value: 'chinese_anime_classical', label: '国风二次元古风', desc: '工笔水墨与东方意境', gradient: 'linear-gradient(135deg, #86efac, #60a5fa)' },
-  { value: '2d_flat_design', label: '2D 扁平 Flat Design', desc: '高饱和几何配色', gradient: 'linear-gradient(135deg, #e2e8f0, #94a3b8)' },
-  { value: 'urban_romance_anime', label: '成熟都市言情', desc: '日漫都市叙事质感', gradient: 'linear-gradient(135deg, #fbcfe8, #a78bfa)' },
-  { value: '3d_anime_realistic', label: '3D 动漫写实', desc: '次世代电影级渲染', gradient: 'linear-gradient(135deg, #fdba74, #818cf8)' },
-  { value: '3D_chinese_traditional', label: '国风 3D', desc: '仙侠玄幻东方美学', gradient: 'linear-gradient(135deg, #bfdbfe, #475569)' },
-  { value: 'stop_motion_clay', label: '定格动画黏土', desc: '手作温度与材质感', gradient: 'linear-gradient(135deg, #fed7aa, #7c3aed)' },
-  { value: 'live_action_classical', label: '真人古风写实', desc: '影视级实景级写实', gradient: 'linear-gradient(135deg, #cbd5e1, #0f172a)' },
-] as const
+const artStylePresets = ref<ArtStylePreset[]>([])
 
 const imageModelPresets = [
   {
@@ -593,18 +670,70 @@ const videoModelPresets = [
 ] as const
 
 const directorStylePresets = [
-  { label: '喜剧搞笑', text: '# 喜剧搞笑类型 · 导演叙事风格' },
-  { label: '青春成长', text: '# 青春成长类型 · 导演叙事风格' },
-  { label: '家庭温情', text: '# 家庭温情类型 · 导演叙事风格' },
-  { label: '历史史诗', text: '# 历史史诗类型 · 导演叙事风格' },
-  { label: '恐怖灵异', text: '# 恐怖灵异类型 · 导演叙事风格' },
-  { label: '热血少年', text: '# 热血少年类型 · 导演叙事风格' },
-  { label: '悬疑推理', text: '# 悬疑推理类型 · 导演叙事风格' },
-  { label: '心理博弈', text: '# 心理博弈类型 · 导演叙事风格' },
+  { label: '喜剧搞笑', text: '# 喜剧搞笑类型 · 导演叙事风格', gradient: 'linear-gradient(135deg, #f59e0b 0%, #ea580c 100%)' },
+  { label: '青春成长', text: '# 青春成长类型 · 导演叙事风格', gradient: 'linear-gradient(135deg, #06b6d4 0%, #0e7490 100%)' },
+  { label: '家庭温情', text: '# 家庭温情类型 · 导演叙事风格', gradient: 'linear-gradient(135deg, #f472b6 0%, #be185d 100%)' },
+  { label: '历史史诗', text: '# 历史史诗类型 · 导演叙事风格', gradient: 'linear-gradient(135deg, #a16207 0%, #44403c 100%)' },
+  { label: '恐怖灵异', text: '# 恐怖灵异类型 · 导演叙事风格', gradient: 'linear-gradient(135deg, #6d28d9 0%, #1e1b4b 100%)' },
+  { label: '热血少年', text: '# 热血少年类型 · 导演叙事风格', gradient: 'linear-gradient(135deg, #ef4444 0%, #991b1b 100%)' },
+  { label: '悬疑推理', text: '# 悬疑推理类型 · 导演叙事风格', gradient: 'linear-gradient(135deg, #475569 0%, #0f172a 100%)' },
+  { label: '心理博弈', text: '# 心理博弈类型 · 导演叙事风格', gradient: 'linear-gradient(135deg, #6366f1 0%, #312e81 100%)' },
 ] as const
 
+const toArtStylePreset = (style: VisualStyleRecord): ArtStylePreset => ({
+  style_path: style.style_path,
+  name: style.name,
+  images: style.images,
+})
+
+const getArtStyleLabel = (value: string) => (
+  artStylePresets.value.find((item) => item.style_path === value)?.style_path ?? ''
+)
+
+const getDefaultArtStyle = () => artStylePresets.value[2]?.style_path ?? DEFAULT_ART_STYLE
+
+const getArtStyleImageUrl = (preset: ArtStylePreset) => {
+  const imageUrl = preset.images[2]?.url ?? preset.images[2]?.path ?? ''
+  return /^(?:https?:|data:|\/)/.test(imageUrl) ? imageUrl : ''
+}
+
+const getArtStyleBackground = (preset: ArtStylePreset) => {
+  const imageUrl = getArtStyleImageUrl(preset)
+  return imageUrl ? `url("${imageUrl}")` : 'linear-gradient(135deg, #475569, #1e293b)'
+}
+
+const getArtStyleAllImageUrls = (preset: ArtStylePreset): string[] => {
+  return preset.images
+    .map((image: VisualStyleImageRecord) => image.url ?? image.path ?? '')
+    .filter((url: string) => /^(?:https?:|data:|\/)/.test(url))
+}
+
+const openStylePreview = (preset: ArtStylePreset) => {
+  const urls = getArtStyleAllImageUrls(preset)
+  if (urls.length === 0) {
+    ElMessage.warning('暂无可预览的图片')
+    return
+  }
+  previewUrls.value = urls
+  previewIndex.value = 0
+  previewVisible.value = true
+}
+
+const ensureArtStyleOption = (value: string) => {
+  if (!value || artStylePresets.value.some((item) => item.style_path === value)) return
+
+  artStylePresets.value = [
+    {
+      style_path: value,
+      name: '当前项目已保存的视觉风格',
+      images: [],
+    },
+    ...artStylePresets.value,
+  ]
+}
+
 const activeArtStyleLabel = computed(
-  () => artStylePresets.find((item) => item.value === projectForm.art_style)?.label ?? '',
+  () => getArtStyleLabel(projectForm.art_style),
 )
 
 const activeDirectorStyleLabel = computed(
@@ -656,6 +785,26 @@ const handleSearch = async () => {
   }
 }
 
+const loadVisualStyles = async () => {
+  artStylesLoading.value = true
+  try {
+    const { data } = await listVisualStylesApi()
+    artStylePresets.value = data.map(toArtStylePreset)
+    if (
+      projectDialogMode.value === 'create'
+      && artStylePresets.value.length > 0
+      && !artStylePresets.value.some((item) => item.style_path === projectForm.art_style)
+    ) {
+      projectForm.art_style = getDefaultArtStyle()
+    }
+  } catch (error) {
+    artStylePresets.value = []
+    ElMessage.error(getErrorMessage(error))
+  } finally {
+    artStylesLoading.value = false
+  }
+}
+
 const openCreateDialog = () => {
   projectDialogMode.value = 'create'
   editingProjectPublicId.value = ''
@@ -667,6 +816,7 @@ const openEditDialog = (project: ProjectRecord) => {
   projectDialogMode.value = 'edit'
   editingProjectPublicId.value = project.public_id
   Object.assign(projectForm, pickProjectPayload(project))
+  ensureArtStyleOption(project.art_style)
   projectDialogVisible.value = true
 }
 
@@ -828,7 +978,7 @@ const resetProjectForm = () => {
     intro: '',
     project_type: 'novel',
     content_type: '',
-    art_style: '3D_chinese_traditional',
+    art_style: getDefaultArtStyle(),
     director_manual: '',
     video_ratio: '9:16',
     image_model: '',
@@ -884,7 +1034,10 @@ const showComingSoon = () => {
   ElMessage.info('功能开发中')
 }
 
-onMounted(loadProjects)
+onMounted(() => {
+  void loadProjects()
+  void loadVisualStyles()
+})
 </script>
 
 <style scoped>
@@ -1901,6 +2054,11 @@ onMounted(loadProjects)
   scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
 }
 
+.project-dark-dialog .style-empty {
+  grid-column: 1 / -1;
+  padding: 16px 0;
+}
+
 .project-dark-dialog .style-grid::-webkit-scrollbar {
   width: 4px;
   height: 4px;
@@ -1921,95 +2079,172 @@ onMounted(loadProjects)
 
 .project-dark-dialog .style-card {
   position: relative;
-  height: 92px;
+  height: 118px;
   padding: 0;
   border-radius: 14px;
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, 0.08);
-  background:
-    linear-gradient(180deg, rgba(0, 0, 0, 0) 20%, rgba(0, 0, 0, 0.72) 100%),
-    var(--card-bg, linear-gradient(135deg, #475569, #1e293b));
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+  background-color: #1a1f29;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.22);
   cursor: pointer;
   text-align: left;
   font-family: inherit;
-  transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+  isolation: isolate;
+  transition: transform 0.22s ease, border-color 0.22s ease, box-shadow 0.22s ease;
+}
+
+.project-dark-dialog .style-card__image {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background-position: center;
+  background-size: cover;
+  background-repeat: no-repeat;
+  transform: scale(1.02);
+  transition: transform 0.55s cubic-bezier(0.22, 0.61, 0.36, 1), filter 0.3s ease;
+}
+
+.project-dark-dialog .style-card__overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background:
+    linear-gradient(180deg, rgba(7, 10, 16, 0) 36%, rgba(7, 10, 16, 0.55) 72%, rgba(7, 10, 16, 0.94) 100%),
+    radial-gradient(120% 80% at 50% 0%, rgba(255, 255, 255, 0.08) 0%, transparent 60%);
+  transition: background 0.25s ease, opacity 0.25s ease;
 }
 
 .project-dark-dialog .style-card:hover {
-  transform: translateY(-2px);
-  border-color: rgba(255, 255, 255, 0.18);
-  box-shadow: 0 18px 38px rgba(0, 0, 0, 0.24);
+  transform: translateY(-3px);
+  border-color: rgba(255, 255, 255, 0.22);
+  box-shadow: 0 22px 44px rgba(0, 0, 0, 0.36);
+}
+
+.project-dark-dialog .style-card:hover .style-card__image {
+  transform: scale(1.08);
+  filter: saturate(1.08) brightness(1.04);
 }
 
 .project-dark-dialog .style-card:focus-visible {
   outline: none;
+  border-color: rgba(147, 197, 253, 0.7);
   box-shadow:
     0 0 0 1px rgba(37, 99, 235, 0.55),
-    0 0 0 3px rgba(37, 99, 235, 0.2);
+    0 0 0 4px rgba(37, 99, 235, 0.18);
 }
 
 .project-dark-dialog .style-card.is-active {
-  border-color: rgba(37, 99, 235, 0.65);
+  border-color: rgba(96, 165, 250, 0.85);
   box-shadow:
-    0 0 0 1px rgba(37, 99, 235, 0.55),
-    0 18px 38px rgba(37, 99, 235, 0.28);
+    0 0 0 1px rgba(96, 165, 250, 0.5),
+    0 0 0 4px rgba(37, 99, 235, 0.18),
+    0 22px 44px rgba(37, 99, 235, 0.32);
 }
 
-.project-dark-dialog .style-card__badge {
+.project-dark-dialog .style-card.is-active .style-card__overlay {
+  background:
+    linear-gradient(180deg, rgba(7, 10, 16, 0) 28%, rgba(7, 10, 16, 0.6) 72%, rgba(7, 10, 16, 0.94) 100%),
+    linear-gradient(180deg, rgba(37, 99, 235, 0.22) 0%, rgba(37, 99, 235, 0) 60%);
+}
+
+.project-dark-dialog .style-card__zoom,
+.project-dark-dialog .style-card__edit {
   position: absolute;
   top: 10px;
-  left: 10px;
-  width: 32px;
-  height: 32px;
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.18);
-  border: 1px solid rgba(255, 255, 255, 0.24);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-}
-
-.project-dark-dialog .style-card.is-active .style-card__badge {
-  background: rgba(37, 99, 235, 0.45);
-  border-color: rgba(147, 197, 253, 0.65);
-}
-
-.project-dark-dialog .style-card.is-active .style-card__badge::after {
-  content: '✓';
-  position: absolute;
-  inset: 0;
+  z-index: 3;
+  width: 28px;
+  height: 28px;
   display: grid;
   place-items: center;
+  border-radius: 50%;
   color: #ffffff;
-  font-size: 16px;
-  font-weight: 700;
+  background: rgba(15, 20, 28, 0.55);
+  border: 1.5px solid rgba(255, 255, 255, 0.55);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.28);
+  cursor: pointer;
+  opacity: 0.85;
+  transform: translateY(-2px);
+  transition: opacity 0.2s ease, transform 0.2s ease, background 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.project-dark-dialog .style-card__zoom { left: 10px; }
+.project-dark-dialog .style-card__edit { right: 10px; }
+
+.project-dark-dialog .style-card__zoom .el-icon,
+.project-dark-dialog .style-card__edit .el-icon {
+  font-size: 14px;
   line-height: 1;
+}
+
+.project-dark-dialog .style-card:hover .style-card__zoom,
+.project-dark-dialog .style-card:hover .style-card__edit,
+.project-dark-dialog .style-card:focus-within .style-card__zoom,
+.project-dark-dialog .style-card:focus-within .style-card__edit {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.project-dark-dialog .style-card__zoom:hover,
+.project-dark-dialog .style-card__zoom:focus-visible {
+  outline: none;
+  background: rgba(15, 20, 28, 0.78);
+  border-color: rgba(255, 255, 255, 0.95);
+  box-shadow:
+    0 0 0 3px rgba(255, 255, 255, 0.18),
+    0 6px 14px rgba(0, 0, 0, 0.4);
+}
+
+.project-dark-dialog .style-card__edit:hover,
+.project-dark-dialog .style-card__edit:focus-visible {
+  outline: none;
+  color: #ffffff;
+  background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+  border-color: rgba(255, 255, 255, 0.95);
+  box-shadow:
+    0 0 0 3px rgba(37, 99, 235, 0.28),
+    0 6px 14px rgba(37, 99, 235, 0.45);
 }
 
 .project-dark-dialog .style-card__text {
   position: absolute;
-  left: 10px;
-  right: 10px;
-  bottom: 10px;
+  left: 12px;
+  right: 12px;
+  bottom: 11px;
+  z-index: 2;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
   color: #ffffff;
-  font-size: 12px;
-  line-height: 1.3;
-  font-weight: 700;
-  text-shadow: 0 2px 8px rgba(0, 0, 0, 0.36);
+  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.55);
 }
 
-.project-dark-dialog .style-card__text strong {
-  font-size: 13px;
+.project-dark-dialog .style-card__title {
+  font-size: 14px;
   font-weight: 700;
+  letter-spacing: -0.2px;
+  line-height: 1.25;
+  color: #ffffff;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.project-dark-dialog .style-card__text em {
+.project-dark-dialog .style-card__subtitle {
   font-style: normal;
+  font-size: 11.5px;
   font-weight: 500;
-  opacity: 0.85;
+  line-height: 1.35;
+  color: rgba(229, 235, 244, 0.78);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: color 0.2s ease;
+}
+
+.project-dark-dialog .style-card.is-active .style-card__subtitle {
+  color: rgba(219, 234, 254, 0.9);
 }
 
 /* 导演风格 chip 网格（参考 chip-grid） */
@@ -2043,65 +2278,187 @@ onMounted(loadProjects)
   background-color: rgba(255, 255, 255, 0.28);
 }
 
-.project-dark-dialog .director-item {
+.project-dark-dialog .director-card {
+  position: relative;
+  height: 118px;
+  padding: 0;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background-color: #1a1f29;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.22);
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+  isolation: isolate;
+  transition: transform 0.22s ease, border-color 0.22s ease, box-shadow 0.22s ease;
+}
+
+.project-dark-dialog .director-card__image {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: grid;
+  place-items: center;
+  background-position: center;
+  background-size: cover;
+  background-repeat: no-repeat;
+  transform: scale(1.02);
+  transition: transform 0.55s cubic-bezier(0.22, 0.61, 0.36, 1), filter 0.3s ease;
+}
+
+.project-dark-dialog .director-card__placeholder {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
+  color: rgba(255, 255, 255, 0.78);
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px dashed rgba(255, 255, 255, 0.32);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  margin-bottom: 28px;
+  transition: color 0.25s ease, background 0.25s ease, border-color 0.25s ease, transform 0.25s ease;
+}
+
+.project-dark-dialog .director-card__placeholder .el-icon {
+  font-size: 22px;
+  line-height: 1;
+}
+
+.project-dark-dialog .director-card__overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background:
+    linear-gradient(180deg, rgba(7, 10, 16, 0) 36%, rgba(7, 10, 16, 0.55) 72%, rgba(7, 10, 16, 0.94) 100%),
+    radial-gradient(120% 80% at 50% 0%, rgba(255, 255, 255, 0.08) 0%, transparent 60%);
+  transition: background 0.25s ease, opacity 0.25s ease;
+}
+
+.project-dark-dialog .director-card:hover {
+  transform: translateY(-3px);
+  border-color: rgba(255, 255, 255, 0.22);
+  box-shadow: 0 22px 44px rgba(0, 0, 0, 0.36);
+}
+
+.project-dark-dialog .director-card:hover .director-card__image {
+  transform: scale(1.06);
+  filter: saturate(1.08) brightness(1.04);
+}
+
+.project-dark-dialog .director-card:hover .director-card__placeholder {
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.18);
+  border-color: rgba(255, 255, 255, 0.5);
+  transform: scale(1.04);
+}
+
+.project-dark-dialog .director-card:focus-visible {
+  outline: none;
+  border-color: rgba(147, 197, 253, 0.7);
+  box-shadow:
+    0 0 0 1px rgba(37, 99, 235, 0.55),
+    0 0 0 4px rgba(37, 99, 235, 0.18);
+}
+
+.project-dark-dialog .director-card.is-active {
+  border-color: rgba(96, 165, 250, 0.85);
+  box-shadow:
+    0 0 0 1px rgba(96, 165, 250, 0.5),
+    0 0 0 4px rgba(37, 99, 235, 0.18),
+    0 22px 44px rgba(37, 99, 235, 0.32);
+}
+
+.project-dark-dialog .director-card.is-active .director-card__overlay {
+  background:
+    linear-gradient(180deg, rgba(7, 10, 16, 0) 28%, rgba(7, 10, 16, 0.6) 72%, rgba(7, 10, 16, 0.94) 100%),
+    linear-gradient(180deg, rgba(37, 99, 235, 0.22) 0%, rgba(37, 99, 235, 0) 60%);
+}
+
+.project-dark-dialog .director-card__edit {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 3;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: #ffffff;
+  background: rgba(15, 20, 28, 0.55);
+  border: 1.5px solid rgba(255, 255, 255, 0.55);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.28);
+  cursor: pointer;
+  opacity: 0.85;
+  transform: translateY(-2px);
+  transition: opacity 0.2s ease, transform 0.2s ease, background 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.project-dark-dialog .director-card__edit .el-icon {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.project-dark-dialog .director-card:hover .director-card__edit,
+.project-dark-dialog .director-card:focus-within .director-card__edit {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.project-dark-dialog .director-card__edit:hover,
+.project-dark-dialog .director-card__edit:focus-visible {
+  outline: none;
+  color: #ffffff;
+  background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+  border-color: rgba(255, 255, 255, 0.95);
+  box-shadow:
+    0 0 0 3px rgba(37, 99, 235, 0.28),
+    0 6px 14px rgba(37, 99, 235, 0.45);
+}
+
+.project-dark-dialog .director-card__text {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 11px;
+  z-index: 2;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 0;
-  border: none;
-  background: transparent;
-  text-align: center;
-  cursor: pointer;
-  font-family: inherit;
-  transition: transform 0.18s ease;
-}
-
-.project-dark-dialog .director-item__name {
-  font-size: 15px;
-  font-weight: 700;
-  color: #e9edf3;
-  transition: color 0.18s ease;
-}
-
-.project-dark-dialog .director-item__chip {
-  min-height: 36px;
-  padding: 8px 10px;
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  color: #cfd8e3;
-  font-size: 12px;
-  line-height: 1.35;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: background-color 0.18s ease, border-color 0.18s ease, color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
-}
-
-.project-dark-dialog .director-item:hover .director-item__chip {
-  background: rgba(255, 255, 255, 0.06);
-  border-color: rgba(255, 255, 255, 0.14);
+  gap: 3px;
   color: #ffffff;
-  transform: translateY(-1px);
+  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.55);
 }
 
-.project-dark-dialog .director-item:focus-visible {
-  outline: none;
+.project-dark-dialog .director-card__title {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: -0.2px;
+  line-height: 1.25;
+  color: #ffffff;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.project-dark-dialog .director-item:focus-visible .director-item__chip {
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.18);
+.project-dark-dialog .director-card__subtitle {
+  font-style: normal;
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.35;
+  color: rgba(229, 235, 244, 0.78);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: color 0.2s ease;
 }
 
-.project-dark-dialog .director-item.is-active .director-item__name {
-  color: #93c5fd;
-}
-
-.project-dark-dialog .director-item.is-active .director-item__chip {
-  background: rgba(37, 99, 235, 0.16);
-  border-color: rgba(37, 99, 235, 0.45);
-  color: #dbeafe;
-  box-shadow: 0 8px 18px rgba(37, 99, 235, 0.18);
+.project-dark-dialog .director-card.is-active .director-card__subtitle {
+  color: rgba(219, 234, 254, 0.9);
 }
 
 @media (max-width: 1080px) {
