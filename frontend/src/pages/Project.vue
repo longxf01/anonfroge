@@ -280,7 +280,19 @@
           <div class="form-col form-col--right">
             <section class="panel-card">
               <header class="panel-card__head">
-                <h3 class="panel-card__title">视觉风格</h3>
+                <div class="panel-card__title-actions">
+                  <h3 class="panel-card__title">视觉风格</h3>
+                  <el-button
+                    class="panel-card__add"
+                    type="primary"
+                    size="small"
+                    plain
+                    @click="openCreateStyleDialog"
+                  >
+                    <el-icon><Plus /></el-icon>
+                    添加视觉风格
+                  </el-button>
+                </div>
                 <span class="panel-card__hint">{{ activeArtStyleLabel || '未选择' }}</span>
               </header>
               <el-form-item prop="art_style" class="panel-card__field">
@@ -325,9 +337,9 @@
                       tabindex="0"
                       aria-label="编辑视觉风格"
                       title="编辑视觉风格"
-                      @click.stop="showComingSoon"
-                      @keydown.enter.stop.prevent="showComingSoon"
-                      @keydown.space.stop.prevent="showComingSoon"
+                      @click.stop="openEditStyleDialog(preset)"
+                      @keydown.enter.stop.prevent="openEditStyleDialog(preset)"
+                      @keydown.space.stop.prevent="openEditStyleDialog(preset)"
                     >
                       <el-icon><EditPen /></el-icon>
                     </span>
@@ -501,6 +513,13 @@
       </el-table>
     </el-dialog>
 
+    <VisualStyleDialog
+      v-model="visualStyleDialogVisible"
+      :mode="visualStyleDialogMode"
+      :style="editingVisualStyle"
+      @saved="handleVisualStyleSaved"
+    />
+
     <el-image-viewer
       v-if="previewVisible"
       :url-list="previewUrls"
@@ -560,14 +579,12 @@ import {
   type VisualStyleRecord,
 } from '@/api/project'
 import Settings from '../components/Settings.vue'
+import VisualStyleDialog from '../components/VisualStyleDialog.vue'
 
 type ProjectDialogMode = 'create' | 'edit'
+type VisualStyleDialogMode = 'create' | 'edit'
 
-interface ArtStylePreset {
-  style_path: string
-  name: string
-  images: VisualStyleRecord['images']
-}
+type ArtStylePreset = VisualStyleRecord
 
 interface DirectorStylePreset {
   manual_path: string
@@ -599,6 +616,9 @@ const candidatesLoading = ref(false)
 const inviteRole = ref<ProjectMemberRole>('editor')
 const artStylesLoading = ref(false)
 const directorStylesLoading = ref(false)
+const visualStyleDialogVisible = ref(false)
+const visualStyleDialogMode = ref<VisualStyleDialogMode>('create')
+const editingVisualStyle = ref<VisualStyleRecord | null>(null)
 
 const settingsVisible = ref(false)
 
@@ -703,6 +723,7 @@ const directorStylePresets = ref<DirectorStylePreset[]>([])
 const toArtStylePreset = (style: VisualStyleRecord): ArtStylePreset => ({
   style_path: style.style_path,
   name: style.name,
+  files: style.files,
   images: style.images,
 })
 
@@ -741,6 +762,23 @@ const openStylePreview = (preset: ArtStylePreset) => {
   previewUrls.value = urls
   previewIndex.value = 0
   previewVisible.value = true
+}
+
+const openCreateStyleDialog = () => {
+  visualStyleDialogMode.value = 'create'
+  editingVisualStyle.value = null
+  visualStyleDialogVisible.value = true
+}
+
+const openEditStyleDialog = (preset: ArtStylePreset) => {
+  visualStyleDialogMode.value = 'edit'
+  editingVisualStyle.value = preset
+  visualStyleDialogVisible.value = true
+}
+
+const handleVisualStyleSaved = async (style: VisualStyleRecord) => {
+  await loadVisualStyles()
+  projectForm.art_style = style.style_path
 }
 
 const getDirectorStyleLabel = (value: string) => (
@@ -2019,7 +2057,6 @@ onMounted(() => {
   color: #4d5560;
 }
 
-/* 对话框双栏布局（参考 toonflow projectDialog） */
 .project-dark-dialog .dialog-grid-2col {
   display: grid;
   grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
@@ -2057,12 +2094,35 @@ onMounted(() => {
   padding: 2px 4px;
 }
 
+.project-dark-dialog .panel-card__title-actions {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .project-dark-dialog .panel-card__title {
   margin: 0;
   font-size: 15px;
   font-weight: 700;
   color: #f2f4f8;
   letter-spacing: -0.2px;
+  flex-shrink: 0;
+}
+
+.project-dark-dialog .panel-card__add {
+  min-height: 30px;
+  border-radius: 999px;
+  color: #bfdbfe;
+  background: rgba(37, 99, 235, 0.12);
+  border-color: rgba(96, 165, 250, 0.35);
+}
+
+.project-dark-dialog .panel-card__add:hover,
+.project-dark-dialog .panel-card__add:focus {
+  color: #ffffff;
+  background: rgba(37, 99, 235, 0.26);
+  border-color: rgba(147, 197, 253, 0.68);
 }
 
 .project-dark-dialog .panel-card__hint {

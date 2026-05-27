@@ -93,6 +93,24 @@ export interface VisualStyleRecord {
   images: VisualStyleImageRecord[]
 }
 
+export interface VisualStyleFilePayload {
+  path: string
+  content: string
+}
+
+export interface VisualStyleImagePayload {
+  filename: string
+  data: string
+}
+
+export interface VisualStyleCreatePayload {
+  style_path: string
+  name: string
+  files: VisualStyleFilePayload[]
+  images: VisualStyleImagePayload[]
+}
+
+
 export interface DirectorManualFileRecord {
   path: string
   content: string
@@ -112,10 +130,50 @@ export interface DirectorManualRecord {
   files: DirectorManualFileRecord[]
   images: DirectorManualImageRecord[]
 }
+
+
 // export 表示把当前函数暴露给外界，允许其他模块通过 import {函数名} from "模块名"进行调用
 export const listProjectsApi = () => request.get<ProjectRecord[]>('/projects/')
 
 export const listVisualStylesApi = () => request.get<VisualStyleRecord[]>('/projects/visual-styles')
+
+export const createVisualStyleApi = (data: VisualStyleCreatePayload) => (
+  request.post<VisualStyleRecord>('/projects/visual-styles', data)
+)
+
+export const getVisualStyleApi = (stylePath: string) => (
+  request.get<VisualStyleRecord>(`/projects/visual-styles/${encodeUrlSegment(stylePath)}`)
+)
+
+export const writeVisualStyleFileApi = (
+  stylePath: string,
+  filePath: string,
+  data: VisualStyleFilePayload,
+) => (
+  request.put<VisualStyleFileRecord>(
+    `/projects/visual-styles/${encodeUrlSegment(stylePath)}/files/${encodeUrlPath(filePath)}`,
+    data,
+  )
+)
+
+export const deleteVisualStyleFileApi = (stylePath: string, filePath: string) => (
+  request.delete(`/projects/visual-styles/${encodeUrlSegment(stylePath)}/files/${encodeUrlPath(filePath)}`)
+)
+
+export const writeVisualStyleImageApi = (
+  stylePath: string,
+  filename: string,
+  data: VisualStyleImagePayload,
+) => (
+  request.put<VisualStyleImageRecord>(
+    `/projects/visual-styles/${encodeUrlSegment(stylePath)}/images/${encodeUrlSegment(filename)}`,
+    data,
+  )
+)
+
+export const deleteVisualStyleImageApi = (stylePath: string, filename: string) => (
+  request.delete(`/projects/visual-styles/${encodeUrlSegment(stylePath)}/images/${encodeUrlSegment(filename)}`)
+)
 
 export const listDirectorManualsApi = () => request.get<DirectorManualRecord[]>('/projects/director-manuals')
 
@@ -157,4 +215,15 @@ export const updateProjectMemberRoleApi = (
 
 export const removeProjectMemberApi = (publicId: string, userPublicId: string) => (
   request.delete(`/projects/${publicId}/members/${userPublicId}`)
+)
+
+const encodeUrlSegment = (value: string) => encodeURIComponent(value.trim())
+
+const encodeUrlPath = (value: string) => (
+  value
+    .trim()
+    .replace(/\\/g, '/')
+    .split('/')
+    .map(encodeURIComponent)
+    .join('/')
 )
