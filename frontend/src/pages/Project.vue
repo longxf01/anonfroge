@@ -286,7 +286,6 @@
                     class="panel-card__add"
                     type="primary"
                     size="small"
-                    plain
                     @click="openCreateStyleDialog"
                   >
                     <el-icon><Plus /></el-icon>
@@ -354,7 +353,18 @@
 
             <section class="panel-card">
               <header class="panel-card__head">
-                <h3 class="panel-card__title">导演风格</h3>
+                <div class="panel-card__title-actions">
+                  <h3 class="panel-card__title">导演风格</h3>
+                  <el-button
+                    class="panel-card__add"
+                    type="primary"
+                    size="small"
+                    @click="openCreateDirectorStyleDialog"
+                  >
+                    <el-icon><Plus /></el-icon>
+                    添加导演风格
+                  </el-button>
+                </div>
                 <span class="panel-card__hint">{{ activeDirectorStyleLabel || '未选择' }}</span>
               </header>
               <el-form-item prop="director_manual" class="panel-card__field">
@@ -400,9 +410,9 @@
                       tabindex="0"
                       aria-label="编辑导演风格"
                       title="编辑导演风格"
-                      @click.stop="showComingSoon"
-                      @keydown.enter.stop.prevent="showComingSoon"
-                      @keydown.space.stop.prevent="showComingSoon"
+                      @click.stop="openEditDirectorStyleDialog(preset)"
+                      @keydown.enter.stop.prevent="openEditDirectorStyleDialog(preset)"
+                      @keydown.space.stop.prevent="openEditDirectorStyleDialog(preset)"
                     >
                       <el-icon><EditPen /></el-icon>
                     </span>
@@ -520,6 +530,13 @@
       @saved="handleVisualStyleSaved"
     />
 
+    <DirectorStyleDialog
+      v-model="directorStyleDialogVisible"
+      :mode="directorStyleDialogMode"
+      :manual="editingDirectorStyle"
+      @saved="handleDirectorStyleSaved"
+    />
+
     <el-image-viewer
       v-if="previewVisible"
       :url-list="previewUrls"
@@ -579,18 +596,15 @@ import {
   type VisualStyleRecord,
 } from '@/api/project'
 import Settings from '../components/Settings.vue'
+import DirectorStyleDialog from '../components/DirectorStyleDialog.vue'
 import VisualStyleDialog from '../components/VisualStyleDialog.vue'
 
 type ProjectDialogMode = 'create' | 'edit'
 type VisualStyleDialogMode = 'create' | 'edit'
+type DirectorStyleDialogMode = 'create' | 'edit'
 
 type ArtStylePreset = VisualStyleRecord
-
-interface DirectorStylePreset {
-  manual_path: string
-  name: string
-  images: DirectorManualRecord['images']
-}
+type DirectorStylePreset = DirectorManualRecord
 
 const router = useRouter()
 const projectFormRef = ref<FormInstance>()
@@ -619,6 +633,9 @@ const directorStylesLoading = ref(false)
 const visualStyleDialogVisible = ref(false)
 const visualStyleDialogMode = ref<VisualStyleDialogMode>('create')
 const editingVisualStyle = ref<VisualStyleRecord | null>(null)
+const directorStyleDialogVisible = ref(false)
+const directorStyleDialogMode = ref<DirectorStyleDialogMode>('create')
+const editingDirectorStyle = ref<DirectorManualRecord | null>(null)
 
 const settingsVisible = ref(false)
 
@@ -730,6 +747,7 @@ const toArtStylePreset = (style: VisualStyleRecord): ArtStylePreset => ({
 const toDirectorStylePreset = (manual: DirectorManualRecord): DirectorStylePreset => ({
   manual_path: manual.manual_path,
   name: manual.name,
+  files: manual.files,
   images: manual.images,
 })
 
@@ -810,6 +828,23 @@ const openDirectorPreview = (preset: DirectorStylePreset) => {
   previewUrls.value = urls
   previewIndex.value = 0
   previewVisible.value = true
+}
+
+const openCreateDirectorStyleDialog = () => {
+  directorStyleDialogMode.value = 'create'
+  editingDirectorStyle.value = null
+  directorStyleDialogVisible.value = true
+}
+
+const openEditDirectorStyleDialog = (preset: DirectorStylePreset) => {
+  directorStyleDialogMode.value = 'edit'
+  editingDirectorStyle.value = preset
+  directorStyleDialogVisible.value = true
+}
+
+const handleDirectorStyleSaved = async (manualPath: string) => {
+  await loadDirectorManuals()
+  projectForm.director_manual = manualPath
 }
 
 const activeArtStyleLabel = computed(

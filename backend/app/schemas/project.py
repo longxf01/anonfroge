@@ -179,3 +179,11 @@ class DirectorManualRead(BaseModel):
     files: list[DirectorManualFileRead] = Field(default_factory=list, description="Markdown 文件列表。")
     images: list[DirectorManualImageRead] = Field(default_factory=list, description="图片文件列表。")
 
+
+class DirectorManualCreate(BaseModel):
+    """创建导演手册请求。"""
+
+    manual_path: str = Field(min_length=1, max_length=120, description="导演手册目录名。")
+    name: str = Field(default="", max_length=120, description="导演手册展示名称。")
+    files: list[DirectorManualFileWrite] = Field(default_factory=list, description="需要写入的 Markdown 文件。")
+    images: list[DirectorManualImageWrite] = Field(default_factory=list, description="需要写入的图片。")

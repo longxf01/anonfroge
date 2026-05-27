@@ -36,6 +36,7 @@ from app.schemas.project import (
     VisualStyleImageWrite,
     VisualStyleRead,
     VisualStyleUpdate,
+    DirectorManualCreate,
 )
 
 STYLE_PATH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$")
@@ -76,6 +77,10 @@ class VisualStyleValidationError(ProjectServiceError):
 
 class DirectorManualNotFoundError(ProjectServiceError):
     """导演手册不存在。"""
+
+
+class DirectorManualConflictError(ProjectServiceError):
+    """导演手册已存在。"""
 
 
 class DirectorManualValidationError(ProjectServiceError):
@@ -621,6 +626,26 @@ async def list_director_manuals(session: AsyncSession) -> list[DirectorManualRea
     return manuals
 
 
+async def create_director_manual(
+    session: AsyncSession,
+    current_user_public_id: str,
+    payload: DirectorManualCreate,
+) -> DirectorManualRead:
+    """创建导演手册目录并写入 Markdown 文件和图片。"""
+    await _ensure_superuser(session, current_user_public_id)
+    manual_dir = _director_manual_dir(payload.manual_path)
+    if manual_dir.exists():
+        raise DirectorManualConflictError("Director manual already exists")
+
+    manual_dir.mkdir(parents=True)
+    _write_default_director_readme_if_needed(manual_dir, payload.name, payload.files)
+    for file_payload in payload.files:
+        _write_director_manual_file_unchecked(manual_dir, file_payload)
+    for image_payload in payload.images:
+        _write_director_manual_image_unchecked(manual_dir, image_payload)
+    return _read_director_manual(manual_dir.name)
+
+
 async def get_director_manual_image_path(
     session: AsyncSession,
     manual_path: str,
@@ -1120,6 +1145,22 @@ def _write_visual_style_image_unchecked(style_dir: Path, payload: VisualStyleIma
     return _read_visual_style_image(style_dir, target)
 
 
+def _write_director_manual_file_unchecked(manual_dir: Path, payload: DirectorManualFileWrite) -> DirectorManualFileRead:
+    """写入导演手册 Markdown 文件；调用方负责权限和目录存在性。"""
+    target = _resolve_director_manual_markdown_file(manual_dir, payload.path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(payload.content, encoding="utf-8")
+    return _read_director_manual_file(manual_dir, target)
+
+
+def _write_director_manual_image_unchecked(manual_dir: Path, payload: DirectorManualImageWrite) -> DirectorManualImageRead:
+    """写入导演手册图片；调用方负责权限和目录存在性。"""
+    target = _resolve_director_manual_image_file(manual_dir, payload.filename)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(_decode_director_manual_image_data(payload.data))
+    return _read_director_manual_image(manual_dir, target)
+
+
 def _decode_image_data(data: str) -> bytes:
     """解码 base64 图片内容。"""
     raw = data.split(",", 1)[1] if data.startswith("data:") and "," in data else data
@@ -1173,7 +1214,27 @@ def _write_default_readme_if_needed(
     _write_visual_style_file_unchecked(style_dir, VisualStyleFileWrite(path="README.md", content=f"# {name}\n"))
 
 
+def _write_default_director_readme_if_needed(
+    manual_dir: Path,
+    name: str,
+    files: list[DirectorManualFileWrite],
+) -> None:
+    """创建导演手册时如果只给了名称，则补一个 README。"""
+    if not name or _director_payload_contains_file(files, "README.md"):
+        return
+    _write_director_manual_file_unchecked(
+        manual_dir,
+        DirectorManualFileWrite(path="README.md", content=f"# {name}\n"),
+    )
+
+
 def _payload_contains_file(files: list[VisualStyleFileWrite] | None, file_path: str) -> bool:
     """判断文件写入列表中是否包含指定相对路径。"""
+    expected = file_path.replace("\\", "/").lower()
+    return any(item.path.replace("\\", "/").lower() == expected for item in files or [])
+
+
+def _director_payload_contains_file(files: list[DirectorManualFileWrite] | None, file_path: str) -> bool:
+    """判断导演手册写入列表中是否包含指定相对路径。"""
     expected = file_path.replace("\\", "/").lower()
     return any(item.path.replace("\\", "/").lower() == expected for item in files or [])

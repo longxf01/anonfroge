@@ -131,6 +131,23 @@ export interface DirectorManualRecord {
   images: DirectorManualImageRecord[]
 }
 
+export interface DirectorManualFilePayload {
+  path: string
+  content: string
+}
+
+export interface DirectorManualImagePayload {
+  filename: string
+  data: string
+}
+
+export interface DirectorManualCreatePayload {
+  manual_path: string
+  name: string
+  files: DirectorManualFilePayload[]
+  images: DirectorManualImagePayload[]
+}
+
 
 // export 表示把当前函数暴露给外界，允许其他模块通过 import {函数名} from "模块名"进行调用
 export const listProjectsApi = () => request.get<ProjectRecord[]>('/projects/')
@@ -176,6 +193,40 @@ export const deleteVisualStyleImageApi = (stylePath: string, filename: string) =
 )
 
 export const listDirectorManualsApi = () => request.get<DirectorManualRecord[]>('/projects/director-manuals')
+
+export const createDirectorManualApi = (data: DirectorManualCreatePayload) => (
+  request.post<DirectorManualRecord>('/projects/director-manuals', data)
+)
+
+export const writeDirectorManualFileApi = (
+  manualPath: string,
+  filePath: string,
+  data: DirectorManualFilePayload,
+) => (
+  request.put<DirectorManualFileRecord>(
+    `/projects/director-manuals/${encodeUrlSegment(manualPath)}/files/${encodeUrlPath(filePath)}`,
+    data,
+  )
+)
+
+export const deleteDirectorManualFileApi = (manualPath: string, filePath: string) => (
+  request.delete(`/projects/director-manuals/${encodeUrlSegment(manualPath)}/files/${encodeUrlPath(filePath)}`)
+)
+
+export const writeDirectorManualImageApi = (
+  manualPath: string,
+  filename: string,
+  data: DirectorManualImagePayload,
+) => (
+  request.put<DirectorManualImageRecord>(
+    `/projects/director-manuals/${encodeUrlSegment(manualPath)}/images/${encodeUrlSegment(filename)}`,
+    data,
+  )
+)
+
+export const deleteDirectorManualImageApi = (manualPath: string, filename: string) => (
+  request.delete(`/projects/director-manuals/${encodeUrlSegment(manualPath)}/images/${encodeUrlSegment(filename)}`)
+)
 
 export const searchProjectsByNameApi = (name: string) => (
   request.get<ProjectRecord[]>('/projects/search/by-name', { params: { name } })
