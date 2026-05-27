@@ -18,6 +18,7 @@ class TestProjectEnum:
         """验证视频生成模式枚举值。"""
         assert ProjectVideoMode.TEXT.value == "text"
         assert ProjectVideoMode.SINGLE_IMAGE.value == "singleImage"
+        assert ProjectVideoMode.MULTI_REFERENCE.value == "multiReference"
         assert ProjectVideoMode.START_END_REQUIRED.value == "startEndRequired"
         assert ProjectVideoMode.END_FRAME_OPTIONAL.value == "endFrameOptional"
         assert ProjectVideoMode.START_FRAME_OPTIONAL.value == "startFrameOptional"
@@ -36,6 +37,7 @@ class TestProjectEnum:
         assert set(enum_values(ProjectVideoMode)) == {
             "text",
             "singleImage",
+            "multiReference",
             "startEndRequired",
             "endFrameOptional",
             "startFrameOptional",

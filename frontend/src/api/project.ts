@@ -3,6 +3,7 @@ import request from '@/request'
 export type ProjectVideoMode =
   | 'text'
   | 'singleImage'
+  | 'multiReference'
   | 'startEndRequired'
   | 'endFrameOptional'
   | 'startFrameOptional'
@@ -20,8 +21,10 @@ export interface ProjectRecord {
   art_style: string
   director_manual: string
   video_ratio: string
+  text_model: string
   image_model: string
   video_model: string
+  tts_model: string
   image_quality: string
   mode: ProjectVideoMode
   my_role?: ProjectMemberRole | null
@@ -39,8 +42,10 @@ export interface ProjectPayload {
   art_style: string
   director_manual: string
   video_ratio: string
+  text_model: string
   image_model: string
   video_model: string
+  tts_model: string
   image_quality: string
   mode: ProjectVideoMode
 }
