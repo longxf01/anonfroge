@@ -1,0 +1,511 @@
+<template>
+  <div class="assistant-thread-wrap">
+    <div
+      ref="assistantThreadRef"
+      class="assistant-thread"
+      aria-label="对话记录"
+      @scroll="onAssistantThreadScroll"
+      @wheel.passive="pauseAssistantAutoScroll"
+      @pointerdown="onAssistantThreadPointerDown"
+      @touchmove.passive="pauseAssistantAutoScroll"
+    >
+      <article
+        v-for="message in messages"
+        :key="message.id"
+        class="assistant-message"
+        :class="[
+          `assistant-message--${message.role}`,
+          { 'is-streaming': message.id === streamingMessageId },
+        ]"
+      >
+        <div class="assistant-bubble">
+          <div
+            v-if="isAssistantThinking(message)"
+            class="assistant-thinking"
+            aria-label="AI 正在思考"
+          >
+            <span></span>
+            <span></span>
+            <span></span>
+          </div>
+          <div
+            v-else-if="isAssistantStreaming(message)"
+            class="assistant-streaming-text"
+          >
+            {{ message.content }}<span class="assistant-type-caret"></span>
+          </div>
+          <MdPreview
+            v-else
+            class="assistant-markdown-preview"
+            :model-value="message.content"
+            theme="dark"
+            preview-theme="github"
+            code-theme="atom"
+          />
+          <time class="assistant-bubble__time">{{ message.time }}</time>
+        </div>
+      </article>
+    </div>
+
+    <button
+      v-if="showAssistantScrollBottom"
+      type="button"
+      class="assistant-scroll-bottom-btn"
+      aria-label="回到最新消息"
+      @click="resumeAssistantAutoScroll"
+    >
+      <el-icon><CaretBottom /></el-icon>
+    </button>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { nextTick, ref } from 'vue'
+import { MdPreview } from 'md-editor-v3'
+import { CaretBottom } from '@element-plus/icons-vue'
+import type { ChatMessage } from './types'
+
+const props = defineProps<{
+  messages: ChatMessage[]
+  streamingMessageId: number | null
+}>()
+
+const assistantThreadRef = ref<HTMLElement | null>(null)
+const showAssistantScrollBottom = ref(false)
+const assistantAutoScrollEnabled = ref(true)
+
+const isAssistantThinking = (message: ChatMessage) => (
+  message.role === 'assistant' && !message.content.trim()
+)
+
+const isAssistantStreaming = (message: ChatMessage) => (
+  message.role === 'assistant'
+  && message.id === props.streamingMessageId
+  && Boolean(message.content.trim())
+)
+
+const waitForAssistantLayoutFrame = () => (
+  new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => resolve())
+  })
+)
+
+const isAssistantThreadAtBottom = () => {
+  const el = assistantThreadRef.value
+  if (!el) return true
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= 24
+}
+
+const updateAssistantScrollState = () => {
+  const el = assistantThreadRef.value
+  if (!el) {
+    showAssistantScrollBottom.value = false
+    return
+  }
+  showAssistantScrollBottom.value = el.scrollHeight > el.clientHeight && !isAssistantThreadAtBottom()
+}
+
+const scrollToBottom = (behavior: ScrollBehavior = 'smooth') => {
+  const el = assistantThreadRef.value
+  if (!el) return
+  el.scrollTo({ top: el.scrollHeight, behavior })
+  showAssistantScrollBottom.value = false
+}
+
+const followOutput = async () => {
+  await nextTick()
+  await waitForAssistantLayoutFrame()
+  if (assistantAutoScrollEnabled.value) {
+    scrollToBottom('smooth')
+  } else {
+    updateAssistantScrollState()
+  }
+}
+
+const pauseAssistantAutoScroll = () => {
+  assistantAutoScrollEnabled.value = false
+  updateAssistantScrollState()
+}
+
+const onAssistantThreadPointerDown = (event: PointerEvent) => {
+  const el = assistantThreadRef.value
+  if (!el) return
+
+  const rect = el.getBoundingClientRect()
+  const scrollbarHitWidth = Math.max(12, el.offsetWidth - el.clientWidth + 2)
+  if (event.clientX >= rect.right - scrollbarHitWidth) {
+    pauseAssistantAutoScroll()
+  }
+}
+
+const resumeAssistantAutoScroll = () => {
+  assistantAutoScrollEnabled.value = true
+  scrollToBottom()
+}
+
+const onAssistantThreadScroll = () => {
+  updateAssistantScrollState()
+}
+
+const resetAutoScroll = () => {
+  assistantAutoScrollEnabled.value = true
+}
+
+defineExpose({
+  followOutput,
+  resetAutoScroll,
+  scrollToBottom,
+})
+</script>
+
+<style scoped>
+.assistant-thread-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background: rgba(4, 8, 14, 0.24);
+}
+
+.assistant-thread {
+  height: 100%;
+  min-height: 0;
+  box-sizing: border-box;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 12px 16px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+}
+
+.assistant-thread::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.assistant-thread::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.assistant-thread::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+}
+
+.assistant-thread::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(255, 255, 255, 0.24);
+}
+
+.assistant-scroll-bottom-btn {
+  position: absolute;
+  right: 16px;
+  bottom: 14px;
+  width: 40px;
+  height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(96, 165, 250, 0.38);
+  border-radius: 50%;
+  color: #dbeafe;
+  background: rgba(13, 18, 27, 0.92);
+  box-shadow: 0 14px 28px rgba(0, 0, 0, 0.34);
+  cursor: pointer;
+  transition: background-color 0.18s ease, border-color 0.18s ease, color 0.18s ease, transform 0.18s ease;
+}
+
+.assistant-scroll-bottom-btn :deep(.el-icon) {
+  font-size: 18px;
+}
+
+.assistant-scroll-bottom-btn:hover,
+.assistant-scroll-bottom-btn:focus {
+  color: #ffffff;
+  border-color: rgba(96, 165, 250, 0.65);
+  background: rgba(37, 99, 235, 0.72);
+  transform: translateY(-1px);
+}
+
+.assistant-scroll-bottom-btn:active {
+  transform: translateY(0);
+}
+
+.assistant-message {
+  display: flex;
+  align-items: flex-start;
+}
+
+.assistant-message.is-streaming .assistant-bubble {
+  border-color: rgba(96, 165, 250, 0.24);
+  box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.08);
+}
+
+.assistant-message--user {
+  justify-content: flex-end;
+}
+
+.assistant-message--user .assistant-bubble {
+  max-width: 86%;
+  border-color: rgba(96, 165, 250, 0.28);
+  background: rgba(30, 64, 175, 0.36);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.assistant-bubble {
+  min-width: 0;
+  max-width: 92%;
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 9px;
+  background: rgba(15, 22, 32, 0.72);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+
+.assistant-bubble__time {
+  justify-self: end;
+  color: #7e8893;
+  font-size: 11px;
+  line-height: 1;
+  font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.assistant-streaming-text {
+  min-width: 0;
+  max-width: 100%;
+  color: #cbd5e1;
+  font-size: 13px;
+  line-height: 1.68;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.assistant-type-caret {
+  display: inline-block;
+  width: 1px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.12em;
+  background: rgba(147, 197, 253, 0.9);
+  animation: assistant-caret-blink 0.9s steps(2, start) infinite;
+}
+
+@keyframes assistant-caret-blink {
+  0%,
+  48% {
+    opacity: 1;
+  }
+
+  49%,
+  100% {
+    opacity: 0;
+  }
+}
+
+.assistant-markdown-preview {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  color: #cbd5e1;
+  background: transparent;
+  font-size: 13px;
+  line-height: 1.68;
+}
+
+.assistant-markdown-preview :deep(.md-editor-preview-wrapper),
+.assistant-markdown-preview :deep(.md-editor-preview) {
+  padding: 0;
+  background: transparent;
+  color: #cbd5e1;
+}
+
+.assistant-markdown-preview :deep(.md-editor-preview) {
+  font-size: 13px;
+  line-height: 1.68;
+  word-break: break-word;
+}
+
+.assistant-markdown-preview :deep(p) {
+  margin: 0 0 8px;
+  color: #cbd5e1;
+  line-height: 1.68;
+  white-space: normal;
+}
+
+.assistant-markdown-preview :deep(p:last-child) {
+  margin-bottom: 0;
+}
+
+.assistant-markdown-preview :deep(h1),
+.assistant-markdown-preview :deep(h2),
+.assistant-markdown-preview :deep(h3),
+.assistant-markdown-preview :deep(h4),
+.assistant-markdown-preview :deep(h5),
+.assistant-markdown-preview :deep(h6) {
+  margin: 12px 0 6px;
+  color: #f2f4f8;
+  line-height: 1.35;
+  font-weight: 750;
+}
+
+.assistant-markdown-preview :deep(h1:first-child),
+.assistant-markdown-preview :deep(h2:first-child),
+.assistant-markdown-preview :deep(h3:first-child),
+.assistant-markdown-preview :deep(h4:first-child),
+.assistant-markdown-preview :deep(h5:first-child),
+.assistant-markdown-preview :deep(h6:first-child) {
+  margin-top: 0;
+}
+
+.assistant-markdown-preview :deep(h1) {
+  font-size: 18px;
+}
+
+.assistant-markdown-preview :deep(h2) {
+  font-size: 16px;
+}
+
+.assistant-markdown-preview :deep(h3),
+.assistant-markdown-preview :deep(h4),
+.assistant-markdown-preview :deep(h5),
+.assistant-markdown-preview :deep(h6) {
+  font-size: 14px;
+}
+
+.assistant-markdown-preview :deep(ul),
+.assistant-markdown-preview :deep(ol) {
+  margin: 6px 0 10px;
+  padding-left: 20px;
+  color: #cbd5e1;
+  line-height: 1.65;
+}
+
+.assistant-markdown-preview :deep(li) {
+  margin: 2px 0;
+  padding-left: 2px;
+}
+
+.assistant-markdown-preview :deep(blockquote) {
+  margin: 8px 0;
+  padding: 7px 10px;
+  border-left: 3px solid rgba(96, 165, 250, 0.56);
+  border-radius: 6px;
+  color: #b8c2cc;
+  background: rgba(96, 165, 250, 0.08);
+}
+
+.assistant-markdown-preview :deep(code) {
+  border-radius: 5px;
+  padding: 1px 5px;
+  color: #dbeafe;
+  background: rgba(15, 23, 42, 0.88);
+  font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.assistant-markdown-preview :deep(pre) {
+  max-width: 100%;
+  margin: 8px 0;
+  overflow-x: auto;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  background: #0d1117;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.32) transparent;
+}
+
+.assistant-markdown-preview :deep(pre code) {
+  display: block;
+  padding: 10px 12px;
+  color: #d6dde7;
+  background: transparent;
+  line-height: 1.55;
+  white-space: pre;
+}
+
+.assistant-markdown-preview :deep(pre::-webkit-scrollbar) {
+  height: 8px;
+}
+
+.assistant-markdown-preview :deep(pre::-webkit-scrollbar-track) {
+  background: transparent;
+}
+
+.assistant-markdown-preview :deep(pre::-webkit-scrollbar-thumb) {
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.32);
+}
+
+.assistant-markdown-preview :deep(table) {
+  display: block;
+  max-width: 100%;
+  margin: 8px 0;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.assistant-markdown-preview :deep(th),
+.assistant-markdown-preview :deep(td) {
+  padding: 6px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.assistant-markdown-preview :deep(a) {
+  color: #93c5fd;
+  text-decoration: none;
+}
+
+.assistant-markdown-preview :deep(a:hover) {
+  color: #bfdbfe;
+  text-decoration: underline;
+}
+
+.assistant-markdown-preview :deep(hr) {
+  margin: 12px 0;
+  border: none;
+  border-top: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.assistant-thinking {
+  min-width: 44px;
+  min-height: 22px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.assistant-thinking span {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: #93c5fd;
+  opacity: 0.38;
+  animation: assistant-thinking-pulse 1s ease-in-out infinite;
+}
+
+.assistant-thinking span:nth-child(2) {
+  animation-delay: 0.16s;
+}
+
+.assistant-thinking span:nth-child(3) {
+  animation-delay: 0.32s;
+}
+
+@keyframes assistant-thinking-pulse {
+  0%,
+  80%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.38;
+  }
+
+  40% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}
+</style>
