@@ -5,6 +5,7 @@ from app.routers.provider import router as provider_router
 from app.routers.project import router as project_router
 from app.routers.user import router as user_router
 from app.routers.novel import router as novel_router
+from app.routers.tasks import router as tasks_router
 
 api_router = APIRouter(prefix=settings.api_prefix)
 
@@ -12,6 +13,7 @@ api_router.include_router(user_router)
 api_router.include_router(project_router)
 api_router.include_router(provider_router)
 api_router.include_router(novel_router)
+api_router.include_router(tasks_router)
 
 @api_router.get(
     "/health",  # 实际路径：/api/health
