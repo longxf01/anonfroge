@@ -35,7 +35,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { MagicStick } from '@element-plus/icons-vue'
-import type { ScreenwritingActiveTab } from '@/api/novel'
+import type { ScreenwritingActiveTab } from '@/api/screenwriting'
 import type { ScreenwritingTab } from './types'
 
 const props = defineProps<{

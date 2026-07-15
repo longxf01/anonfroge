@@ -24,6 +24,7 @@
             :connected-model-id="connectedModelId"
             :is-sending="isSendingChat"
             :streaming-message-id="streamingAssistantMessageId"
+            :rag-warmup="ragWarmup"
             @send="sendChatMessage"
             @new-conversation="startNewConversation"
             @insert-stage-prompt="insertStagePrompt"
@@ -48,6 +49,7 @@
 import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import type { AxiosError } from 'axios'
 import {
   Document,
   MagicStick,
@@ -55,17 +57,18 @@ import {
 } from '@element-plus/icons-vue'
 import {
   chatScreenwritingStreamUrl,
+  warmupScreenwritingRagIndexApi,
   type ScreenwritingActiveTab,
   type ScreenwritingChatTurn,
   type ScreenwritingStreamEvent,
-} from '@/api/novel'
+} from '@/api/screenwriting'
 import { fetchWithAuthRetry } from '@/request'
 import { readNdjsonStream } from '@/utils/ndjsonStream'
 import ScreenwritingAssistantPanel from '@/components/screenwriting/ScreenwritingAssistantPanel.vue'
 import ScreenwritingPageHeader from '@/components/screenwriting/ScreenwritingPageHeader.vue'
 import ScreenwritingSidebar from '@/components/screenwriting/ScreenwritingSidebar.vue'
 import ScreenwritingStageTabs from '@/components/screenwriting/ScreenwritingStageTabs.vue'
-import type { ChatMessage, ScreenwritingTab } from '@/components/screenwriting/types'
+import type { ChatMessage, ScreenwritingRagWarmupViewState, ScreenwritingTab } from '@/components/screenwriting/types'
 import Settings from '../components/Settings.vue'
 
 interface AssistantPanelExpose {
@@ -88,11 +91,14 @@ const isSendingChat = ref(false)
 const conversationId = ref('')
 const connectedModelId = ref('')
 const streamingAssistantMessageId = ref<number | null>(null)
+const ragWarmup = ref<ScreenwritingRagWarmupViewState>({ status: 'idle', label: '' })
 let chatSeq = 2
 let chatStreamController: AbortController | null = null
+let ragWarmupPollTimer: number | null = null
 
 const ASSISTANT_REVEAL_CHUNK_SIZE = 1
 const ASSISTANT_REVEAL_INTERVAL_MS = 18
+const RAG_WARMUP_POLL_INTERVAL_MS = 1400
 
 const screenwritingTabs: ScreenwritingTab[] = [
   {
@@ -213,6 +219,22 @@ const getMissingAssistantContent = (currentContent: string, incomingContent: str
   return incomingContent
 }
 
+const readAssistantFinalContent = (event: ScreenwritingStreamEvent) => {
+  if (event.content?.trim()) return event.content
+  const assistantMessage = event.data?.assistantMessage
+  if (typeof assistantMessage === 'string' && assistantMessage.trim()) {
+    return assistantMessage
+  }
+  const messages = event.data?.messages
+  if (Array.isArray(messages)) {
+    const finalAssistantMessage = [...messages]
+      .reverse()
+      .find((message) => message.role === 'assistant' && message.content.trim())
+    return finalAssistantMessage?.content ?? ''
+  }
+  return ''
+}
+
 const sendChatMessage = async () => {
   const content = chatInput.value.trim()
   if (!content) {
@@ -228,6 +250,8 @@ const sendChatMessage = async () => {
     return
   }
 
+  const thinkingStartedAt = performance.now()
+  const clientRequestStartedAtMs = Date.now()
   assistantPanelRef.value?.resetAutoScroll()
   const history = chatMessages.value
     .map(toChatTurn)
@@ -240,14 +264,22 @@ const sendChatMessage = async () => {
   })
   chatInput.value = ''
 
-  const assistantMessage: ChatMessage = {
-    id: chatSeq++,
+  const assistantMessageId = chatSeq++
+  chatMessages.value.push({
+    id: assistantMessageId,
     role: 'assistant',
     content: '',
     time: formatChatTime(),
+    thinkingElapsedMs: 0,
+  })
+  const getAssistantMessage = () => (
+    chatMessages.value.find((message) => message.id === assistantMessageId)
+  )
+  const updateAssistantMessage = (updater: (message: ChatMessage) => void) => {
+    const message = getAssistantMessage()
+    if (message) updater(message)
   }
-  chatMessages.value.push(assistantMessage)
-  streamingAssistantMessageId.value = assistantMessage.id
+  streamingAssistantMessageId.value = assistantMessageId
   await nextTick()
   assistantPanelRef.value?.scrollToBottom()
 
@@ -260,10 +292,30 @@ const sendChatMessage = async () => {
   let assistantRevealQueue: string[] = []
   let assistantRevealTask: Promise<void> | null = null
 
+  const updateThinkingElapsed = (serverElapsedMs?: number) => {
+    const localElapsedMs = Math.max(0, Math.floor(performance.now() - thinkingStartedAt))
+    const normalizedServerElapsedMs = Number.isFinite(serverElapsedMs)
+      ? Math.max(0, Math.floor(serverElapsedMs ?? 0))
+      : 0
+    updateAssistantMessage((message) => {
+      message.thinkingElapsedMs = Math.max(
+        message.thinkingElapsedMs ?? 0,
+        localElapsedMs,
+        normalizedServerElapsedMs,
+      )
+    })
+  }
+
+  const thinkingTimer = window.setInterval(() => {
+    updateThinkingElapsed()
+  }, 250)
+
   const revealQueuedAssistantContent = async () => {
     while (!assistantRevealCanceled && !controller.signal.aborted && assistantRevealQueue.length) {
       const chunk = assistantRevealQueue.splice(0, ASSISTANT_REVEAL_CHUNK_SIZE).join('')
-      assistantMessage.content += chunk
+      updateAssistantMessage((message) => {
+        message.content += chunk
+      })
       await assistantPanelRef.value?.followOutput()
       await waitForAssistantRevealFrame()
     }
@@ -310,6 +362,7 @@ const sendChatMessage = async () => {
         activeTab: activeTab.value,
         message: content,
         messages: history,
+        clientRequestStartedAtMs,
       }),
       signal: controller.signal,
     })
@@ -322,11 +375,22 @@ const sendChatMessage = async () => {
     }
 
     await readNdjsonStream<ScreenwritingStreamEvent>(response.body, async (event) => {
+      updateThinkingElapsed(event.data?.thinkingElapsedMs)
       if (event.conversationId) {
         conversationId.value = event.conversationId
       }
       if (event.modelId) {
         connectedModelId.value = event.modelId
+      }
+      if (event.data?.rag) {
+        updateAssistantMessage((message) => {
+          message.rag = event.data?.rag
+        })
+      }
+      if (event.data?.serverTimings) {
+        updateAssistantMessage((message) => {
+          message.serverTimings = event.data?.serverTimings
+        })
       }
       if (event.type === 'error') {
         throw new Error(readStreamError(event))
@@ -334,23 +398,33 @@ const sendChatMessage = async () => {
       if (event.type === 'message.delta' && event.content) {
         enqueueAssistantContent(event.content, 'delta')
       }
-      if (event.type === 'done' && event.content) {
-        enqueueAssistantContent(event.content, 'final')
+      if (event.type === 'done') {
+        const finalContent = readAssistantFinalContent(event)
+        if (finalContent) {
+          enqueueAssistantContent(finalContent, 'final')
+        }
       }
     })
     await waitForAssistantReveal()
 
-    if (!receivedContent && !assistantMessage.content.trim()) {
-      assistantMessage.content = '本轮没有返回可展示内容，请稍后重试。'
+    if (!receivedContent && !getAssistantMessage()?.content.trim()) {
+      updateAssistantMessage((message) => {
+        message.content = '本轮没有返回可展示内容，请稍后重试。'
+      })
       await assistantPanelRef.value?.followOutput()
     }
   } catch (error) {
     if (isAbortError(error)) return
     assistantRevealCanceled = true
     assistantRevealQueue = []
-    assistantMessage.content = `对话失败：${getErrorMessage(error)}`
-    ElMessage.error(assistantMessage.content)
+    const errorMessage = `对话失败：${getErrorMessage(error)}`
+    updateAssistantMessage((message) => {
+      message.content = errorMessage
+    })
+    ElMessage.error(errorMessage)
   } finally {
+    window.clearInterval(thinkingTimer)
+    updateThinkingElapsed()
     assistantRevealCanceled = true
     if (chatStreamController === controller) {
       chatStreamController = null
@@ -381,9 +455,45 @@ const readFetchError = async (response: Response) => {
 }
 
 const getErrorMessage = (error: unknown) => {
+  const axiosError = isRecord(error) ? (error as unknown as AxiosError<{ detail?: unknown; message?: unknown }>) : null
+  const responseMessage =
+    formatErrorDetail(axiosError?.response?.data?.detail) ||
+    formatErrorDetail(axiosError?.response?.data?.message)
+  if (responseMessage) return responseMessage
+  if (axiosError?.response?.status) {
+    const statusText = axiosError.response.statusText ? ` ${axiosError.response.statusText}` : ''
+    return `请求失败：HTTP ${axiosError.response.status}${statusText}`
+  }
+  if (axiosError?.code === 'ECONNABORTED') return '请求超时'
   if (error instanceof Error) return error.message
-  return String(error || '未知错误')
+  return formatErrorDetail(error) || '未知错误'
 }
+
+const formatErrorDetail = (detail: unknown): string => {
+  if (!detail) return ''
+  if (typeof detail === 'string') return detail.trim()
+  if (Array.isArray(detail)) {
+    return detail.map(formatErrorDetail).filter(Boolean).join('；')
+  }
+  if (isRecord(detail)) {
+    const message =
+      formatErrorDetail(detail.msg) ||
+      formatErrorDetail(detail.message) ||
+      formatErrorDetail(detail.detail)
+    const location = Array.isArray(detail.loc) ? detail.loc.map(String).join('.') : ''
+    if (message) return location ? `${location}: ${message}` : message
+    try {
+      return JSON.stringify(detail)
+    } catch {
+      return String(detail)
+    }
+  }
+  return String(detail)
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => (
+  typeof value === 'object' && value !== null
+)
 
 const isAbortError = (error: unknown) => (
   error instanceof DOMException && error.name === 'AbortError'
@@ -433,13 +543,73 @@ const showComingSoon = () => {
   ElMessage.info('功能开发中')
 }
 
+const clearRagWarmupPoll = () => {
+  if (ragWarmupPollTimer === null) return
+  window.clearTimeout(ragWarmupPollTimer)
+  ragWarmupPollTimer = null
+}
+
+const scheduleRagWarmupPoll = () => {
+  clearRagWarmupPoll()
+  ragWarmupPollTimer = window.setTimeout(() => {
+    void warmupRagIndex({ silent: true })
+  }, RAG_WARMUP_POLL_INTERVAL_MS)
+}
+
+const warmupRagIndex = async (options: { silent?: boolean } = {}) => {
+  if (!projectPublicId.value) return
+  if (!options.silent) {
+    clearRagWarmupPoll()
+    ragWarmup.value = {
+      status: 'starting',
+      label: '正在启动资料索引预热',
+      detail: '首次进入当前项目时开始构建 RAG 检索索引。',
+    }
+  }
+  try {
+    const { data: result } = await warmupScreenwritingRagIndexApi(projectPublicId.value)
+    if (result.status === 'ready') {
+      clearRagWarmupPoll()
+      ragWarmup.value = {
+        status: 'ready',
+        label: '资料索引预热完成',
+        detail: '现在可以使用章节、项目与小说资料进行检索。',
+      }
+      return
+    }
+    ragWarmup.value = {
+      status: 'running',
+      label: result.status === 'started' ? '资料索引预热已开始' : '资料索引预热进行中',
+      detail: result.status === 'running'
+        ? '同项目已有构建任务在运行，正在等待完成。'
+        : '正在异步构建当前项目的向量索引。',
+    }
+    scheduleRagWarmupPoll()
+  } catch (error) {
+    clearRagWarmupPoll()
+    const errorMessage = getErrorMessage(error)
+    ragWarmup.value = {
+      status: 'failed',
+      label: '资料索引预热失败',
+      detail: `错误：${errorMessage}。仍可继续对话，系统会在问答时尝试检索。`,
+    }
+    console.warn('Screenwriting RAG warmup failed', {
+      projectPublicId: projectPublicId.value,
+      errorMessage,
+      error,
+    })
+  }
+}
+
 onMounted(() => {
   projectPublicId.value = resolveProjectPublicId()
   conversationId.value = createConversationId()
+  void warmupRagIndex()
   nextTick(() => assistantPanelRef.value?.scrollToBottom('auto'))
 })
 
 onBeforeUnmount(() => {
+  clearRagWarmupPoll()
   stopChatStream()
 })
 </script>

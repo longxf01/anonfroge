@@ -42,7 +42,55 @@
             preview-theme="github"
             code-theme="atom"
           />
+          <div
+            v-if="message.rag"
+            class="assistant-rag"
+            :class="{ 'has-failure': hasRagFailure(message) }"
+          >
+            <div class="assistant-rag__summary" aria-label="本轮资料检索状态">
+              <span>{{ ragRetrievalModeLabel(message) }}</span>
+              <span>命中 {{ message.rag.hitCount }} / 文档 {{ message.rag.documentCount }}</span>
+              <span v-if="message.rag.runtime.indexCacheHit">索引缓存命中</span>
+              <span v-if="hasRagFailure(message)">资料检索降级</span>
+            </div>
+            <ul
+              v-if="visibleRagHits(message).length"
+              class="assistant-rag__hits"
+              aria-label="本轮参考资料"
+            >
+              <li
+                v-for="hit in visibleRagHits(message)"
+                :key="hit.sourceId"
+              >
+                <span class="assistant-rag__hit-title" :title="hit.title">{{ hit.title }}</span>
+                <span class="assistant-rag__hit-type">{{ ragSourceTypeLabel(hit.sourceType) }}</span>
+                <span class="assistant-rag__hit-score">{{ ragScoreLabel(hit.score) }}</span>
+              </li>
+            </ul>
+          </div>
+          <div
+            v-if="message.serverTimings"
+            class="assistant-server-timings"
+            aria-label="服务端阶段耗时"
+          >
+            <span>服务端 {{ formatDurationMs(message.serverTimings.totalMs) }}</span>
+            <span v-if="shouldShowClientToServerTiming(message)">
+              请求 {{ formatDurationMs(message.serverTimings.clientToServerMs) }}
+            </span>
+            <span
+              v-for="stage in visibleServerTimingStages(message)"
+              :key="stage.name"
+            >
+              {{ serverTimingStageLabel(stage.name) }} {{ formatDurationMs(stage.durationMs) }}
+            </span>
+          </div>
           <time class="assistant-bubble__time">{{ message.time }}</time>
+          <div
+            v-if="shouldShowThinkingElapsed(message)"
+            class="assistant-bubble__thinking-time"
+          >
+            思考 {{ formatThinkingElapsed(message.thinkingElapsedMs) }}
+          </div>
         </div>
       </article>
     </div>
@@ -63,6 +111,7 @@
 import { nextTick, ref } from 'vue'
 import { MdPreview } from 'md-editor-v3'
 import { CaretBottom } from '@element-plus/icons-vue'
+import type { ScreenwritingRagHit, ScreenwritingServerTimingStage } from '@/api/screenwriting'
 import type { ChatMessage } from './types'
 
 const props = defineProps<{
@@ -73,6 +122,14 @@ const props = defineProps<{
 const assistantThreadRef = ref<HTMLElement | null>(null)
 const showAssistantScrollBottom = ref(false)
 const assistantAutoScrollEnabled = ref(true)
+const SERVER_TIMING_STAGE_ORDER = ['project', 'rag', 'agentSetup', 'agentRun', 'modelStream']
+const SERVER_TIMING_STAGE_LABELS: Record<string, string> = {
+  project: '项目',
+  rag: '检索',
+  agentSetup: 'Agent',
+  agentRun: '生成',
+  modelStream: '生成',
+}
 
 const isAssistantThinking = (message: ChatMessage) => (
   message.role === 'assistant' && !message.content.trim()
@@ -83,6 +140,81 @@ const isAssistantStreaming = (message: ChatMessage) => (
   && message.id === props.streamingMessageId
   && Boolean(message.content.trim())
 )
+
+const ragRetrievalModeLabel = (message: ChatMessage) => {
+  const mode = message.rag?.runtime.retrievalMode
+  if (mode === 'metadata') {
+    return message.rag?.runtime.retrievalStrategy === 'chapter_index_exact'
+      ? '章节直达'
+      : '资料直达'
+  }
+  if (mode === 'vector') return '向量检索'
+  if (mode === 'lexical_fallback') return '词法降级'
+  if (mode === 'empty') return '无命中'
+  if (mode === 'lexical') return '词法检索'
+  return typeof mode === 'string' && mode.trim() ? mode.trim() : '资料检索'
+}
+
+const ragSourceTypeLabel = (sourceType: string) => {
+  if (sourceType === 'project') return '项目'
+  if (sourceType === 'novel') return '小说'
+  if (sourceType === 'chapter') return '章节'
+  if (sourceType === 'art_style') return '视觉'
+  if (sourceType === 'director_manual') return '导演'
+  return sourceType || '资料'
+}
+
+const ragScoreLabel = (score: number) => (
+  Number.isFinite(score) ? score.toFixed(2) : '0.00'
+)
+
+const visibleRagHits = (message: ChatMessage): ScreenwritingRagHit[] => (
+  message.rag?.hits.slice(0, 3) ?? []
+)
+
+const hasRagFailure = (message: ChatMessage) => (
+  Boolean(message.rag?.runtime.failureReason)
+)
+
+const isServerTimingStage = (
+  stage: ScreenwritingServerTimingStage | undefined,
+): stage is ScreenwritingServerTimingStage => Boolean(stage)
+
+const visibleServerTimingStages = (message: ChatMessage): ScreenwritingServerTimingStage[] => {
+  const stages = message.serverTimings?.stages ?? []
+  return SERVER_TIMING_STAGE_ORDER
+    .map((stageName) => stages.find((stage) => stage.name === stageName))
+    .filter(isServerTimingStage)
+}
+
+const serverTimingStageLabel = (stageName: string) => (
+  SERVER_TIMING_STAGE_LABELS[stageName] ?? stageName
+)
+
+const shouldShowClientToServerTiming = (message: ChatMessage) => (
+  typeof message.serverTimings?.clientToServerMs === 'number'
+)
+
+const formatDurationMs = (durationMs: number | null | undefined) => {
+  const safeMs = Math.max(0, Math.floor(durationMs ?? 0))
+  if (safeMs < 1000) return `${safeMs}ms`
+  if (safeMs < 10000) return `${(safeMs / 1000).toFixed(1)}s`
+  return `${Math.round(safeMs / 1000)}s`
+}
+
+const shouldShowThinkingElapsed = (message: ChatMessage) => (
+  message.role === 'assistant'
+  && typeof message.thinkingElapsedMs === 'number'
+  && message.thinkingElapsedMs >= 0
+)
+
+const formatThinkingElapsed = (elapsedMs: number | undefined) => {
+  const safeMs = Math.max(0, Math.floor(elapsedMs ?? 0))
+  const totalSeconds = Math.floor(safeMs / 1000)
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
+}
 
 const waitForAssistantLayoutFrame = () => (
   new Promise<void>((resolve) => {
@@ -271,6 +403,111 @@ defineExpose({
   line-height: 1;
   font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
   font-variant-numeric: tabular-nums;
+}
+
+.assistant-bubble__thinking-time {
+  justify-self: end;
+  color: #9fb4cc;
+  font-size: 11px;
+  line-height: 1;
+  font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.assistant-rag {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  padding-top: 7px;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.assistant-rag__summary {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px 8px;
+  color: #9aa7b5;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.assistant-rag__summary span {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 6px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.06);
+}
+
+.assistant-rag.has-failure .assistant-rag__summary span:last-child {
+  color: #fcd34d;
+  border-color: rgba(245, 158, 11, 0.22);
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.assistant-rag__hits {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.assistant-rag__hits li {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 7px;
+  color: #8b949e;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.assistant-rag__hit-title {
+  min-width: 0;
+  overflow: hidden;
+  color: #b8c2cc;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.assistant-rag__hit-type,
+.assistant-rag__hit-score {
+  flex-shrink: 0;
+  color: #7e8893;
+  font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.assistant-server-timings {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+  color: #8b95a1;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.assistant-server-timings span {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 1px 6px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.13);
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.05);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .assistant-streaming-text {

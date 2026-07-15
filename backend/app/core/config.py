@@ -6,6 +6,15 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from app.core.rag.constants import (
+    DEFAULT_SCREENWRITING_RAG_CHUNK_CHARS,
+    DEFAULT_SCREENWRITING_RAG_CHUNK_OVERLAP,
+    DEFAULT_SCREENWRITING_RAG_INDEX_CHUNK_BATCH_SIZE,
+    DEFAULT_SCREENWRITING_RAG_MIN_VECTOR_SCORE,
+    DEFAULT_SCREENWRITING_RAG_VECTOR_STORE_ROOT,
+    DEFAULT_SCREENWRITING_RAG_VISUAL_INTENT_KEYWORDS,
+    DEFAULT_SCREENWRITING_RAG_WARMUP_DOCUMENT_BATCH_SIZE,
+)
 from app.core.tasks.constants import (
     DEFAULT_ASYNC_TASK_MODULES,
     DEFAULT_IMAGE_GENERATION_TIMEOUT_SECONDS,
@@ -135,7 +144,7 @@ class Settings(object):
     chapter_event_extraction_prompt_name: str = field( default_factory=lambda: os.getenv("CHAPTER_EVENT_EXTRACTION_PROMPT_NAME", "chapter_event_extraction") )  # 章节事件提取提示词名称
     novel_crawl_http_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("NOVEL_CRAWL_HTTP_TIMEOUT_SECONDS", "20.0")))  # 小说爬虫 HTTP 总超时秒数
     novel_crawl_http_connect_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("NOVEL_CRAWL_HTTP_CONNECT_TIMEOUT_SECONDS", "10.0")))  # 小说爬虫 HTTP 连接超时秒数
-    novel_crawl_impersonate: str = field(default_factory=lambda: os.getenv("NOVEL_CRAWL_IMPERSONATE", "chrome110"))  # 小说 rule 来源浏览器 TLS 指纹画像
+    novel_crawl_impersonate: str = field(default_factory=lambda: os.getenv("NOVEL_CRAWL_IMPERSONATE", "chrome"))  # 小说 rule 来源浏览器 TLS 指纹画像
     novel_crawl_proxy: str = field(default_factory=lambda: os.getenv("NOVEL_CRAWL_PROXY", ""))  # 小说爬虫代理地址，留空则不启用代理
     novel_crawl_chapter_coroutines_per_process: int = field(default_factory=lambda: int(os.getenv("NOVEL_CRAWL_CHAPTER_COROUTINES_PER_PROCESS", "8")))  # 小说章节抓取每进程协程数
     novel_crawl_max_processes: int = field(default_factory=lambda: int(os.getenv("NOVEL_CRAWL_MAX_PROCESSES", "4")))  # 小说章节抓取最大进程数
@@ -157,6 +166,20 @@ class Settings(object):
     media_generation_poll_interval_seconds: float = field(default_factory=lambda: float(os.getenv("MEDIA_GENERATION_POLL_INTERVAL_SECONDS", DEFAULT_MEDIA_GENERATION_POLL_INTERVAL_SECONDS)))  # 媒体生成异步轮询间隔秒数
     media_generation_max_concurrency: int = field(default_factory=lambda: int(os.getenv("MEDIA_GENERATION_MAX_CONCURRENCY", DEFAULT_MEDIA_GENERATION_MAX_CONCURRENCY)))  # 媒体生成默认最大并发数量
     provider_template_path: str = field(default_factory=lambda: os.getenv("PROVIDER_TEMPLATE_PATH", "./data/provider_template.py"))  # 服务商模板文件路径
+
+    agent_embedding_model_name: str = field(default_factory=lambda: os.getenv("AGENT_EMBEDDING_MODEL_NAME", "bge-small-zh-v1.5"))  # Agent 本地嵌入模型名称
+    agent_embedding_model_dir: str = field(default_factory=lambda: os.getenv("AGENT_EMBEDDING_MODEL_DIR", "./data/models/bge-small-zh-v1.5"))  # Agent 本地嵌入模型目录
+    agent_vector_store_dir: str = field(default_factory=lambda: os.getenv("AGENT_VECTOR_STORE_DIR", "./data/chroma/script-agent"))  # Agent ChromaDB 持久化目录
+    agent_embedding_dim: int = field(default_factory=lambda: int(os.getenv("AGENT_EMBEDDING_DIM", "512")))  # Agent 嵌入向量维度
+    agent_embedding_max_tokens: int = field(default_factory=lambda: int(os.getenv("AGENT_EMBEDDING_MAX_TOKENS", "512")))  # Agent 嵌入最大 token 数
+    agent_embedding_batch_size: int = field(default_factory=lambda: int(os.getenv("AGENT_EMBEDDING_BATCH_SIZE", "8")))  # Agent 嵌入单次 ONNX 推理批量上限
+    screenwriting_rag_chunk_chars: int = field(default_factory=lambda: int(os.getenv("SCREENWRITING_RAG_CHUNK_CHARS", DEFAULT_SCREENWRITING_RAG_CHUNK_CHARS)))  # 剧本创作 RAG 文档切片字符数
+    screenwriting_rag_chunk_overlap: int = field(default_factory=lambda: int(os.getenv("SCREENWRITING_RAG_CHUNK_OVERLAP", DEFAULT_SCREENWRITING_RAG_CHUNK_OVERLAP)))  # 剧本创作 RAG 文档切片重叠字符数
+    screenwriting_rag_index_chunk_batch_size: int = field(default_factory=lambda: int(os.getenv("SCREENWRITING_RAG_INDEX_CHUNK_BATCH_SIZE", DEFAULT_SCREENWRITING_RAG_INDEX_CHUNK_BATCH_SIZE)))  # 剧本创作 RAG 向量写入 chunk 批量上限
+    screenwriting_rag_warmup_document_batch_size: int = field(default_factory=lambda: int(os.getenv("SCREENWRITING_RAG_WARMUP_DOCUMENT_BATCH_SIZE", DEFAULT_SCREENWRITING_RAG_WARMUP_DOCUMENT_BATCH_SIZE)))  # 剧本创作 RAG 预热文档加载批量上限
+    screenwriting_rag_min_vector_score: float = field(default_factory=lambda: float(os.getenv("SCREENWRITING_RAG_MIN_VECTOR_SCORE", DEFAULT_SCREENWRITING_RAG_MIN_VECTOR_SCORE)))  # 剧本创作 RAG 向量命中最低分
+    screenwriting_rag_vector_store_root: str = field(default_factory=lambda: os.getenv("SCREENWRITING_RAG_VECTOR_STORE_ROOT", DEFAULT_SCREENWRITING_RAG_VECTOR_STORE_ROOT))  # 剧本创作 RAG ChromaDB 项目级持久化根目录
+    screenwriting_rag_visual_intent_keywords: tuple[str, ...] = field(default_factory=lambda: _env_str_tuple("SCREENWRITING_RAG_VISUAL_INTENT_KEYWORDS", DEFAULT_SCREENWRITING_RAG_VISUAL_INTENT_KEYWORDS))  # 剧本创作 RAG 技能资料召回意图关键词
 
 settings = Settings()
 

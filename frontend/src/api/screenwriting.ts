@@ -1,5 +1,19 @@
 import request from '@/request'
 
+export interface ScreenwritingPreflightCheck {
+  key: string
+  label: string
+  passed: boolean
+  detail: string
+}
+
+export interface ScreenwritingPreflightResult {
+  ready: boolean
+  requiredEventCount: number
+  eventReadyCount: number
+  textModel: string
+  checks: ScreenwritingPreflightCheck[]
+}
 
 export type ScreenwritingActiveTab = 'skeleton' | 'strategy' | 'script'
 
@@ -15,6 +29,62 @@ export interface ScreenwritingChatPayload {
   activeTab: ScreenwritingActiveTab
   messages: ScreenwritingChatTurn[]
   reset?: boolean
+  clientRequestStartedAtMs?: number
+}
+
+export type ScreenwritingRagWarmupApiStatus = 'started' | 'running' | 'ready'
+
+export interface ScreenwritingRagWarmupResponse {
+  status: ScreenwritingRagWarmupApiStatus
+  ragIsolationKey: string
+}
+
+export interface ScreenwritingRagRuntimeMetadata {
+  assetsReady?: boolean
+  vectorReady?: boolean
+  retrievalMode?: string
+  retrievalStrategy?: string
+  failureReason?: string | null
+  hitCount?: number
+  minVectorScore?: number
+  indexCacheHit?: boolean
+  [key: string]: unknown
+}
+
+export interface ScreenwritingRagHit {
+  sourceId: string
+  sourceType: string
+  title: string
+  score: number
+}
+
+export interface ScreenwritingRagPayload {
+  runtime: ScreenwritingRagRuntimeMetadata
+  hitCount: number
+  documentCount: number
+  hits: ScreenwritingRagHit[]
+}
+
+export interface ScreenwritingServerTimingStage {
+  name: string
+  durationMs: number
+  startedAtMs?: number
+  endedAtMs?: number
+}
+
+export interface ScreenwritingServerTimings {
+  totalMs: number
+  clientToServerMs?: number | null
+  stages: ScreenwritingServerTimingStage[]
+}
+
+export interface ScreenwritingChatRuntime {
+  agent?: string
+  conversation?: string
+  rag?: ScreenwritingRagPayload
+  thinkingElapsedMs?: number
+  serverTimings?: ScreenwritingServerTimings
+  [key: string]: unknown
 }
 
 export interface ScreenwritingChatResponse {
@@ -24,7 +94,18 @@ export interface ScreenwritingChatResponse {
   activeTab: ScreenwritingActiveTab
   content: string
   messages: ScreenwritingChatTurn[]
-  runtime: Record<string, unknown>
+  runtime: ScreenwritingChatRuntime
+}
+
+export interface ScreenwritingStreamEventData {
+  rag?: ScreenwritingRagPayload
+  detail?: string
+  errorType?: string
+  thinkingElapsedMs?: number
+  serverTimings?: ScreenwritingServerTimings
+  assistantMessage?: string
+  messages?: ScreenwritingChatTurn[]
+  [key: string]: unknown
 }
 
 export interface ScreenwritingStreamEvent {
@@ -34,11 +115,23 @@ export interface ScreenwritingStreamEvent {
   isolationKey: string
   modelId: string
   activeTab: ScreenwritingActiveTab
-  data?: Record<string, unknown>
+  data?: ScreenwritingStreamEventData
 }
 
-const projectNovelPath = (projectPublicId: string) => (
-  `/projects/${encodeURIComponent(projectPublicId.trim())}/novels`
+export const getScreenwritingPreflightApi = (
+  projectPublicId: string,
+) => (
+  request.get<ScreenwritingPreflightResult>(
+    `${projectScreenwritingPath(projectPublicId)}/preflight`,
+  )
+)
+
+export const warmupScreenwritingRagIndexApi = (
+  projectPublicId: string,
+) => (
+  request.post<ScreenwritingRagWarmupResponse>(
+    `${projectScreenwritingPath(projectPublicId)}/rag/warmup`,
+  )
 )
 
 export const chatScreenwritingApi = (
@@ -46,12 +139,16 @@ export const chatScreenwritingApi = (
   payload: ScreenwritingChatPayload,
 ) => (
   request.post<ScreenwritingChatResponse>(
-    `${projectNovelPath(projectPublicId)}/screenwriting/chat`,
+    `${projectScreenwritingPath(projectPublicId)}/chat`,
     payload,
     { timeout: 300000 },
   )
 )
 
 export const chatScreenwritingStreamUrl = (projectPublicId: string) => (
-  `/api${projectNovelPath(projectPublicId)}/screenwriting/chat/stream`
+  `/api${projectScreenwritingPath(projectPublicId)}/chat/stream`
+)
+
+const projectScreenwritingPath = (projectPublicId: string) => (
+  `/projects/${encodeURIComponent(projectPublicId.trim())}/novels/screenwriting`
 )

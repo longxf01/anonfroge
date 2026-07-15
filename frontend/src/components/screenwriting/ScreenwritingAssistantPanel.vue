@@ -6,6 +6,35 @@
         :message-count="messages.length"
       />
 
+      <section
+        v-if="ragWarmup.status !== 'idle'"
+        class="rag-warmup"
+        :class="`rag-warmup--${ragWarmup.status}`"
+        aria-live="polite"
+      >
+        <div class="rag-warmup__meta">
+          <span class="rag-warmup__dot"></span>
+          <span class="rag-warmup__label">{{ ragWarmup.label }}</span>
+          <span
+            v-if="ragWarmup.detail"
+            class="rag-warmup__detail"
+            :title="ragWarmup.detail"
+          >
+            {{ ragWarmup.detail }}
+          </span>
+        </div>
+        <div
+          class="rag-warmup__track"
+          role="progressbar"
+          :aria-label="ragWarmup.label"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          :aria-valuenow="ragWarmup.status === 'ready' || ragWarmup.status === 'failed' ? 100 : undefined"
+        >
+          <span class="rag-warmup__bar"></span>
+        </div>
+      </section>
+
       <ScreenwritingAssistantThread
         ref="threadRef"
         :messages="messages"
@@ -33,7 +62,7 @@ import { ref } from 'vue'
 import ScreenwritingAssistantComposer from './ScreenwritingAssistantComposer.vue'
 import ScreenwritingAssistantHeader from './ScreenwritingAssistantHeader.vue'
 import ScreenwritingAssistantThread from './ScreenwritingAssistantThread.vue'
-import type { ChatMessage } from './types'
+import type { ChatMessage, ScreenwritingRagWarmupViewState } from './types'
 
 interface AssistantThreadExpose {
   followOutput: () => Promise<void>
@@ -51,8 +80,10 @@ withDefaults(defineProps<{
   connectedModelId: string
   isSending: boolean
   streamingMessageId: number | null
+  ragWarmup?: ScreenwritingRagWarmupViewState
   inputLimit?: number
 }>(), {
+  ragWarmup: () => ({ status: 'idle', label: '' }),
   inputLimit: 2000,
 })
 
@@ -112,6 +143,110 @@ defineExpose({
     inset 0 1px 0 rgba(255, 255, 255, 0.05),
     0 22px 52px rgba(0, 0, 0, 0.42);
   overflow: hidden;
+}
+
+.rag-warmup {
+  display: grid;
+  gap: 7px;
+  padding: 9px 14px 10px;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+  background: rgba(15, 23, 42, 0.42);
+}
+
+.rag-warmup__meta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #cbd5e1;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.rag-warmup__dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #60a5fa;
+  box-shadow: 0 0 0 4px rgba(96, 165, 250, 0.12);
+}
+
+.rag-warmup__label {
+  flex: 0 0 auto;
+  font-weight: 650;
+}
+
+.rag-warmup__detail {
+  min-width: 0;
+  overflow: hidden;
+  color: #93a4b8;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rag-warmup__track {
+  position: relative;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.18);
+}
+
+.rag-warmup__bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 38%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #60a5fa, #22d3ee);
+}
+
+.rag-warmup--starting .rag-warmup__bar,
+.rag-warmup--running .rag-warmup__bar {
+  animation: rag-warmup-progress 1.15s ease-in-out infinite;
+}
+
+.rag-warmup--ready .rag-warmup__dot {
+  background: #22c55e;
+  box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.12);
+}
+
+.rag-warmup--ready .rag-warmup__bar {
+  width: 100%;
+  background: linear-gradient(90deg, #22c55e, #86efac);
+}
+
+.rag-warmup--failed .rag-warmup__dot {
+  background: #f59e0b;
+  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.12);
+}
+
+.rag-warmup--failed .rag-warmup__bar {
+  width: 100%;
+  background: linear-gradient(90deg, #f59e0b, #f97316);
+}
+
+@keyframes rag-warmup-progress {
+  0% {
+    transform: translateX(-110%);
+  }
+
+  50% {
+    transform: translateX(55%);
+  }
+
+  100% {
+    transform: translateX(270%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rag-warmup--starting .rag-warmup__bar,
+  .rag-warmup--running .rag-warmup__bar {
+    animation: none;
+    width: 68%;
+  }
 }
 
 @media (max-width: 920px) {

@@ -1,0 +1,23 @@
+from __future__ import annotations
+
+
+DEFAULT_SCREENWRITING_RAG_CHUNK_CHARS: int = 900
+DEFAULT_SCREENWRITING_RAG_CHUNK_OVERLAP: int = 120
+DEFAULT_SCREENWRITING_RAG_INDEX_CHUNK_BATCH_SIZE: int = 64
+DEFAULT_SCREENWRITING_RAG_WARMUP_DOCUMENT_BATCH_SIZE: int = 32
+DEFAULT_SCREENWRITING_RAG_MIN_VECTOR_SCORE: float = 0.35
+DEFAULT_SCREENWRITING_RAG_VECTOR_STORE_ROOT: str = "./data/chroma/screenwriting-rag"
+DEFAULT_SCREENWRITING_RAG_VISUAL_INTENT_KEYWORDS: tuple[str, ...] = (
+    "风格",
+    "导演",
+    "镜头",
+    "画面",
+    "视听",
+    "构图",
+    "运镜",
+    "摄影",
+    "美术",
+    "色彩",
+    "视觉",
+    "调度",
+)

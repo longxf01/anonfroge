@@ -9,7 +9,11 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from app.core.database import get_session
 from app.middlewares import common
 from app.routers.base import BaseView, route
-from app.schemas.screenwriting import ScreenwritingChatPayload, ScreenwritingChatResponse
+from app.schemas.screenwriting import (
+    ScreenwritingChatPayload,
+    ScreenwritingChatResponse,
+    ScreenwritingRagWarmupResponse,
+)
 from app.services import project as project_service
 from app.services import screenwriting as screenwriting_service
 
@@ -116,6 +120,30 @@ class ScreenwritingView(BaseView):
                 "X-Content-Type-Options": "nosniff",
             },
         )
+
+    @route(
+        "/rag/warmup",
+        methods=["POST"],
+        response_model=ScreenwritingRagWarmupResponse,
+        middlewares=SCREENWRITING_ROUTE_MIDDLEWARES,
+        summary="预热剧本创作 RAG 向量索引",
+        description="在用户进入剧本创作页面时异步调度当前项目的 RAG 向量索引构建。",
+    )
+    async def warmup_screenwriting_rag_index(
+        self,
+        project_public_id: str,
+        request: Request,
+        session: SessionDep,
+    ) -> ScreenwritingRagWarmupResponse:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            return await screenwriting_service.warmup_screenwriting_rag_index(
+                session,
+                project_public_id,
+                current_user_public_id,
+            )
+        except (project_service.ProjectServiceError, screenwriting_service.ScreenwritingServiceError) as exc:
+            self._raise_as_http(exc)
 
 
 router = ScreenwritingView()()

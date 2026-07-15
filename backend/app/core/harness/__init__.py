@@ -1,5 +1,7 @@
 """通用 Harness Agent 底座入口。"""
 
+from app.core.harness.memory.scope import HarnessMemoryScope
+from app.core.harness.memory.vector import ChromaVectorMemory, RetrievedChunk, VectorMemory, lexical_score
 from app.core.harness.profiles import (
     SCREENWRITING_DEEPAGENTS_EXCLUDED_TOOLS,
     SCREENWRITING_HARNESS_PROFILE_KEY,
@@ -7,7 +9,6 @@ from app.core.harness.profiles import (
     load_screenwriting_harness_prompt,
     register_screenwriting_harness_profile,
 )
-from app.core.harness.memory.scope import HarnessMemoryScope
 from app.core.harness.runtime.agent import (
     HarnessAgent,
     HarnessAgentError,
@@ -16,24 +17,22 @@ from app.core.harness.runtime.agent import (
     ScriptAgentResult,
     ScriptAgentRuntime,
 )
-from app.core.harness.runtime.deepagents import DeepAgentsRuntime
-from app.core.harness.tools.adapter import ModelGatewayAdapter
-from app.core.harness.tools.chat_model import ProviderGatewayChatModel
 
 __all__ = [
-    "DeepAgentsRuntime",
     "HarnessAgent",
     "HarnessAgentError",
     "HarnessMemoryScope",
-    "ModelGatewayAdapter",
-    "ProviderGatewayChatModel",
+    "ChromaVectorMemory",
+    "RetrievedChunk",
     "SCREENWRITING_DEEPAGENTS_EXCLUDED_TOOLS",
     "SCREENWRITING_HARNESS_PROFILE_KEY",
     "ScriptAgentEvent",
     "ScriptAgentInput",
     "ScriptAgentResult",
     "ScriptAgentRuntime",
+    "VectorMemory",
     "build_screenwriting_harness_profile",
+    "lexical_score",
     "load_screenwriting_harness_prompt",
     "register_screenwriting_harness_profile",
 ]
