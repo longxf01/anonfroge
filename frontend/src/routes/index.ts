@@ -26,6 +26,10 @@ const routes = [
     path: '/original',
     component: () => import('@/pages/Original.vue')
   },
+  {
+    path: '/tasks',
+    component: () => import('@/pages/Tasks.vue')
+  },
 ]
 
 

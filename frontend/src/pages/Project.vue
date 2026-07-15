@@ -11,11 +11,6 @@
             </button>
           </el-tooltip>
 
-          <el-tooltip content="任务" placement="right">
-            <button class="nav-btn" aria-label="任务" @click="showComingSoon">
-              <el-icon><List /></el-icon>
-            </button>
-          </el-tooltip>
         </div>
 
         <div class="side-bottom">
@@ -114,6 +109,12 @@
               <time class="time">{{ formatDate(project.created_at) }}</time>
 
               <div class="actions">
+                <el-tooltip content="任务" placement="top">
+                  <el-button text circle class="icon-action" @click.stop="openProjectTasks(project)">
+                    <el-icon><List /></el-icon>
+                  </el-button>
+                </el-tooltip>
+
                 <el-tooltip content="成员" placement="top">
                   <el-button text circle class="icon-action" @click.stop="openMemberDialog(project)">
                     <el-icon><UserFilled /></el-icon>
@@ -1270,6 +1271,14 @@ const openProject = (project: ProjectRecord) => {
     return
   }
   router.push({ path, query: { id: project.public_id } })
+}
+
+const openProjectTasks = (project: ProjectRecord) => {
+  if (project.disabled_at) {
+    ElMessage.warning('该项目已禁用，无法查看任务')
+    return
+  }
+  router.push({ path: '/tasks', query: { id: project.public_id, type: project.project_type } })
 }
 
 const showComingSoon = () => {

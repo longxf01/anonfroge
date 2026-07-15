@@ -53,6 +53,22 @@ TaskHandlerResult = dict[str, Any] | None
 TaskHandler = Callable[[Any], TaskHandlerResult | Awaitable[TaskHandlerResult]]
 
 
+class TaskHandlerFailure(Exception):
+    """任务处理器主动声明的业务失败，可携带诊断结果写回任务子项。"""
+
+    def __init__(
+        self,
+        error_message: str,
+        *,
+        error_code: str = "task_handler_failed",
+        result: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(error_message)
+        self.error_code = error_code.strip() or "task_handler_failed"
+        self.error_message = error_message.strip() or self.error_code
+        self.result = result or {}
+
+
 class TaskHandlerRegistry:
     """异步任务处理器注册表。"""
 
@@ -297,6 +313,7 @@ class AsyncTaskEngine:
         status: TaskStatus | None = None,
         created_by: str = "",
         queue_name: str = "",
+        project_public_id: str = "",
     ) -> TaskJobPage:
         """分页查询异步任务列表。"""
         return await task_service.list_task_jobs(
@@ -307,6 +324,7 @@ class AsyncTaskEngine:
             status=status,
             created_by=created_by,
             queue_name=queue_name,
+            project_public_id=project_public_id,
         )
 
     async def get_task_job(
@@ -456,6 +474,7 @@ class AsyncTaskEngine:
         *,
         stream_id: str = "",
         stage: str = "handler",
+        result: dict[str, Any] | None = None,
     ) -> bool:
         """标记任务子项执行失败，子项不存在时返回 False。"""
         try:
@@ -468,6 +487,7 @@ class AsyncTaskEngine:
                 retry_backoff_seconds=self.config.worker_retry_backoff_seconds,
                 stream_id=stream_id,
                 stage=stage,
+                result=result,
             )
         except TaskItemNotFoundError:
             await session.rollback()

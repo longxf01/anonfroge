@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import func, or_, update
-from sqlmodel import select
+from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.models.tasks import TaskDeadLetter, TaskItem, TaskJob, TaskStatus, utc_now
@@ -124,6 +124,7 @@ async def list_task_jobs(
     status: TaskStatus | None = None,
     created_by: str = "",
     queue_name: str = "",
+    project_public_id: str = "",
 ) -> TaskJobPage:
     """分页查询异步任务列表。"""
     page = max(page, 1)
@@ -139,6 +140,29 @@ async def list_task_jobs(
         if value:
             conditions.append(column == value.strip())
 
+    # 项目任务页按任务 payload 中的 project_public_id 归属过滤。
+    # 当前任务底座不直接绑定项目表，因此这里先用业务 payload 做项目维度适配。
+    if project_public_id:
+        statement = (
+            select(TaskJob)
+            .where(*conditions)
+            .order_by(TaskJob.created_at.desc(), TaskJob.id.desc())
+        )
+        result = await session.exec(statement)
+        matched_jobs = [
+            job
+            for job in result.all()
+            if _payload_project_public_id(job.payload) == project_public_id.strip()
+        ]
+        start = (page - 1) * limit
+        page_jobs = matched_jobs[start : start + limit]
+        return TaskJobPage(
+            data=await _to_job_reads_with_item_counts(session, page_jobs),
+            total=len(matched_jobs),
+            page=page,
+            limit=limit,
+        )
+
     count_statement = select(func.count()).select_from(TaskJob).where(*conditions)
     count_result = await session.exec(count_statement)
     total = int(count_result.one())
@@ -151,8 +175,9 @@ async def list_task_jobs(
         .limit(limit)
     )
     result = await session.exec(statement)
+    jobs = list(result.all())
     return TaskJobPage(
-        data=[_to_job_read(job) for job in result.all()],
+        data=await _to_job_reads_with_item_counts(session, jobs),
         total=total,
         page=page,
         limit=limit,
@@ -168,7 +193,7 @@ async def get_task_job(
     """按公开标识获取异步任务。"""
     job = await _get_task_job_model_or_raise(session, job_public_id)
     if not include_items:
-        return _to_job_read(job)
+        return _to_job_read(job, await _list_task_item_models(session, job.id or 0))
     return _to_job_detail(job, await _list_task_item_models(session, job.id or 0))
 
 
@@ -199,7 +224,7 @@ async def update_task_job_status(
     session.add(job)
     await session.commit()
     await session.refresh(job)
-    return _to_job_read(job)
+    return _to_job_read(job, await _list_task_item_models(session, int(job.id or 0)))
 
 
 async def update_task_item_status(
@@ -297,6 +322,7 @@ async def record_task_item_failure(
     retry_backoff_seconds: float = 30.0,
     stream_id: str = "",
     stage: str = "handler",
+    result: dict[str, Any] | None = None,
 ) -> TaskItemRead:
     """记录任务子项失败；未达最大次数时按指数退避重新排队，超限后进入 DLQ。"""
     item = await _get_task_item_model_or_raise(session, item_public_id)
@@ -307,6 +333,8 @@ async def record_task_item_failure(
     item.worker_id = worker_id.strip()
     item.heartbeat_at = None
     item.updated_at = now
+    if result is not None:
+        item.result = _dump_json(result)
 
     if item.attempt_count < item.max_attempts:
         item.status = TaskStatus.PENDING
@@ -353,7 +381,32 @@ async def pause_task_job(session: AsyncSession, job_public_id: str) -> TaskJobRe
     await refresh_task_job_progress(session, job)
     await session.commit()
     await session.refresh(job)
-    return _to_job_read(job)
+    return _to_job_read(job, await _list_task_item_models(session, int(job.id or 0)))
+
+
+async def pause_task_items(
+    session: AsyncSession,
+    job_public_id: str,
+    item_public_ids: set[str],
+) -> TaskJobRead:
+    """暂停任务下指定的尚未开始执行子项。"""
+    job = await _get_task_job_model_or_raise(session, job_public_id)
+    if job.status in JOB_TERMINAL_STATUSES:
+        raise TaskValidationError("已结束的任务不能暂停")
+    target_ids = {value.strip() for value in item_public_ids if value and value.strip()}
+    items = await _list_task_item_models(session, int(job.id or 0))
+    now = utc_now()
+    for item in items:
+        if item.public_id not in target_ids or item.status not in PAUSABLE_ITEM_STATUSES:
+            continue
+        item.status = TaskStatus.PAUSED
+        item.worker_id = ""
+        item.updated_at = now
+        session.add(item)
+    await refresh_task_job_progress(session, job)
+    await session.commit()
+    await session.refresh(job)
+    return _to_job_read(job, await _list_task_item_models(session, int(job.id or 0)))
 
 
 async def resume_task_job(session: AsyncSession, job_public_id: str) -> TaskJobRead:
@@ -373,7 +426,32 @@ async def resume_task_job(session: AsyncSession, job_public_id: str) -> TaskJobR
     await refresh_task_job_progress(session, job)
     await session.commit()
     await session.refresh(job)
-    return _to_job_read(job)
+    return _to_job_read(job, await _list_task_item_models(session, int(job.id or 0)))
+
+
+async def resume_task_items(
+    session: AsyncSession,
+    job_public_id: str,
+    item_public_ids: set[str],
+) -> TaskJobRead:
+    """恢复任务下指定的已暂停子项。"""
+    job = await _get_task_job_model_or_raise(session, job_public_id)
+    if job.status in JOB_TERMINAL_STATUSES:
+        raise TaskValidationError("已结束的任务不能恢复")
+    target_ids = {value.strip() for value in item_public_ids if value and value.strip()}
+    items = await _list_task_item_models(session, int(job.id or 0))
+    now = utc_now()
+    for item in items:
+        if item.public_id not in target_ids or item.status not in RESUMABLE_ITEM_STATUSES:
+            continue
+        item.status = TaskStatus.PENDING
+        item.worker_id = ""
+        item.updated_at = now
+        session.add(item)
+    await refresh_task_job_progress(session, job)
+    await session.commit()
+    await session.refresh(job)
+    return _to_job_read(job, await _list_task_item_models(session, int(job.id or 0)))
 
 
 async def cancel_task_job(session: AsyncSession, job_public_id: str) -> TaskJobRead:
@@ -394,7 +472,7 @@ async def cancel_task_job(session: AsyncSession, job_public_id: str) -> TaskJobR
     await refresh_task_job_progress(session, job)
     await session.commit()
     await session.refresh(job)
-    return _to_job_read(job)
+    return _to_job_read(job, await _list_task_item_models(session, int(job.id or 0)))
 
 
 async def delete_task_job(session: AsyncSession, job_public_id: str) -> None:
@@ -697,6 +775,37 @@ async def _list_task_item_models(
     return list(result.all())
 
 
+async def _list_task_item_models_by_job_ids(
+    session: AsyncSession,
+    job_ids: list[int],
+) -> dict[int, list[TaskItem]]:
+    """按任务内部主键批量读取未删除子项。"""
+    if not job_ids:
+        return {}
+    statement = (
+        select(TaskItem)
+        .where(TaskItem.disabled_at.is_(None), col(TaskItem.job_id).in_(job_ids))
+        .order_by(TaskItem.priority.desc(), TaskItem.id)
+    )
+    result = await session.exec(statement)
+    items_by_job_id: dict[int, list[TaskItem]] = {}
+    for item in result.all():
+        items_by_job_id.setdefault(item.job_id, []).append(item)
+    return items_by_job_id
+
+
+async def _to_job_reads_with_item_counts(
+    session: AsyncSession,
+    jobs: list[TaskJob],
+) -> list[TaskJobRead]:
+    """批量转换任务响应，并附带准确的子项状态计数。"""
+    items_by_job_id = await _list_task_item_models_by_job_ids(
+        session,
+        [int(job.id or 0) for job in jobs if job.id is not None],
+    )
+    return [_to_job_read(job, items_by_job_id.get(int(job.id or 0), [])) for job in jobs]
+
+
 def _build_task_item(job: TaskJob, payload: TaskItemCreate, now: datetime) -> TaskItem:
     item_type = payload.item_type.strip() or job.task_type
     return TaskItem(
@@ -806,12 +915,19 @@ def _load_json(value: str) -> dict[str, Any]:
     return {"value": loaded}
 
 
-def _to_job_read(job: TaskJob) -> TaskJobRead:
-    return TaskJobRead(**_read_schema_values(job, "payload", "result"))
+def _payload_project_public_id(raw_payload: str) -> str:
+    """从任务 payload 中读取所属项目公开标识。"""
+    return str(_load_json(raw_payload).get("project_public_id") or "")
+
+
+def _to_job_read(job: TaskJob, items: list[TaskItem] | None = None) -> TaskJobRead:
+    values = _read_schema_values(job, "payload", "result")
+    values.update(_item_status_count_values(items or []))
+    return TaskJobRead(**values)
 
 
 def _to_job_detail(job: TaskJob, items: list[TaskItem]) -> TaskJobDetail:
-    return TaskJobDetail(**_to_job_read(job).model_dump(), items=[_to_item_read(item) for item in items])
+    return TaskJobDetail(**_to_job_read(job, items).model_dump(), items=[_to_item_read(item) for item in items])
 
 
 def _to_item_read(item: TaskItem) -> TaskItemRead:
@@ -820,6 +936,16 @@ def _to_item_read(item: TaskItem) -> TaskItemRead:
 
 def _to_dead_letter_read(dead_letter: TaskDeadLetter) -> TaskDeadLetterRead:
     return TaskDeadLetterRead(**_read_schema_values(dead_letter, "payload", "result"))
+
+
+def _item_status_count_values(items: list[TaskItem]) -> dict[str, int]:
+    counts = Counter(item.status for item in items)
+    return {
+        "pending_items": counts[TaskStatus.PENDING],
+        "queued_items": counts[TaskStatus.QUEUED],
+        "running_items": counts[TaskStatus.RUNNING],
+        "paused_items": counts[TaskStatus.PAUSED],
+    }
 
 
 def _read_schema_values(model: Any, *json_fields: str) -> dict[str, Any]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from app.services import provider_runtime
@@ -31,8 +32,11 @@ class ProviderModelGateway:
                 input_values=input_values,
                 timeout=self.timeout,
             )
-            raw_output = await provider.generate(model_id=model_id, messages=messages, **kwargs)
+            request = provider.generate(model_id=model_id, messages=messages, **kwargs)
+            raw_output = await asyncio.wait_for(request, timeout=self.timeout) if self.timeout > 0 else await request
             return self._extract_text(raw_output)
+        except TimeoutError as exc:
+            raise ProviderModelGatewayError(f"模型调用超时：{self.timeout}秒") from exc
         except ProviderModelGatewayError:
             raise
         except Exception as exc:

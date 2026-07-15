@@ -16,6 +16,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from app.core.tasks.engine import (
     AsyncTaskEngine,
     TaskHandler,
+    TaskHandlerFailure,
     TaskHandlerRegistry,
     TaskHandlerResult,
     default_async_task_engine,
@@ -229,6 +230,32 @@ class TaskWorker:
                     ],
                 )
                 return
+            except TaskHandlerFailure as exc:
+                await session.rollback()
+                await self._stop_heartbeat(heartbeat_task)
+                acked = await self._mark_item_failed_and_ack(
+                    session,
+                    record,
+                    exc.error_code,
+                    exc.error_message,
+                    stage="handler_failure",
+                    result=exc.result,
+                )
+                self._log_task_event(
+                    logging.WARNING,
+                    "任务处理器声明业务失败",
+                    "task_handler_failure",
+                    record,
+                    message,
+                    started_at=started_at,
+                    exc_info=True,
+                    extra_fields=[
+                        ("错误", "error", exc.error_message),
+                        ("错误码", "error_code", exc.error_code),
+                        ("ACK", "ack", acked),
+                    ],
+                )
+                return
             except Exception as exc:
                 await session.rollback()
                 await self._stop_heartbeat(heartbeat_task)
@@ -364,7 +391,6 @@ class TaskWorker:
         done = {task for task in in_flight if task.done()}
         in_flight.difference_update(done)
 
-            
     def _start_heartbeat(self, item_public_id: str) -> asyncio.Task[None] | None:
         interval = self.task_engine.config.worker_heartbeat_interval_seconds
         if interval <= 0:
@@ -436,6 +462,7 @@ class TaskWorker:
         error_message: str,
         *,
         stage: str,
+        result: dict[str, Any] | None = None,
     ) -> int | None:
         try:
             await self._mark_item_failed(
@@ -445,6 +472,7 @@ class TaskWorker:
                 error_message,
                 stream_id=record.stream_id,
                 stage=stage,
+                result=result,
             )
         except Exception as exc:
             await session.rollback()
@@ -453,6 +481,7 @@ class TaskWorker:
                 stage=f"writeback_{stage}",
                 error_code="task_failure_writeback_error",
                 error_message=str(exc),
+                result=result,
             )
             logger.exception(
                 "任务失败状态写回失败，已尝试写入死信记录：stream_id=%s item_public_id=%s",
@@ -505,6 +534,7 @@ class TaskWorker:
         *,
         stream_id: str = "",
         stage: str = "handler",
+        result: dict[str, Any] | None = None,
     ) -> None:
         await self.task_engine.mark_task_item_failed(
             session,
@@ -514,6 +544,7 @@ class TaskWorker:
             self.consumer_name,
             stream_id=stream_id,
             stage=stage,
+            result=result,
         )
 
     async def _ack(self, stream_id: str) -> int:
