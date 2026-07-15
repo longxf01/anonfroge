@@ -25,6 +25,7 @@ dist-ssr
 # Python cache
 __pycache__/
 *.pyc
-#data
-/docker/*/data
+# data
+docker/*/data
 data/skills
+data/models/

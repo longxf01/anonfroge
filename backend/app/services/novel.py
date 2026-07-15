@@ -49,6 +49,8 @@ from app.schemas.novel import (
     NovelChapterRead,
     NovelChapterUpdate,
     NovelImportSplitRule,
+    ScreenwritingPreflightCheck,
+    ScreenwritingPreflightResult,
 )
 from app.schemas.tasks import TaskItemCreate, TaskItemRead, TaskJobCreate, TaskJobDetail
 from app.services.agent_gateway import ProviderModelGateway
@@ -121,6 +123,8 @@ SINGLE_CHAPTER_CLEAN_MAX_CONCURRENCY = 3
 NOVEL_CHAPTER_CLEAN_TASK_TYPE = "novel.chapter.clean_event"
 NOVEL_CHAPTER_CLEAN_QUEUE_NAME = "novel"
 BATCH_CLEAN_STREAM_INTERVAL_SECONDS = 2.0
+# 进入剧本创作前，要求事件提取成功的章节数量下限。
+SCREENWRITING_REQUIRED_EVENT_COUNT = 10
 logger = logging.getLogger(__name__)
 _single_chapter_clean_tasks: set[asyncio.Task[None]] = set()
 _single_chapter_clean_semaphore: asyncio.Semaphore | None = None
@@ -215,6 +219,67 @@ async def list_chapter_clean_statuses(
     project = await _get_project_with_id(session, project_public_id, current_user_public_id)
     chapters = await _list_chapter_models_by_ids(session, project.id, chapter_ids)
     return [_to_clean_status(chapter) for chapter in chapters]
+
+
+async def get_screenwriting_preflight(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+) -> ScreenwritingPreflightResult:
+    """校验当前项目是否满足进入剧本创作的准入条件。
+
+    校验项：
+        1. 项目已配置文本模型；
+        2. 事件提取成功（event_state==1）的章节数达到下限。
+    """
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+
+    text_model = project.text_model.strip()
+    text_model_passed = bool(text_model)
+
+    count_statement = (
+        select(func.count())
+        .select_from(NovelChapter)
+        .where(
+            NovelChapter.project_id == project.id,
+            NovelChapter.event_state == 1,
+        )
+    )
+    count_result = await session.exec(count_statement)
+    event_ready_count = int(count_result.one())
+    required = SCREENWRITING_REQUIRED_EVENT_COUNT
+    event_passed = event_ready_count >= required
+
+    checks = [
+        ScreenwritingPreflightCheck(
+            key="text_model",
+            label="已配置文本模型",
+            passed=text_model_passed,
+            detail=(
+                f"当前文本模型：{text_model}"
+                if text_model_passed
+                else "项目尚未配置文本模型，请先在项目设置中选择文本模型"
+            ),
+        ),
+        ScreenwritingPreflightCheck(
+            key="chapter_events",
+            label=f"已完成至少 {required} 章事件提取",
+            passed=event_passed,
+            detail=(
+                f"已完成事件提取 {event_ready_count} 章"
+                if event_passed
+                else f"已完成事件提取 {event_ready_count} 章，至少需要 {required} 章，请先在小说页清洗章节事件"
+            ),
+        ),
+    ]
+
+    return ScreenwritingPreflightResult(
+        ready=text_model_passed and event_passed,
+        required_event_count=required,
+        event_ready_count=event_ready_count,
+        text_model=text_model,
+        checks=checks,
+    )
 
 
 async def create_chapter(
@@ -727,12 +792,13 @@ async def clean_chapter_for_task(
     project_public_id: str,
     chapter_id: int,
     current_user_public_id: str,
-    model_id: str | None = None,
+    *,
+    model_id: str = "",
 ) -> dict[str, Any]:
     """清洗异步任务章节事件，并返回可写入任务结果的执行载荷。"""
     project = await _get_project_with_id(session, project_public_id, current_user_public_id)
     chapter = await _get_chapter_model_or_raise(session, project.id, chapter_id)
-    prompt_trace = await _apply_chapter_event_extraction(chapter, (model_id or "").strip() or project.text_model)
+    prompt_trace = await _apply_chapter_event_extraction(chapter, model_id.strip() or project.text_model)
     chapter.updated_at = utc_now()
     session.add(chapter)
     await session.commit()
@@ -845,6 +911,8 @@ async def batch_clean_chapters(
 
     now = utc_now()
     model_id = project.text_model.strip()
+    if not model_id:
+        raise NovelChapterValidationError("项目未配置文本模型，无法提交批量清洗任务")
     items: list[TaskItemCreate] = []
     for chapter in chapters:
         chapter_id = int(chapter.id or 0)

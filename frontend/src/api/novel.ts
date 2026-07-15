@@ -281,6 +281,29 @@ export const listNovelChapterCleanStatusesApi = (
   })
 )
 
+export interface ScreenwritingPreflightCheck {
+  key: string
+  label: string
+  passed: boolean
+  detail: string
+}
+
+export interface ScreenwritingPreflightResult {
+  ready: boolean
+  requiredEventCount: number
+  eventReadyCount: number
+  textModel: string
+  checks: ScreenwritingPreflightCheck[]
+}
+
+export const getScreenwritingPreflightApi = (
+  projectPublicId: string,
+) => (
+  request.get<ScreenwritingPreflightResult>(
+    `${projectNovelPath(projectPublicId)}/screenwriting/preflight`,
+  )
+)
+
 export const createNovelChapterApi = (
   projectPublicId: string,
   payload: NovelChapterPayload,

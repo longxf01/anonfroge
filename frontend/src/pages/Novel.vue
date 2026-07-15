@@ -67,6 +67,77 @@
               <el-icon><Plus /></el-icon>
               新建章节
             </el-button>
+
+            <div ref="screenwritingEntryRef" class="screenwriting-entry">
+              <el-button
+                class="screenwriting-button"
+                size="large"
+                :loading="screenwritingChecking"
+                @click="startScreenwritingPreflight"
+              >
+                <el-icon v-if="!screenwritingChecking"><VideoCamera /></el-icon>
+                剧本创作
+              </el-button>
+
+              <transition name="preflight-pop">
+                <div v-if="preflightVisible" class="preflight-panel">
+                  <div class="preflight-panel__head">
+                    <span class="preflight-panel__title">剧本创作准入校验</span>
+                    <button
+                      type="button"
+                      class="preflight-close"
+                      aria-label="关闭"
+                      @click="closePreflightPanel"
+                    >
+                      <el-icon><Close /></el-icon>
+                    </button>
+                  </div>
+
+                  <div v-if="preflightPhase === 'loading'" class="preflight-loading">
+                    <el-icon class="is-spin"><Loading /></el-icon>
+                    <span>正在校验项目准入条件…</span>
+                  </div>
+
+                  <div v-else-if="preflightPhase === 'error'" class="preflight-error">
+                    <el-icon><WarningFilled /></el-icon>
+                    <div>
+                      <p>校验请求失败</p>
+                      <span>{{ preflightError }}</span>
+                    </div>
+                  </div>
+
+                  <ul v-else class="preflight-list">
+                    <li
+                      v-for="item in preflightItems"
+                      :key="item.key"
+                      class="preflight-item"
+                      :class="`preflight-item--${item.status}`"
+                    >
+                      <span class="preflight-item__icon">
+                        <el-icon v-if="item.status === 'checking'" class="is-spin"><Loading /></el-icon>
+                        <el-icon v-else-if="item.status === 'passed'"><CircleCheckFilled /></el-icon>
+                        <el-icon v-else><CircleCloseFilled /></el-icon>
+                      </span>
+                      <span class="preflight-item__body">
+                        <span class="preflight-item__label">{{ item.label }}</span>
+                        <span v-if="item.status === 'failed'" class="preflight-item__detail">{{ item.detail }}</span>
+                      </span>
+                    </li>
+                  </ul>
+
+                  <div v-if="preflightPhase === 'done-ok'" class="preflight-foot preflight-foot--ok">
+                    <el-icon class="is-spin"><Loading /></el-icon>
+                    <span>校验通过，正在进入剧本创作…</span>
+                  </div>
+                  <div v-else-if="preflightPhase === 'done-fail'" class="preflight-foot preflight-foot--fail">
+                    <span>请完成上述条件后再试</span>
+                    <el-button size="small" class="preflight-retry" @click="startScreenwritingPreflight">
+                      重新校验
+                    </el-button>
+                  </div>
+                </div>
+              </transition>
+            </div>
           </div>
         </header>
 
@@ -423,12 +494,15 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { AxiosError } from 'axios'
 import type { FormInstance, FormRules, TableInstance } from 'element-plus'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
+  CircleCheckFilled,
+  CircleCloseFilled,
+  Close,
   Connection,
   Delete,
   Document,
@@ -436,13 +510,16 @@ import {
   EditPen,
   Folder,
   List,
+  Loading,
   MagicStick,
   Plus,
   Reading,
   Search,
   Setting,
   Upload,
+  VideoCamera,
   View,
+  WarningFilled,
 } from '@element-plus/icons-vue'
 import {
   batchCleanJobEventsUrl,
@@ -453,6 +530,7 @@ import {
   createNovelChapterApi,
   deleteNovelChapterApi,
   getBatchCleanJobProgressApi,
+  getScreenwritingPreflightApi,
   importCrawlChaptersApi,
   importNovelChaptersApi,
   listActiveBatchCleanJobsApi,
@@ -468,6 +546,7 @@ import {
   type NovelChapterImportItemPayload,
   type NovelChapterPayload,
   type NovelChapterRecord,
+  type ScreenwritingPreflightResult,
 } from '@/api/novel'
 import { fetchWithAuthRetry } from '@/request'
 import NovelCrawlDialog from '../components/NovelCrawlDialog.vue'
@@ -539,6 +618,24 @@ const viewDrawerVisible = ref(false)
 const viewingNovelId = ref<number | null>(null)
 
 const settingsVisible = ref(false)
+
+type PreflightItemStatus = 'checking' | 'passed' | 'failed'
+type PreflightPhase = 'idle' | 'loading' | 'checking' | 'done-ok' | 'done-fail' | 'error'
+
+interface PreflightItem {
+  key: string
+  label: string
+  detail: string
+  status: PreflightItemStatus
+}
+
+const screenwritingEntryRef = ref<HTMLElement | null>(null)
+const screenwritingChecking = ref(false)
+const preflightVisible = ref(false)
+const preflightPhase = ref<PreflightPhase>('idle')
+const preflightItems = ref<PreflightItem[]>([])
+const preflightError = ref('')
+let preflightRunId = 0
 
 const form = reactive<NovelChapterForm>({
   chapterIndex: 1,
@@ -1333,6 +1430,85 @@ const showComingSoon = () => {
   ElMessage.info('功能开发中')
 }
 
+const preflightDelay = (ms: number) => new Promise<void>((resolve) => {
+  window.setTimeout(resolve, ms)
+})
+
+const closePreflightPanel = () => {
+  preflightRunId += 1
+  preflightVisible.value = false
+  screenwritingChecking.value = false
+  preflightItems.value = []
+  preflightPhase.value = 'idle'
+  preflightError.value = ''
+}
+
+const startScreenwritingPreflight = async () => {
+  if (!ensureProjectReady() || screenwritingChecking.value) return
+  const runId = preflightRunId + 1
+  preflightRunId = runId
+  screenwritingChecking.value = true
+  preflightVisible.value = true
+  preflightPhase.value = 'loading'
+  preflightItems.value = []
+  preflightError.value = ''
+
+  let result: ScreenwritingPreflightResult
+  try {
+    const { data } = await getScreenwritingPreflightApi(projectPublicId.value)
+    result = data
+  } catch (error) {
+    if (runId !== preflightRunId) return
+    preflightPhase.value = 'error'
+    preflightError.value = getErrorMessage(error)
+    screenwritingChecking.value = false
+    return
+  }
+  if (runId !== preflightRunId) return
+
+  preflightItems.value = result.checks.map((check) => ({
+    key: check.key,
+    label: check.label,
+    detail: check.detail,
+    status: 'checking',
+  }))
+  preflightPhase.value = 'checking'
+
+  for (let index = 0; index < result.checks.length; index += 1) {
+    await preflightDelay(620)
+    if (runId !== preflightRunId) return
+    const check = result.checks[index]
+    preflightItems.value[index] = {
+      key: check.key,
+      label: check.label,
+      detail: check.detail,
+      status: check.passed ? 'passed' : 'failed',
+    }
+  }
+
+  await preflightDelay(480)
+  if (runId !== preflightRunId) return
+
+  if (result.ready) {
+    preflightPhase.value = 'done-ok'
+    await preflightDelay(760)
+    if (runId !== preflightRunId) return
+    router.push({ path: '/screenwriting', query: { id: projectPublicId.value } })
+    return
+  }
+
+  preflightPhase.value = 'done-fail'
+  screenwritingChecking.value = false
+}
+
+const onPreflightDocumentClick = (event: MouseEvent) => {
+  if (!preflightVisible.value) return
+  const entry = screenwritingEntryRef.value
+  if (entry && !entry.contains(event.target as Node)) {
+    closePreflightPanel()
+  }
+}
+
 const importDialogVisible = ref(false)
 const openImportDialog = () => {
   if (!ensureProjectReady()) return
@@ -1533,7 +1709,13 @@ watch(searchKeyword, () => {
   }, 300)
 })
 
+onMounted(() => {
+  document.addEventListener('mousedown', onPreflightDocumentClick)
+})
+
 onBeforeUnmount(() => {
+  preflightRunId += 1
+  document.removeEventListener('mousedown', onPreflightDocumentClick)
   stopAllSingleCleanPolling({ clearPersisted: false })
   stopBatchCleanPolling()
   stopBatchCleanAutoDismiss()
@@ -1768,6 +1950,284 @@ onBeforeUnmount(() => {
 
 .header-action:active {
   transform: translateY(0);
+}
+
+/* 剧本创作入口与准入校验浮层 */
+.screenwriting-entry {
+  position: relative;
+}
+
+.screenwriting-button {
+  height: 38px;
+  padding: 0 16px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(96, 165, 250, 0.4);
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #dbeafe;
+  background: linear-gradient(180deg, rgba(37, 99, 235, 0.26), rgba(37, 99, 235, 0.12));
+  box-shadow: 0 8px 18px rgba(37, 99, 235, 0.16);
+  transition: color 0.2s ease, background 0.2s ease, border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.screenwriting-button :deep(.el-icon) {
+  margin-right: 0;
+  font-size: 16px;
+}
+
+.screenwriting-button:hover,
+.screenwriting-button:focus {
+  color: #ffffff;
+  border-color: rgba(147, 197, 253, 0.55);
+  background: linear-gradient(180deg, rgba(37, 99, 235, 0.38), rgba(37, 99, 235, 0.2));
+  box-shadow: 0 14px 30px rgba(37, 99, 235, 0.26);
+  transform: translateY(-1px);
+}
+
+.preflight-panel {
+  position: absolute;
+  top: calc(100% + 12px);
+  right: 0;
+  z-index: 30;
+  width: 340px;
+  padding: 14px 16px 16px;
+  border: 1px solid rgba(96, 165, 250, 0.3);
+  border-radius: 14px;
+  background: linear-gradient(180deg, #14181f 0%, #0d1117 100%);
+  box-shadow: 0 26px 64px rgba(0, 0, 0, 0.55);
+}
+
+.preflight-panel::before {
+  content: "";
+  position: absolute;
+  top: -6px;
+  right: 28px;
+  width: 12px;
+  height: 12px;
+  background: #14181f;
+  border-left: 1px solid rgba(96, 165, 250, 0.3);
+  border-top: 1px solid rgba(96, 165, 250, 0.3);
+  transform: rotate(45deg);
+}
+
+.preflight-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.preflight-panel__title {
+  color: #f2f4f8;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.preflight-close {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: 7px;
+  color: #8b949e;
+  background: transparent;
+  cursor: pointer;
+  transition: color 0.18s ease, background-color 0.18s ease;
+}
+
+.preflight-close :deep(.el-icon) {
+  font-size: 15px;
+}
+
+.preflight-close:hover {
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.preflight-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0 2px;
+  color: #bfdbfe;
+  font-size: 13px;
+}
+
+.preflight-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: #fca5a5;
+  font-size: 13px;
+}
+
+.preflight-error :deep(.el-icon) {
+  margin-top: 1px;
+  font-size: 18px;
+}
+
+.preflight-error p {
+  margin: 0 0 2px;
+  font-weight: 600;
+}
+
+.preflight-error span {
+  color: #8b949e;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.preflight-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.preflight-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 0;
+}
+
+.preflight-item + .preflight-item {
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.preflight-item__icon {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  margin-top: 1px;
+}
+
+.preflight-item__icon :deep(.el-icon) {
+  font-size: 18px;
+}
+
+.preflight-item--checking .preflight-item__icon {
+  color: #60a5fa;
+}
+
+.preflight-item--passed .preflight-item__icon {
+  color: #22c55e;
+}
+
+.preflight-item--failed .preflight-item__icon {
+  color: #f87171;
+}
+
+.preflight-item--passed .preflight-item__icon,
+.preflight-item--failed .preflight-item__icon {
+  animation: preflight-pop-in 0.34s ease;
+}
+
+.preflight-item__body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.preflight-item__label {
+  color: #e6edf3;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.preflight-item--failed .preflight-item__label {
+  color: #fca5a5;
+}
+
+.preflight-item__detail {
+  color: #8b949e;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.preflight-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  font-size: 12px;
+}
+
+.preflight-foot--ok {
+  color: #86efac;
+  border-top-color: rgba(34, 197, 94, 0.2);
+}
+
+.preflight-foot--fail {
+  justify-content: space-between;
+}
+
+.preflight-foot--fail span {
+  color: #8b949e;
+}
+
+.preflight-retry {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 8px;
+  color: #dbeafe;
+  border-color: rgba(96, 165, 250, 0.36);
+  background-color: rgba(37, 99, 235, 0.12);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.preflight-retry:hover,
+.preflight-retry:focus {
+  color: #ffffff;
+  border-color: rgba(147, 197, 253, 0.5);
+  background-color: rgba(37, 99, 235, 0.22);
+}
+
+.preflight-panel .is-spin {
+  animation: preflight-spin 0.8s linear infinite;
+}
+
+@keyframes preflight-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes preflight-pop-in {
+  0% {
+    transform: scale(0.4);
+    opacity: 0;
+  }
+
+  60% {
+    transform: scale(1.16);
+  }
+
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.preflight-pop-enter-active,
+.preflight-pop-leave-active {
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.preflight-pop-enter-from,
+.preflight-pop-leave-to {
+  opacity: 0;
+  transform: translateY(-6px);
 }
 
 .toolbar {

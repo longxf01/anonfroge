@@ -113,6 +113,29 @@ class NovelChapterPage(BaseModel):
     limit: int
 
 
+class ScreenwritingPreflightCheck(BaseModel):
+    """剧本创作准入校验单项结果。"""
+
+    model_config = SCHEMA_CONFIG
+
+    key: str
+    label: str
+    passed: bool
+    detail: str
+
+
+class ScreenwritingPreflightResult(BaseModel):
+    """剧本创作准入校验整体结果。"""
+
+    model_config = SCHEMA_CONFIG
+
+    ready: bool
+    required_event_count: int
+    event_ready_count: int
+    text_model: str
+    checks: list[ScreenwritingPreflightCheck]
+
+
 class NovelChapterImportItem(BaseModel):
     """全文导入时前端预览得到的单章草稿。"""
 

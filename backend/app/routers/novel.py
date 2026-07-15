@@ -40,6 +40,7 @@ from app.schemas.novel import (
     NovelChapterRead,
     NovelChapterUpdate,
     NovelImportSplitRule,
+    ScreenwritingPreflightResult,
 )
 from app.services import novel as novel_service
 from app.services import project as project_service
@@ -220,7 +221,7 @@ class NovelView(BaseView):
         status_code=status.HTTP_202_ACCEPTED,
         middlewares=NOVEL_ROUTE_MIDDLEWARES,
         summary="批量清洗章节事件",
-        description="按章节 ID 创建批量清洗异步任务，进度和结果通过 SSE 通道返回。",
+        description="按章节 ID 创建并立即启动批量清洗异步任务，进度和结果通过 SSE 通道返回。",
     )
     async def batch_clean_chapters(
         self,
@@ -721,6 +722,31 @@ class NovelView(BaseView):
     ) -> list[NovelChapterCleanStatus]:
         """兼容旧版清洗状态查询路径。"""
         return await self.list_clean_statuses(project_public_id, request, session, ids)
+
+    @route(
+        "/screenwriting/preflight",
+        methods=["GET"],
+        response_model=ScreenwritingPreflightResult,
+        middlewares=NOVEL_ROUTE_MIDDLEWARES,
+        summary="剧本创作准入校验",
+        description="校验当前项目是否已配置文本模型，并完成足够数量章节的事件提取。",
+    )
+    async def screenwriting_preflight(
+        self,
+        project_public_id: str,
+        request: Request,
+        session: SessionDep,
+    ) -> ScreenwritingPreflightResult:
+        """剧本创作准入校验。"""
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            return await novel_service.get_screenwriting_preflight(
+                session,
+                project_public_id,
+                current_user_public_id,
+            )
+        except (project_service.ProjectServiceError, novel_service.NovelServiceError) as exc:
+            self._raise_as_http(exc)
 
     @route(
         "/{chapter_id}",
