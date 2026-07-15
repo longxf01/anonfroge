@@ -53,3 +53,6 @@ DEFAULT_MEDIA_GENERATION_MAX_CONCURRENCY: int = 2
 TASK_STREAM_EVENT_ITEM_QUEUED: str = "task.item.queued"
 # Redis Stream 任务消息结构版本号。
 TASK_STREAM_MESSAGE_VERSION: str = "1"
+
+# OrphanScavenger 默认扫描间隔秒数。
+DEFAULT_TASK_ORPHAN_SCAVENGER_INTERVAL_SECONDS: float = 30.0

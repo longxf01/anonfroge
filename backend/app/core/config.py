@@ -13,6 +13,7 @@ from app.core.tasks.constants import (
     DEFAULT_MEDIA_GENERATION_POLL_INTERVAL_SECONDS,
     DEFAULT_MEDIA_GENERATION_TIMEOUT_SECONDS,
     DEFAULT_TASK_CONSUMER_GROUP,
+    DEFAULT_TASK_ORPHAN_SCAVENGER_INTERVAL_SECONDS,
     DEFAULT_TASK_STALE_RUNNING_TIMEOUT_SECONDS,
     DEFAULT_TASK_STREAM_MAX_LEN,
     DEFAULT_TASK_STREAM_NAME,
@@ -21,6 +22,7 @@ from app.core.tasks.constants import (
     DEFAULT_TASK_WORKER_CONSUMER_NAME,
     DEFAULT_TASK_WORKER_HEARTBEAT_INTERVAL_SECONDS,
     DEFAULT_TASK_WORKER_IDLE_SLEEP_SECONDS,
+    DEFAULT_TASK_WORKER_LOG_ENABLED,
     DEFAULT_TASK_WORKER_MAX_CONCURRENCY,
     DEFAULT_TASK_WORKER_MAX_RETRIES,
     DEFAULT_TASK_WORKER_RETRY_BACKOFF_SECONDS,
@@ -35,6 +37,14 @@ BASE_DIR = Path(__file__).resolve().parents[3]
 # 拼接路径
 ENV_FILE = BASE_DIR / ".env"
 load_dotenv(ENV_FILE, override=False)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """从环境变量解析布尔值。"""
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 # frozen=True 冻结属性值，不允许配置类Settings实例化以后，被其他地方的程序修改属性值
@@ -85,11 +95,13 @@ class Settings(object):
     async_task_worker_idle_sleep_seconds: float = field( default_factory=lambda: float(os.getenv("ASYNC_TASK_WORKER_IDLE_SLEEP_SECONDS", DEFAULT_TASK_WORKER_IDLE_SLEEP_SECONDS)) )  # 异步任务 Worker 空闲休眠秒数
     async_task_worker_max_concurrency: int = field(default_factory=lambda: int(os.getenv("ASYNC_TASK_WORKER_MAX_CONCURRENCY", DEFAULT_TASK_WORKER_MAX_CONCURRENCY)))  # 异步任务 Worker 最大并发处理数量
     async_task_worker_task_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("ASYNC_TASK_WORKER_TASK_TIMEOUT_SECONDS", DEFAULT_TASK_WORKER_TASK_TIMEOUT_SECONDS)))  # 异步任务单个子项执行超时秒数
+    async_task_worker_log_enabled: bool = field(default_factory=lambda: _env_bool("ASYNC_TASK_WORKER_LOG_ENABLED", DEFAULT_TASK_WORKER_LOG_ENABLED))  # 异步任务 Worker 是否打印任务执行日志
     async_task_worker_heartbeat_interval_seconds: float = field(default_factory=lambda: float(os.getenv("ASYNC_TASK_WORKER_HEARTBEAT_INTERVAL_SECONDS", DEFAULT_TASK_WORKER_HEARTBEAT_INTERVAL_SECONDS)))  # 异步任务 Worker 心跳刷新间隔秒数
     async_task_worker_max_retries: int = field(default_factory=lambda: int(os.getenv("ASYNC_TASK_WORKER_MAX_RETRIES", DEFAULT_TASK_WORKER_MAX_RETRIES)))  # 异步任务默认最大重试次数
     async_task_worker_retry_backoff_seconds: float = field(default_factory=lambda: float(os.getenv("ASYNC_TASK_WORKER_RETRY_BACKOFF_SECONDS", DEFAULT_TASK_WORKER_RETRY_BACKOFF_SECONDS)))  # 异步任务重试基础退避秒数
     async_task_worker_shutdown_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("ASYNC_TASK_WORKER_SHUTDOWN_TIMEOUT_SECONDS", DEFAULT_TASK_WORKER_SHUTDOWN_TIMEOUT_SECONDS)))  # 异步任务 Worker 优雅退出等待秒数
     async_task_stale_running_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("ASYNC_TASK_STALE_RUNNING_TIMEOUT_SECONDS", DEFAULT_TASK_STALE_RUNNING_TIMEOUT_SECONDS)))  # 异步任务运行中状态失联判定秒数
+    async_task_orphan_scavenger_interval_seconds: float = field(default_factory=lambda: float(os.getenv("ASYNC_TASK_ORPHAN_SCAVENGER_INTERVAL_SECONDS", DEFAULT_TASK_ORPHAN_SCAVENGER_INTERVAL_SECONDS)))  # 异步任务孤儿扫描间隔秒数
     algorithm: str = field(default_factory=lambda: os.getenv("ALGORITHM", "HS256"))  # JWT 签名算法
     access_token_expire_seconds: int = field(default_factory=lambda: int(os.getenv("ACCESS_TOKEN_EXPIRE_SECONDS", "900")))  # 访问令牌有效秒数
     refresh_token_expire_seconds: int = field(default_factory=lambda: int(os.getenv("REFRESH_TOKEN_EXPIRE_SECONDS", "604800")))  # 刷新令牌有效秒数

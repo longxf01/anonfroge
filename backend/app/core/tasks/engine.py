@@ -11,6 +11,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from app.core.tasks.constants import (
     ASYNC_TASKS_ATTRIBUTE,
     DEFAULT_ASYNC_TASK_MODULES,
+    DEFAULT_TASK_ORPHAN_SCAVENGER_INTERVAL_SECONDS,
     DEFAULT_TASK_CONSUMER_GROUP,
     DEFAULT_TASK_STALE_RUNNING_TIMEOUT_SECONDS,
     DEFAULT_TASK_STREAM_MAX_LEN,
@@ -31,6 +32,7 @@ from app.models.tasks import TaskStatus
 from app.schemas.tasks import (
     TaskItemCreate,
     TaskItemRead,
+    TaskDeadLetterRead,
     TaskJobCreate,
     TaskJobDetail,
     TaskJobPage,
@@ -100,6 +102,7 @@ class TaskEngineConfig:
     worker_retry_backoff_seconds: float = DEFAULT_TASK_WORKER_RETRY_BACKOFF_SECONDS
     worker_shutdown_timeout_seconds: float = DEFAULT_TASK_WORKER_SHUTDOWN_TIMEOUT_SECONDS
     stale_running_timeout_seconds: float = DEFAULT_TASK_STALE_RUNNING_TIMEOUT_SECONDS
+    orphan_scavenger_interval_seconds: float = DEFAULT_TASK_ORPHAN_SCAVENGER_INTERVAL_SECONDS
 
     @classmethod
     def from_env(cls) -> "TaskEngineConfig":
@@ -148,6 +151,10 @@ class TaskEngineConfig:
                 "ASYNC_TASK_STALE_RUNNING_TIMEOUT_SECONDS",
                 DEFAULT_TASK_STALE_RUNNING_TIMEOUT_SECONDS,
             ),
+            orphan_scavenger_interval_seconds=_env_float(
+                "ASYNC_TASK_ORPHAN_SCAVENGER_INTERVAL_SECONDS",
+                DEFAULT_TASK_ORPHAN_SCAVENGER_INTERVAL_SECONDS,
+            ),
         )
 
     @classmethod
@@ -195,6 +202,13 @@ class TaskEngineConfig:
             ),
             stale_running_timeout_seconds=float(
                 getattr(settings, "async_task_stale_running_timeout_seconds", DEFAULT_TASK_STALE_RUNNING_TIMEOUT_SECONDS)
+            ),
+            orphan_scavenger_interval_seconds=float(
+                getattr(
+                    settings,
+                    "async_task_orphan_scavenger_interval_seconds",
+                    DEFAULT_TASK_ORPHAN_SCAVENGER_INTERVAL_SECONDS,
+                )
             ),
         )
 
@@ -258,7 +272,7 @@ class AsyncTaskEngine:
 
     async def create_task_job(self, session: AsyncSession, payload: TaskJobCreate) -> TaskJobDetail:
         """创建异步任务及初始子项。"""
-        return await task_service.create_task_job(session, payload)
+        return await task_service.create_task_job(session, self._apply_task_job_defaults(payload))
 
     async def append_task_items(
         self,
@@ -267,7 +281,11 @@ class AsyncTaskEngine:
         payloads: list[TaskItemCreate],
     ) -> TaskJobDetail:
         """追加异步任务子项。"""
-        return await task_service.append_task_items(session, job_public_id, payloads)
+        return await task_service.append_task_items(
+            session,
+            job_public_id,
+            self._apply_task_item_defaults(payloads),
+        )
 
     async def list_task_jobs(
         self,
@@ -348,6 +366,33 @@ class AsyncTaskEngine:
         """软删除异步任务子项。"""
         await task_service.delete_task_item(session, item_public_id)
 
+    async def pause_task_job(self, session: AsyncSession, job_public_id: str) -> TaskJobRead:
+        """暂停异步任务。"""
+        return await task_service.pause_task_job(session, job_public_id)
+
+    async def resume_task_job(
+        self,
+        session: AsyncSession,
+        job_public_id: str,
+        *,
+        redis_client: Any | None = None,
+        stream_name: str | None = None,
+        group_name: str | None = None,
+    ) -> list[TaskStreamRecord]:
+        """恢复异步任务并重新投递可执行子项。"""
+        await task_service.resume_task_job(session, job_public_id)
+        return await self.enqueue_task_job(
+            session,
+            job_public_id,
+            redis_client=redis_client,
+            stream_name=stream_name,
+            group_name=group_name,
+        )
+
+    async def cancel_task_job(self, session: AsyncSession, job_public_id: str) -> TaskJobRead:
+        """取消异步任务。"""
+        return await task_service.cancel_task_job(session, job_public_id)
+
     async def cancel_task_item(self, session: AsyncSession, item_public_id: str) -> TaskItemRead:
         """取消异步任务子项。"""
         return await task_service.cancel_task_item(session, item_public_id)
@@ -408,16 +453,35 @@ class AsyncTaskEngine:
         error_code: str,
         error_message: str,
         worker_id: str,
+        *,
+        stream_id: str = "",
+        stage: str = "handler",
     ) -> bool:
         """标记任务子项执行失败，子项不存在时返回 False。"""
-        return await self._mark_task_item_status(
-            session,
-            item_public_id,
-            TaskStatus.FAILED,
-            worker_id,
-            error_code=error_code,
-            error_message=error_message,
-        )
+        try:
+            await task_service.record_task_item_failure(
+                session,
+                item_public_id,
+                error_code,
+                error_message,
+                worker_id,
+                retry_backoff_seconds=self.config.worker_retry_backoff_seconds,
+                stream_id=stream_id,
+                stage=stage,
+            )
+        except TaskItemNotFoundError:
+            await session.rollback()
+            return False
+        return True
+
+    async def heartbeat_task_item(
+        self,
+        session: AsyncSession,
+        item_public_id: str,
+        worker_id: str,
+    ) -> bool:
+        """刷新任务子项心跳。"""
+        return await task_service.heartbeat_task_item(session, item_public_id, worker_id)
 
     async def enqueue_task_item(
         self,
@@ -524,6 +588,67 @@ class AsyncTaskEngine:
             group_name=group_name,
         )
         return job
+
+    async def enqueue_due_pending_task_items(
+        self,
+        session: AsyncSession,
+        *,
+        limit: int = 100,
+        redis_client: Any | None = None,
+        stream_name: str | None = None,
+        group_name: str | None = None,
+    ) -> int:
+        """投递已经到调度时间的 pending 子项，用于重试和孤儿恢复。"""
+        item_public_ids = await task_service.list_due_pending_task_item_public_ids(session, limit=limit)
+        enqueued = 0
+        for item_public_id in item_public_ids:
+            try:
+                await self.enqueue_task_item(
+                    session,
+                    item_public_id,
+                    redis_client=redis_client,
+                    stream_name=stream_name,
+                    group_name=group_name,
+                )
+            except (TaskServiceError, Exception):
+                await session.rollback()
+                continue
+            enqueued += 1
+        return enqueued
+
+    async def recover_stale_running_task_items(
+        self,
+        session: AsyncSession,
+        *,
+        limit: int = 100,
+    ) -> int:
+        """恢复心跳超时的 running 子项。"""
+        return await task_service.recover_stale_running_task_items(
+            session,
+            stale_after_seconds=self.config.stale_running_timeout_seconds,
+            retry_backoff_seconds=self.config.worker_retry_backoff_seconds,
+            limit=limit,
+        )
+
+    async def create_task_dead_letter(
+        self,
+        session: AsyncSession,
+        **kwargs: Any,
+    ) -> TaskDeadLetterRead:
+        """创建任务死信记录。"""
+        return await task_service.create_task_dead_letter(session, **kwargs)
+
+    def _apply_task_job_defaults(self, payload: TaskJobCreate) -> TaskJobCreate:
+        return payload.model_copy(update={"items": self._apply_task_item_defaults(payload.items)})
+
+    def _apply_task_item_defaults(self, payloads: list[TaskItemCreate]) -> list[TaskItemCreate]:
+        max_attempts = min(max(int(self.config.worker_max_retries), 1), 100)
+        return [
+            payload
+            if "max_attempts" in payload.model_fields_set
+            else payload.model_copy(update={"max_attempts": max_attempts})
+            for payload in payloads
+        ]
 
     async def _mark_task_item_status(
         self,

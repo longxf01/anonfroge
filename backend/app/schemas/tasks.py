@@ -121,6 +121,35 @@ class TaskJobPage(BaseModel):
     limit: int
 
 
+class TaskDeadLetterRead(BaseModel):
+    """异步任务死信响应。"""
+
+    model_config = READ_SCHEMA_CONFIG
+
+    id: int
+    public_id: str
+    job_id: int | None
+    item_id: int | None
+    job_public_id: str
+    item_public_id: str
+    task_type: str
+    item_type: str
+    queue_name: str
+    stream_id: str
+    stage: str
+    worker_id: str
+    attempt_count: int
+    max_attempts: int
+    error_code: str
+    error_message: str
+    payload: dict[str, Any]
+    result: dict[str, Any]
+    sort_order: int
+    created_at: datetime
+    updated_at: datetime
+    disabled_at: datetime | None
+
+
 class TaskStreamMessage(BaseModel):
     """Redis Stream 中的异步任务消息。"""
 

@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from redis.exceptions import ResponseError
+from sqlalchemy import or_
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -62,7 +63,12 @@ async def enqueue_task_item(
     item = await _get_task_item_model_or_raise(session, item_public_id)
     if item.status != TaskStatus.PENDING:
         raise TaskStreamValidationError("只有待处理任务子项可以入队")
+    now = utc_now()
+    if item.scheduled_at is not None and item.scheduled_at > now:
+        raise TaskStreamValidationError("任务子项尚未到计划调度时间")
     job = await _get_task_job_model_by_id_or_raise(session, item.job_id)
+    if job.status in {TaskStatus.PAUSED, TaskStatus.CANCELLED, TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.PARTIAL}:
+        raise TaskStreamValidationError("任务当前状态不允许入队")
     record = await _publish_task_item(
         job,
         item,
@@ -71,7 +77,6 @@ async def enqueue_task_item(
         group_name=group_name,
         stream_max_len=stream_max_len,
     )
-    now = utc_now()
     item.status = TaskStatus.QUEUED
     item.updated_at = now
     session.add(item)
@@ -92,6 +97,8 @@ async def enqueue_task_job(
 ) -> list[TaskStreamRecord]:
     """将任务下所有待处理子项投递到 Redis Stream。"""
     job = await _get_task_job_model_or_raise(session, job_public_id)
+    if job.status in {TaskStatus.PAUSED, TaskStatus.CANCELLED, TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.PARTIAL}:
+        raise TaskStreamValidationError("任务当前状态不允许入队")
     items = await _list_pending_task_items(session, int(job.id or 0))
     records: list[TaskStreamRecord] = []
     now = utc_now()
@@ -156,6 +163,37 @@ async def ack_task_stream_record(
     return int(await client.xack(_stream_name(stream_name), _group_name(group_name), stream_id.strip()))
 
 
+async def claim_stale_task_stream_records(
+    consumer_name: str,
+    *,
+    min_idle_ms: int,
+    redis_client: Any | None = None,
+    stream_name: str | None = None,
+    group_name: str | None = None,
+    start_id: str = "0-0",
+    count: int = 100,
+) -> list[TaskStreamRecord]:
+    """从 Redis Stream PEL 中认领长时间未确认的消息。"""
+    if not consumer_name.strip():
+        raise TaskStreamValidationError("Consumer 名称不能为空")
+    client = _redis_client(redis_client)
+    stream = _stream_name(stream_name)
+    group = _group_name(group_name)
+    await ensure_task_stream_group(client, stream_name=stream, group_name=group)
+    raw = await client.xautoclaim(
+        name=stream,
+        groupname=group,
+        consumername=consumer_name.strip(),
+        min_idle_time=max(min_idle_ms, 0),
+        start_id=start_id,
+        count=max(count, 1),
+    )
+    return [
+        TaskStreamRecord(stream_id=str(stream_id), message=_fields_to_message(dict(fields)))
+        for stream_id, fields in _xautoclaim_messages(raw)
+    ]
+
+
 async def _publish_task_item(
     job: TaskJob,
     item: TaskItem,
@@ -216,6 +254,7 @@ async def _list_pending_task_items(session: AsyncSession, job_id: int) -> list[T
             TaskItem.job_id == job_id,
             TaskItem.status == TaskStatus.PENDING,
             TaskItem.disabled_at.is_(None),
+            or_(TaskItem.scheduled_at.is_(None), TaskItem.scheduled_at <= utc_now()),
         )
         .order_by(TaskItem.priority.desc(), TaskItem.id)
     )
@@ -282,6 +321,12 @@ def _parse_streams(raw_streams: list[Any]) -> list[TaskStreamRecord]:
         for stream_id, fields in messages:
             records.append(TaskStreamRecord(stream_id=str(stream_id), message=_fields_to_message(dict(fields))))
     return records
+
+
+def _xautoclaim_messages(raw: Any) -> list[Any]:
+    if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+        return []
+    return list(raw[1] or [])
 
 
 def _load_json(value: str) -> dict[str, Any]:

@@ -26,7 +26,6 @@ class TaskStatus(str, Enum):
     PARTIAL = "partial"
     PAUSED = "paused"
 
-
 def _enum_values(enum_cls: type[Enum]) -> list[str]:
     """返回枚举值列表，用于数据库字段存储枚举值而不是成员名。"""
     return [item.value for item in enum_cls]
@@ -232,4 +231,90 @@ class TaskItem(TaskBaseModel, table=True):
         default=None,
         sa_column=Column("completed_at", DateTime(timezone=True), nullable=True),
         description="任务子项完成时间。",
+    )
+
+class TaskDeadLetter(TaskBaseModel, table=True):
+    """异步任务死信记录。"""
+
+    __tablename__ = "af_task_dead_letter"
+
+    job_id: int | None = Field(
+        default=None,
+        sa_column=Column("job_id", Integer, ForeignKey("af_task_job.id"), nullable=True, index=True),
+        description="所属任务内部主键。",
+    )
+    item_id: int | None = Field(
+        default=None,
+        sa_column=Column("item_id", Integer, ForeignKey("af_task_item.id"), nullable=True, index=True),
+        description="所属任务子项内部主键。",
+    )
+    job_public_id: str = Field(
+        default="",
+        sa_column=Column("job_public_id", String(36), nullable=False, default="", server_default="", index=True),
+        description="任务公开标识。",
+    )
+    item_public_id: str = Field(
+        default="",
+        sa_column=Column("item_public_id", String(36), nullable=False, default="", server_default="", index=True),
+        description="任务子项公开标识。",
+    )
+    task_type: str = Field(
+        default="",
+        sa_column=Column("task_type", String(100), nullable=False, default="", server_default="", index=True),
+        description="任务类型标识。",
+    )
+    item_type: str = Field(
+        default="",
+        sa_column=Column("item_type", String(100), nullable=False, default="", server_default="", index=True),
+        description="任务子项类型标识。",
+    )
+    queue_name: str = Field(
+        default="default",
+        sa_column=Column("queue_name", String(120), nullable=False, default="default", server_default="default", index=True),
+        description="任务队列名称。",
+    )
+    stream_id: str = Field(
+        default="",
+        sa_column=Column("stream_id", String(120), nullable=False, default="", server_default="", index=True),
+        description="Redis Stream 消息 ID。",
+    )
+    stage: str = Field(
+        default="",
+        sa_column=Column("stage", String(100), nullable=False, default="", server_default="", index=True),
+        description="进入死信队列时所处阶段。",
+    )
+    worker_id: str = Field(
+        default="",
+        sa_column=Column("worker_id", String(120), nullable=False, default="", server_default="", index=True),
+        description="处理该任务的 Worker 标识。",
+    )
+    attempt_count: int = Field(
+        default=0,
+        sa_column=Column("attempt_count", Integer, nullable=False, default=0, server_default="0"),
+        description="进入死信队列时的已尝试次数。",
+    )
+    max_attempts: int = Field(
+        default=0,
+        sa_column=Column("max_attempts", Integer, nullable=False, default=0, server_default="0"),
+        description="任务子项最大尝试次数。",
+    )
+    error_code: str = Field(
+        default="",
+        sa_column=Column("error_code", String(100), nullable=False, default="", server_default=""),
+        description="死信错误码。",
+    )
+    error_message: str = Field(
+        default="",
+        sa_column=Column("error_message", Text(), nullable=False, default="", server_default=""),
+        description="死信错误信息。",
+    )
+    payload: str = Field(
+        default="{}",
+        sa_column=Column("payload", Text(), nullable=False, default="{}", server_default="{}"),
+        description="任务子项输入参数，JSON 字符串。",
+    )
+    result: str = Field(
+        default="{}",
+        sa_column=Column("result", Text(), nullable=False, default="{}", server_default="{}"),
+        description="任务子项执行结果，JSON 字符串。",
     )

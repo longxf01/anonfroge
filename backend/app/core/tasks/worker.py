@@ -21,6 +21,7 @@ from app.core.tasks.engine import (
     default_async_task_engine,
     default_task_handler_registry,
 )
+from app.core.tasks.scavenger import OrphanScavenger
 from app.models.tasks import TaskItem, TaskJob, TaskStatus
 from app.schemas.tasks import TaskStreamMessage, TaskStreamRecord
 
@@ -76,6 +77,7 @@ class TaskWorker:
         max_concurrency: int = 1,
         task_timeout_seconds: float | None = None,
         task_log_enabled: bool = True,
+        orphan_scavenger_interval_seconds: float = 30.0,
         task_engine: Any | None = None,
     ) -> None:
         self.consumer_name = consumer_name or _default_consumer_name()
@@ -90,12 +92,16 @@ class TaskWorker:
         self.max_concurrency = max(max_concurrency, 1)
         self.task_timeout_seconds = task_timeout_seconds
         self.task_log_enabled = task_log_enabled
+        self.orphan_scavenger_interval_seconds = max(orphan_scavenger_interval_seconds, 0)
+        self._last_orphan_scavenge_at = 0.0
+        self._orphan_scavenger: OrphanScavenger | None = None
         if task_engine is None:
             raise TaskWorkerServiceError("TaskWorker 必须传入 task_engine")
         self.task_engine = task_engine
 
     async def process_once(self) -> int:
         """读取并处理一批异步任务消息。"""
+        await self._maybe_scavenge_orphans()
         records = await self.task_engine.read_task_stream_records(
             self.consumer_name,
             redis_client=self.redis_client,
@@ -126,13 +132,30 @@ class TaskWorker:
         )
         async with self._open_session() as session:
             if handler is None:
-                await self._mark_item_failed(
+                started = await self.task_engine.mark_task_item_running(
                     session,
                     message.item_public_id,
+                    self.consumer_name,
+                )
+                if not started:
+                    acked = await self._ack(record.stream_id)
+                    self._log_task_event(
+                        logging.INFO,
+                        "任务跳过：抢占失败或任务不可执行",
+                        "claim_skipped",
+                        record,
+                        message,
+                        started_at=started_at,
+                        extra_fields=[("ACK", "ack", acked)],
+                    )
+                    return
+                acked = await self._mark_item_failed_and_ack(
+                    session,
+                    record,
                     "task_handler_not_found",
                     f"未注册任务处理器：{message.item_type or message.task_type}",
+                    stage="handler_lookup",
                 )
-                acked = await self._ack(record.stream_id)
                 self._log_task_event(
                     logging.WARNING,
                     "任务处理失败：未注册处理器",
@@ -178,17 +201,19 @@ class TaskWorker:
                 record=record,
                 worker_id=self.consumer_name,
             )
+            heartbeat_task = self._start_heartbeat(message.item_public_id)
             try:
                 result = await _run_handler(handler, context, timeout_seconds=self.task_timeout_seconds)
             except asyncio.TimeoutError:
                 await session.rollback()
-                await self._mark_item_failed(
+                await self._stop_heartbeat(heartbeat_task)
+                acked = await self._mark_item_failed_and_ack(
                     session,
-                    message.item_public_id,
+                    record,
                     "task_handler_timeout",
                     f"任务处理超时：{self.task_timeout_seconds}秒",
+                    stage="handler_timeout",
                 )
-                acked = await self._ack(record.stream_id)
                 self._log_task_event(
                     logging.ERROR,
                     "任务执行超时",
@@ -206,13 +231,14 @@ class TaskWorker:
                 return
             except Exception as exc:
                 await session.rollback()
-                await self._mark_item_failed(
+                await self._stop_heartbeat(heartbeat_task)
+                acked = await self._mark_item_failed_and_ack(
                     session,
-                    message.item_public_id,
+                    record,
                     "task_handler_error",
                     str(exc),
+                    stage="handler_error",
                 )
-                acked = await self._ack(record.stream_id)
                 self._log_task_event(
                     logging.ERROR,
                     "任务执行异常",
@@ -229,12 +255,29 @@ class TaskWorker:
                 )
                 return
 
-            await self.task_engine.mark_task_item_succeeded(
-                session,
-                message.item_public_id,
-                result or {},
-                self.consumer_name,
-            )
+            await self._stop_heartbeat(heartbeat_task)
+            try:
+                await self.task_engine.mark_task_item_succeeded(
+                    session,
+                    message.item_public_id,
+                    result or {},
+                    self.consumer_name,
+                )
+            except Exception as exc:
+                await session.rollback()
+                await self._create_writeback_dead_letter(
+                    record,
+                    stage="writeback_success",
+                    error_code="task_success_writeback_error",
+                    error_message=str(exc),
+                    result=result or {},
+                )
+                logger.exception(
+                    "任务成功结果写回失败，已尝试写入死信记录：stream_id=%s item_public_id=%s",
+                    record.stream_id,
+                    message.item_public_id,
+                )
+                return
             acked = await self._ack(record.stream_id)
             self._log_task_event(
                 logging.INFO,
@@ -289,6 +332,7 @@ class TaskWorker:
         capacity = max(0, self.max_concurrency - len(in_flight))
         if capacity <= 0:
             return 0
+        await self._maybe_scavenge_orphans()
         records = await self.task_engine.read_task_stream_records(
             self.consumer_name,
             redis_client=self.redis_client,
@@ -319,13 +363,148 @@ class TaskWorker:
     def _discard_done_tasks(self, in_flight: set[asyncio.Task[None]]) -> None:
         done = {task for task in in_flight if task.done()}
         in_flight.difference_update(done)
+
             
+    def _start_heartbeat(self, item_public_id: str) -> asyncio.Task[None] | None:
+        interval = self.task_engine.config.worker_heartbeat_interval_seconds
+        if interval <= 0:
+            return None
+        return asyncio.create_task(self._run_heartbeat(item_public_id))
+
+    async def _run_heartbeat(self, item_public_id: str) -> None:
+        interval = self.task_engine.config.worker_heartbeat_interval_seconds
+        while interval > 0:
+            await asyncio.sleep(interval)
+            try:
+                async with self._open_session() as session:
+                    alive = await self.task_engine.heartbeat_task_item(
+                        session,
+                        item_public_id,
+                        self.consumer_name,
+                    )
+            except Exception:
+                logger.exception("任务心跳刷新失败：item_public_id=%s", item_public_id)
+                return
+            if not alive:
+                logger.warning("任务心跳停止：任务已不再由当前 Worker 运行，item_public_id=%s", item_public_id)
+                return
+
+    async def _stop_heartbeat(self, heartbeat_task: asyncio.Task[None] | None) -> None:
+        if heartbeat_task is None:
+            return
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            return
+
+    async def _maybe_scavenge_orphans(self) -> None:
+        if self.orphan_scavenger_interval_seconds <= 0:
+            return
+        now = time.monotonic()
+        if now - self._last_orphan_scavenge_at < self.orphan_scavenger_interval_seconds:
+            return
+        self._last_orphan_scavenge_at = now
+        if self._orphan_scavenger is None:
+            self._orphan_scavenger = OrphanScavenger(
+                self.task_engine,
+                consumer_name=self.consumer_name,
+                session_maker=self._session_maker(),
+                redis_client=self.redis_client,
+                stream_name=self.stream_name,
+                group_name=self.group_name,
+                limit=max(self.batch_size, 100),
+            )
+        try:
+            result = await self._orphan_scavenger.run_once()
+        except Exception:
+            logger.exception("OrphanScavenger 扫描失败")
+            return
+        logger.info(
+            "OrphanScavenger 扫描完成：stale_running=%s pending_enqueued=%s redis_claimed=%s redis_acked=%s",
+            result.stale_running_recovered,
+            result.pending_enqueued,
+            result.redis_pending_claimed,
+            result.redis_pending_acked,
+        )
+
+    async def _mark_item_failed_and_ack(
+        self,
+        session: AsyncSession,
+        record: TaskStreamRecord,
+        error_code: str,
+        error_message: str,
+        *,
+        stage: str,
+    ) -> int | None:
+        try:
+            await self._mark_item_failed(
+                session,
+                record.message.item_public_id,
+                error_code,
+                error_message,
+                stream_id=record.stream_id,
+                stage=stage,
+            )
+        except Exception as exc:
+            await session.rollback()
+            await self._create_writeback_dead_letter(
+                record,
+                stage=f"writeback_{stage}",
+                error_code="task_failure_writeback_error",
+                error_message=str(exc),
+            )
+            logger.exception(
+                "任务失败状态写回失败，已尝试写入死信记录：stream_id=%s item_public_id=%s",
+                record.stream_id,
+                record.message.item_public_id,
+            )
+            return None
+        return await self._ack(record.stream_id)
+
+    async def _create_writeback_dead_letter(
+        self,
+        record: TaskStreamRecord,
+        *,
+        stage: str,
+        error_code: str,
+        error_message: str,
+        result: dict[str, Any] | None = None,
+    ) -> None:
+        message = record.message
+        try:
+            async with self._open_session() as session:
+                await self.task_engine.create_task_dead_letter(
+                    session,
+                    job_public_id=message.job_public_id,
+                    item_public_id=message.item_public_id,
+                    task_type=message.task_type,
+                    item_type=message.item_type,
+                    queue_name=message.queue_name,
+                    stream_id=record.stream_id,
+                    stage=stage,
+                    worker_id=self.consumer_name,
+                    error_code=error_code,
+                    error_message=error_message,
+                    payload=message.payload,
+                    result=result or {},
+                )
+        except Exception:
+            logger.exception(
+                "任务写回异常的死信记录创建失败：stream_id=%s item_public_id=%s",
+                record.stream_id,
+                message.item_public_id,
+            )
+
     async def _mark_item_failed(
         self,
         session: AsyncSession,
         item_public_id: str,
         error_code: str,
         error_message: str,
+        *,
+        stream_id: str = "",
+        stage: str = "handler",
     ) -> None:
         await self.task_engine.mark_task_item_failed(
             session,
@@ -333,6 +512,8 @@ class TaskWorker:
             error_code,
             error_message,
             self.consumer_name,
+            stream_id=stream_id,
+            stage=stage,
         )
 
     async def _ack(self, stream_id: str) -> int:
@@ -394,6 +575,7 @@ def create_task_worker(
     max_concurrency: int | None = None,
     task_timeout_seconds: float | None = None,
     task_log_enabled: bool | None = None,
+    orphan_scavenger_interval_seconds: float | None = None,
 ) -> TaskWorker:
     """基于异步任务引擎创建通用 Worker。"""
     engine = task_engine or default_async_task_engine
@@ -423,6 +605,11 @@ def create_task_worker(
             if task_log_enabled is not None
             else config.worker_log_enabled
         ),
+        orphan_scavenger_interval_seconds=(
+            orphan_scavenger_interval_seconds
+            if orphan_scavenger_interval_seconds is not None
+            else config.orphan_scavenger_interval_seconds
+        ),
         task_engine=engine,
     )
 
@@ -450,6 +637,7 @@ async def format_task_worker_status(worker: TaskWorker) -> str:
         f"任务超时(task_timeout):     {_format_optional(worker.task_timeout_seconds, suffix='s')}",
         f"任务日志(task_log):         {_format_enabled(worker.task_log_enabled)}",
         f"心跳间隔(heartbeat):        {config.worker_heartbeat_interval_seconds}s",
+        f"孤儿扫描(orphan_scan):      {worker.orphan_scavenger_interval_seconds}s",
         f"最大重试(max_retries):      {config.worker_max_retries}",
         f"重试退避(retry_backoff):    {config.worker_retry_backoff_seconds}s",
         f"僵尸判定(stale_after):      {config.stale_running_timeout_seconds}s",
