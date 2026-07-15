@@ -48,7 +48,7 @@
 
           <el-button class="create-button" type="primary" size="large" @click="openCreateDialog">
             <el-icon><Plus /></el-icon>
-            新建项目
+            &nbsp;新建项目
           </el-button>
         </header>
 
@@ -87,6 +87,7 @@
             :key="project.public_id"
             class="project-card"
             shadow="never"
+            @click="openProject(project)"
           >
             <template #header>
               <div class="card-head">
@@ -114,25 +115,25 @@
 
               <div class="actions">
                 <el-tooltip content="成员" placement="top">
-                  <el-button text circle class="icon-action" @click="openMemberDialog(project)">
+                  <el-button text circle class="icon-action" @click.stop="openMemberDialog(project)">
                     <el-icon><UserFilled /></el-icon>
                   </el-button>
                 </el-tooltip>
 
                 <el-tooltip :content="project.disabled_at ? '启用' : '禁用'" placement="top">
-                  <el-button text circle class="icon-action" @click="toggleProjectStatus(project)">
+                  <el-button text circle class="icon-action" @click.stop="toggleProjectStatus(project)">
                     <el-icon><SwitchButton /></el-icon>
                   </el-button>
                 </el-tooltip>
 
                 <el-tooltip content="编辑" placement="top">
-                  <el-button text circle class="icon-action" @click="openEditDialog(project)">
+                  <el-button text circle class="icon-action" @click.stop="openEditDialog(project)">
                     <el-icon><EditPen /></el-icon>
                   </el-button>
                 </el-tooltip>
 
                 <el-tooltip content="删除" placement="top">
-                  <el-button text circle class="icon-action delete" @click="handleDeleteProject(project)">
+                  <el-button text circle class="icon-action delete" @click.stop="handleDeleteProject(project)">
                     <el-icon><Delete /></el-icon>
                   </el-button>
                 </el-tooltip>
@@ -1251,6 +1252,24 @@ const isCancelError = (error: unknown) => error === 'cancel' || error === 'close
 
 const goHome = () => {
   router.push('/project')
+}
+
+const openProject = (project: ProjectRecord) => {
+  if (project.disabled_at) {
+    ElMessage.warning('该项目已禁用，无法打开')
+    return
+  }
+  const routeMap: Record<string, string> = {
+    novel: '/novel',
+    script: '/script',
+    original: '/original',
+  }
+  const path = routeMap[project.project_type]
+  if (!path) {
+    ElMessage.info('该项目类型暂未开放')
+    return
+  }
+  router.push({ path, query: { id: project.public_id } })
 }
 
 const showComingSoon = () => {
