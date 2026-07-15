@@ -137,7 +137,7 @@
                 plain
                 @click="dismissBatchCleanBanner"
               >
-                关闭
+                {{ batchCleanAutoDismissSeconds > 0 ? `关闭（${batchCleanAutoDismissSeconds}s）` : '关闭' }}
               </el-button>
             </div>
           </div>
@@ -253,6 +253,21 @@
         </section>
 
         <div class="pagination-wrap">
+          <div class="page-size-control">
+            <span class="page-size-control__label">每页</span>
+            <el-input-number
+              v-model="pageSizeInput"
+              class="page-size-control__input"
+              :min="1"
+              :max="MAX_PAGE_SIZE"
+              :step="1"
+              :controls="false"
+              size="small"
+              @blur="commitPageSizeInput"
+              @change="handlePageSizeInputChange"
+            />
+            <span class="page-size-control__suffix">条</span>
+          </div>
           <el-pagination
             v-model:current-page="currentPage"
             :page-size="pageSize"
@@ -430,6 +445,7 @@ import {
   View,
 } from '@element-plus/icons-vue'
 import {
+  batchCleanJobEventsUrl,
   batchCleanNovelChaptersApi,
   batchDeleteNovelChaptersApi,
   cancelBatchCleanJobApi,
@@ -439,6 +455,7 @@ import {
   getBatchCleanJobProgressApi,
   importCrawlChaptersApi,
   importNovelChaptersApi,
+  listActiveBatchCleanJobsApi,
   listNovelChapterCleanStatusesApi,
   listNovelChaptersApi,
   updateNovelChapterApi,
@@ -452,6 +469,7 @@ import {
   type NovelChapterPayload,
   type NovelChapterRecord,
 } from '@/api/novel'
+import { fetchWithAuthRetry } from '@/request'
 import NovelCrawlDialog from '../components/NovelCrawlDialog.vue'
 import NovelImportDialog from '../components/NovelImportDialog.vue'
 import Settings from '../components/Settings.vue'
@@ -484,6 +502,7 @@ const totalNovels = ref(0)
 const searchKeyword = ref('')
 const currentPage = ref(1)
 const pageSize = ref(8)
+const pageSizeInput = ref<number | undefined>(8)
 const loading = ref(false)
 const cleaning = ref(false)
 const submitting = ref(false)
@@ -499,11 +518,15 @@ const clearChapterSelection = () => {
 const batchCleanJob = ref<NovelChapterBatchCleanProgress | null>(null)
 const batchCleanJobPublicId = ref<string>('')
 const batchCleanCancelLoading = ref(false)
-let batchCleanPollTimer: number | undefined
+let batchCleanStreamController: AbortController | null = null
+let batchCleanAutoDismissTimer: number | undefined
 let singleCleanPollTimer: number | undefined
 let singleCleanPollInFlight = false
 const singleCleanPollingChapterIds = new Set<number>()
 const singleCleanPollAttempts = new Map<number, number>()
+const batchCleanAutoDismissSeconds = ref(0)
+const MAX_PAGE_SIZE = 100
+const BATCH_CLEAN_AUTO_DISMISS_SECONDS = 10
 const SINGLE_CLEAN_STORAGE_KEY_PREFIX = 'novel:single-clean-polling:'
 const SINGLE_CLEAN_POLL_INTERVAL_MS = 8000
 const SINGLE_CLEAN_MAX_POLL_ATTEMPTS = 80
@@ -599,6 +622,26 @@ const viewingNovel = computed(() =>
 
 const viewDrawerTitle = computed(() => (viewingNovel.value ? `章节预览：${viewingNovel.value.chapter}` : '章节预览'))
 
+const normalizePageSize = (value: number | undefined) => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return pageSize.value
+  return Math.min(MAX_PAGE_SIZE, Math.max(1, Math.trunc(value)))
+}
+
+const applyPageSize = (value: number | undefined) => {
+  const nextPageSize = normalizePageSize(value)
+  pageSizeInput.value = nextPageSize
+  if (pageSize.value === nextPageSize) return
+  pageSize.value = nextPageSize
+}
+
+const handlePageSizeInputChange = (value: number | undefined) => {
+  applyPageSize(value)
+}
+
+const commitPageSizeInput = () => {
+  applyPageSize(pageSizeInput.value)
+}
+
 const fetchNovels = async () => {
   if (!projectPublicId.value) return
   loading.value = true
@@ -618,6 +661,7 @@ const fetchNovels = async () => {
       cleaningInline: singleCleanPollingChapterIds.has(item.id),
     }))
     totalNovels.value = data.total
+    await refreshBatchCleanProgressForCurrentPage()
   } catch (error) {
     ElMessage.error(`章节加载失败：${getErrorMessage(error)}`)
   } finally {
@@ -1046,19 +1090,7 @@ const summarizeJobFinish = (progress: NovelChapterBatchCleanProgress) => {
 const pollBatchCleanOnce = async (jobPublicId: string) => {
   try {
     const { data } = await getBatchCleanJobProgressApi(projectPublicId.value, jobPublicId)
-    applyBatchCleanProgress(data)
-    if (data.isFinished) {
-      stopBatchCleanPolling()
-      await fetchNovels()
-      const summary = summarizeJobFinish(data)
-      if (data.jobStatus === 'succeeded') {
-        ElMessage.success(summary)
-      } else if (data.jobStatus === 'canceled') {
-        ElMessage.info(summary)
-      } else {
-        ElMessage.warning(summary)
-      }
-    }
+    await handleBatchCleanProgress(data)
   } catch (error) {
     stopBatchCleanPolling()
     ElMessage.error(`批量清洗进度查询失败：${getErrorMessage(error)}`)
@@ -1067,21 +1099,180 @@ const pollBatchCleanOnce = async (jobPublicId: string) => {
 
 const startBatchCleanPolling = (jobPublicId: string) => {
   stopBatchCleanPolling()
+  stopBatchCleanAutoDismiss()
   batchCleanJobPublicId.value = jobPublicId
-  void pollBatchCleanOnce(jobPublicId)
-  batchCleanPollTimer = window.setInterval(() => {
-    void pollBatchCleanOnce(jobPublicId)
-  }, 5000)
+  const controller = new AbortController()
+  batchCleanStreamController = controller
+  void streamBatchCleanProgress(jobPublicId, controller)
 }
 
 const stopBatchCleanPolling = () => {
-  if (batchCleanPollTimer !== undefined) {
-    window.clearInterval(batchCleanPollTimer)
-    batchCleanPollTimer = undefined
+  batchCleanStreamController?.abort()
+  batchCleanStreamController = null
+}
+
+const startBatchCleanAutoDismiss = () => {
+  if (batchCleanAutoDismissTimer !== undefined) return
+  batchCleanAutoDismissSeconds.value = BATCH_CLEAN_AUTO_DISMISS_SECONDS
+  batchCleanAutoDismissTimer = window.setInterval(() => {
+    if (!batchCleanJob.value || batchCleanJob.value.jobStatus !== 'succeeded') {
+      stopBatchCleanAutoDismiss()
+      return
+    }
+    batchCleanAutoDismissSeconds.value -= 1
+    if (batchCleanAutoDismissSeconds.value <= 0) {
+      dismissBatchCleanBanner()
+    }
+  }, 1000)
+}
+
+const stopBatchCleanAutoDismiss = () => {
+  if (batchCleanAutoDismissTimer !== undefined) {
+    window.clearInterval(batchCleanAutoDismissTimer)
+    batchCleanAutoDismissTimer = undefined
+  }
+  batchCleanAutoDismissSeconds.value = 0
+}
+
+const streamBatchCleanProgress = async (jobPublicId: string, controller: AbortController) => {
+  try {
+    const response = await fetchWithAuthRetry(batchCleanJobEventsUrl(projectPublicId.value, jobPublicId), {
+      headers: {
+        Accept: 'text/event-stream',
+      },
+      signal: controller.signal,
+    })
+    if (!response.ok) {
+      throw new Error(await readFetchError(response))
+    }
+    if (!response.body) {
+      throw new Error('当前浏览器不支持读取批量清洗进度流')
+    }
+    await readBatchCleanEventStream(response.body)
+  } catch (error) {
+    if (isAbortError(error)) return
+    stopBatchCleanPolling()
+    ElMessage.error(`批量清洗进度接收失败：${getErrorMessage(error)}`)
+  } finally {
+    if (batchCleanStreamController === controller) {
+      batchCleanStreamController = null
+    }
   }
 }
 
+const readBatchCleanEventStream = async (body: ReadableStream<Uint8Array>) => {
+  const reader = body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const blocks = buffer.split('\n\n')
+    buffer = blocks.pop() || ''
+    for (const block of blocks) {
+      if (await handleBatchCleanEventBlock(block)) {
+        await reader.cancel()
+        return
+      }
+    }
+  }
+
+  buffer += decoder.decode()
+  if (buffer.trim()) {
+    await handleBatchCleanEventBlock(buffer)
+  }
+}
+
+const handleBatchCleanEventBlock = async (block: string) => {
+  const dataLines: string[] = []
+  let eventName = 'message'
+  block.split(/\r?\n/).forEach((line) => {
+    if (line.startsWith('event:')) {
+      eventName = line.slice(6).trim()
+      return
+    }
+    if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trimStart())
+    }
+  })
+  if (eventName !== 'progress' || dataLines.length === 0) return false
+  const progress = JSON.parse(dataLines.join('\n')) as NovelChapterBatchCleanProgress
+  return await handleBatchCleanProgress(progress)
+}
+
+interface HandleBatchCleanProgressOptions {
+  refreshChapters?: boolean
+}
+
+const handleBatchCleanProgress = async (
+  progress: NovelChapterBatchCleanProgress,
+  options: HandleBatchCleanProgressOptions = {},
+) => {
+  const wasFinished = Boolean(batchCleanJob.value?.isFinished)
+  applyBatchCleanProgress(progress)
+  if (!progress.isFinished) {
+    stopBatchCleanAutoDismiss()
+    return false
+  }
+  batchCleanStreamController = null
+  if (wasFinished) return true
+  if (options.refreshChapters !== false) {
+    await fetchNovels()
+  }
+  const summary = summarizeJobFinish(progress)
+  if (progress.jobStatus === 'succeeded') {
+    ElMessage.success(summary)
+    startBatchCleanAutoDismiss()
+  } else if (progress.jobStatus === 'canceled') {
+    ElMessage.info(summary)
+  } else {
+    ElMessage.warning(summary)
+  }
+  return true
+}
+
+const refreshBatchCleanProgressForCurrentPage = async () => {
+  if (!projectPublicId.value || !batchCleanJobPublicId.value || batchCleanJob.value?.isFinished) return
+  try {
+    const { data } = await getBatchCleanJobProgressApi(projectPublicId.value, batchCleanJobPublicId.value)
+    if (data.isFinished) {
+      await handleBatchCleanProgress(data, { refreshChapters: false })
+      return
+    }
+    applyBatchCleanProgress(data)
+  } catch (error) {
+    console.warn('批量清洗进度同步失败', error)
+  }
+}
+
+const restoreActiveBatchCleanJob = async () => {
+  if (!projectPublicId.value || batchCleanJobPublicId.value) return
+  try {
+    const { data } = await listActiveBatchCleanJobsApi(projectPublicId.value)
+    if (!data.items.length || batchCleanJobPublicId.value) return
+    startBatchCleanPolling(data.items[0].jobPublicId)
+  } catch {
+    // 自动恢复失败不打断小说页首屏加载。
+  }
+}
+
+const readFetchError = async (response: Response) => {
+  try {
+    const payload = await response.json()
+    return formatErrorDetail(payload?.detail) || response.statusText || '请求失败'
+  } catch {
+    return response.statusText || '请求失败'
+  }
+}
+
+const isAbortError = (error: unknown) => (
+  error instanceof DOMException && error.name === 'AbortError'
+)
+
 const dismissBatchCleanBanner = () => {
+  stopBatchCleanAutoDismiss()
   stopBatchCleanPolling()
   batchCleanJob.value = null
   batchCleanJobPublicId.value = ''
@@ -1128,7 +1319,14 @@ const goTasks = () => {
     ElMessage.warning('项目信息尚未加载完成，请稍候再试')
     return
   }
-  router.push({ path: '/tasks', query: { id: projectPublicId.value } })
+  router.push({
+    path: '/tasks',
+    query: {
+      id: projectPublicId.value,
+      type: 'novel',
+      from: route.fullPath,
+    },
+  })
 }
 
 const showComingSoon = () => {
@@ -1244,6 +1442,7 @@ const loadRouteProject = () => {
   if (projectPublicId.value !== id) {
     stopAllSingleCleanPolling()
     stopBatchCleanPolling()
+    stopBatchCleanAutoDismiss()
     batchCleanJob.value = null
     batchCleanJobPublicId.value = ''
     projectPublicId.value = id
@@ -1257,6 +1456,7 @@ const loadRouteProject = () => {
   } else {
     void fetchNovels()
   }
+  void restoreActiveBatchCleanJob()
 }
 
 const runSearchNow = () => {
@@ -1313,6 +1513,16 @@ watch(currentPage, () => {
   void fetchNovels()
 })
 
+watch(pageSize, (value) => {
+  pageSizeInput.value = value
+  clearChapterSelection()
+  if (currentPage.value !== 1) {
+    currentPage.value = 1
+  } else {
+    void fetchNovels()
+  }
+})
+
 watch(searchKeyword, () => {
   if (searchTimer !== undefined) {
     window.clearTimeout(searchTimer)
@@ -1326,6 +1536,7 @@ watch(searchKeyword, () => {
 onBeforeUnmount(() => {
   stopAllSingleCleanPolling({ clearPersisted: false })
   stopBatchCleanPolling()
+  stopBatchCleanAutoDismiss()
   if (searchTimer !== undefined) {
     window.clearTimeout(searchTimer)
     searchTimer = undefined
@@ -1980,10 +2191,54 @@ onBeforeUnmount(() => {
 }
 .pagination-wrap {
   display: flex;
+  align-items: center;
   justify-content: center;
+  gap: 14px;
+  flex-wrap: wrap;
   margin-top: 14px;
   flex-shrink: 0;
   font-variant-numeric: tabular-nums;
+}
+
+.page-size-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #8b949e;
+  font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+
+.page-size-control__input {
+  width: 76px;
+}
+
+.page-size-control__input :deep(.el-input__wrapper) {
+  min-height: 32px;
+  padding: 0 10px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08) inset;
+  transition: background-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.page-size-control__input :deep(.el-input__wrapper:hover) {
+  background: rgba(37, 99, 235, 0.1);
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.36) inset;
+}
+
+.page-size-control__input :deep(.el-input__wrapper.is-focus) {
+  background: rgba(13, 17, 23, 0.88);
+  box-shadow:
+    0 0 0 1px rgba(96, 165, 250, 0.58) inset,
+    0 0 0 3px rgba(37, 99, 235, 0.14);
+}
+
+.page-size-control__input :deep(.el-input__inner) {
+  color: #e6edf3;
+  font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  text-align: center;
 }
 
 .pagination-wrap :deep(.el-pagination.is-background .btn-prev),

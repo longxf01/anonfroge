@@ -27,6 +27,9 @@ from app.schemas.novel import (
     CrawlSourceRead,
     CrawlSourceUpdate,
     NovelChapterBatchClean,
+    NovelChapterBatchCleanActiveJobList,
+    NovelChapterBatchCleanCancelResult,
+    NovelChapterBatchCleanProgress,
     NovelChapterBatchDelete,
     NovelChapterBatchResult,
     NovelChapterCleanStatus,
@@ -213,10 +216,11 @@ class NovelView(BaseView):
     @route(
         "/batch-clean",
         methods=["POST"],
-        response_model=NovelChapterBatchResult,
+        response_model=NovelChapterBatchCleanProgress,
+        status_code=status.HTTP_202_ACCEPTED,
         middlewares=NOVEL_ROUTE_MIDDLEWARES,
         summary="批量清洗章节事件",
-        description="按章节 ID 批量生成事件清洗结果。",
+        description="按章节 ID 创建批量清洗异步任务，进度和结果通过 SSE 通道返回。",
     )
     async def batch_clean_chapters(
         self,
@@ -224,8 +228,8 @@ class NovelView(BaseView):
         payload: NovelChapterBatchClean,
         request: Request,
         session: SessionDep,
-    ) -> NovelChapterBatchResult:
-        """批量清洗章节事件。"""
+    ) -> NovelChapterBatchCleanProgress:
+        """提交批量清洗章节事件异步任务。"""
         current_user_public_id = self._current_user_public_id(request)
         try:
             return await novel_service.batch_clean_chapters(
@@ -233,6 +237,133 @@ class NovelView(BaseView):
                 project_public_id,
                 current_user_public_id,
                 payload,
+            )
+        except (project_service.ProjectServiceError, novel_service.NovelServiceError) as exc:
+            self._raise_as_http(exc)
+
+    @route(
+        "/batch-clean/jobs/active",
+        methods=["GET"],
+        response_model=NovelChapterBatchCleanActiveJobList,
+        middlewares=NOVEL_ROUTE_MIDDLEWARES,
+        summary="列出未完结批量清洗任务",
+        description="返回当前项目下未结束的批量清洗任务，用于客户端恢复 SSE 订阅。",
+    )
+    async def list_active_batch_clean_jobs(
+        self,
+        project_public_id: str,
+        request: Request,
+        session: SessionDep,
+    ) -> NovelChapterBatchCleanActiveJobList:
+        """列出未完结批量清洗任务。"""
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            return await novel_service.list_active_batch_clean_jobs(
+                session,
+                project_public_id,
+                current_user_public_id,
+            )
+        except (project_service.ProjectServiceError, novel_service.NovelServiceError) as exc:
+            self._raise_as_http(exc)
+
+    @route(
+        "/batch-clean/jobs/{job_public_id}/events",
+        methods=["GET"],
+        middlewares=NOVEL_ROUTE_MIDDLEWARES,
+        summary="订阅批量清洗任务进度",
+        description="以 text/event-stream 持续推送批量清洗任务进度，直到任务进入终态。",
+    )
+    async def stream_batch_clean_job_events(
+        self,
+        project_public_id: str,
+        job_public_id: str,
+        request: Request,
+        session: SessionDep,
+    ) -> StreamingResponse:
+        """通过 SSE 推送批量清洗任务进度。"""
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            await novel_service.get_batch_clean_job_progress(
+                session,
+                project_public_id,
+                current_user_public_id,
+                job_public_id,
+            )
+        except (project_service.ProjectServiceError, novel_service.NovelServiceError) as exc:
+            self._raise_as_http(exc)
+
+        async def render_events():
+            async for progress in novel_service.stream_batch_clean_job_progress(
+                project_public_id,
+                current_user_public_id,
+                job_public_id,
+            ):
+                if await request.is_disconnected():
+                    break
+                yield _format_sse_event(
+                    "progress",
+                    progress.model_dump(by_alias=True, mode="json"),
+                )
+
+        return StreamingResponse(
+            render_events(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @route(
+        "/batch-clean/jobs/{job_public_id}",
+        methods=["GET"],
+        response_model=NovelChapterBatchCleanProgress,
+        middlewares=NOVEL_ROUTE_MIDDLEWARES,
+        summary="查询批量清洗任务进度快照",
+        description="返回批量清洗任务当前进度快照，用于调试或 SSE 失败后的兜底查询。",
+    )
+    async def get_batch_clean_job_progress(
+        self,
+        project_public_id: str,
+        job_public_id: str,
+        request: Request,
+        session: SessionDep,
+    ) -> NovelChapterBatchCleanProgress:
+        """查询批量清洗任务进度快照。"""
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            return await novel_service.get_batch_clean_job_progress(
+                session,
+                project_public_id,
+                current_user_public_id,
+                job_public_id,
+            )
+        except (project_service.ProjectServiceError, novel_service.NovelServiceError) as exc:
+            self._raise_as_http(exc)
+
+    @route(
+        "/batch-clean/jobs/{job_public_id}/cancel",
+        methods=["POST"],
+        response_model=NovelChapterBatchCleanCancelResult,
+        middlewares=NOVEL_ROUTE_MIDDLEWARES,
+        summary="取消批量清洗任务",
+        description="取消批量清洗任务中尚未开始执行的章节子项。",
+    )
+    async def cancel_batch_clean_job(
+        self,
+        project_public_id: str,
+        job_public_id: str,
+        request: Request,
+        session: SessionDep,
+    ) -> NovelChapterBatchCleanCancelResult:
+        """取消批量清洗任务。"""
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            return await novel_service.cancel_batch_clean_job(
+                session,
+                project_public_id,
+                current_user_public_id,
+                job_public_id,
             )
         except (project_service.ProjectServiceError, novel_service.NovelServiceError) as exc:
             self._raise_as_http(exc)
@@ -693,3 +824,8 @@ def _parse_id_list(raw_ids: str) -> list[int]:
         except ValueError as exc:
             raise novel_service.NovelChapterValidationError("章节 ID 必须是整数") from exc
     return ids
+
+
+def _format_sse_event(event: str, data: object) -> str:
+    """把事件名和 JSON 数据格式化为 SSE 帧。"""
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"

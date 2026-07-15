@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections import Counter
 from collections.abc import AsyncIterator
 import json
 import logging
@@ -12,7 +13,9 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core import database
 from app.core.config import settings
+from app.core.tasks.engine import default_async_task_engine
 from app.models.novel import NovelChapter, NovelCrawlBook, NovelCrawlSource
+from app.models.tasks import TaskJob, TaskStatus
 from app.schemas.novel import (
     CrawlAnalyzePayload,
     CrawlAnalyzeResult,
@@ -30,7 +33,12 @@ from app.schemas.novel import (
     CrawlSourceRead,
     CrawlSourceUpdate,
     NovelChapterBatchClean,
+    NovelChapterBatchCleanActiveJob,
+    NovelChapterBatchCleanActiveJobList,
+    NovelChapterBatchCleanCancelResult,
     NovelChapterBatchDelete,
+    NovelChapterBatchCleanItem,
+    NovelChapterBatchCleanProgress,
     NovelChapterBatchResult,
     NovelChapterCleanStatus,
     NovelChapterCreate,
@@ -41,10 +49,12 @@ from app.schemas.novel import (
     NovelChapterUpdate,
     NovelImportSplitRule,
 )
+from app.schemas.tasks import TaskItemCreate, TaskItemRead, TaskJobCreate, TaskJobDetail
 from app.services.agent_gateway import ProviderModelGateway
 from app.services.prompt_registry import PromptRegistry
 from app.services import novel_crawler
 from app.services import project as project_service
+from app.services import tasks as task_service
 from app.utils.novel_import_rules import get_builtin_import_split_rules
 from app.utils.novel_parser import ParsedNovelChapter, parse_novel_chapters
 from app.utils.time_tools import utc_now
@@ -107,6 +117,9 @@ CRAWL_SOURCE_CONFIG_FIELDS = (
 MIN_EVENT_EXTRACTION_CONTENT_LENGTH = 300
 # 单章事件清晰的并发数量（设置最多允许多少个清洗任务同时执行，默认设为3）
 SINGLE_CHAPTER_CLEAN_MAX_CONCURRENCY = 3
+NOVEL_CHAPTER_CLEAN_TASK_TYPE = "novel.chapter.clean_event"
+NOVEL_CHAPTER_CLEAN_QUEUE_NAME = "novel"
+BATCH_CLEAN_STREAM_INTERVAL_SECONDS = 2.0
 logger = logging.getLogger(__name__)
 _single_chapter_clean_tasks: set[asyncio.Task[None]] = set()
 _single_chapter_clean_semaphore: asyncio.Semaphore | None = None
@@ -804,17 +817,314 @@ async def batch_clean_chapters(
     project_public_id: str,
     current_user_public_id: str,
     payload: NovelChapterBatchClean,
-) -> NovelChapterBatchResult:
-    """批量清洗章节事件。"""
+) -> NovelChapterBatchCleanProgress:
+    """提交批量章节事件清洗异步任务，并返回初始进度快照。"""
     project = await _get_project_with_id(session, project_public_id, current_user_public_id)
     chapters = await _list_chapter_models_by_ids(session, project.id, payload.ids)
+    if not chapters:
+        raise NovelChapterValidationError("未找到任何待清洗章节")
+
     now = utc_now()
+    items: list[TaskItemCreate] = []
     for chapter in chapters:
-        _apply_clean_result(chapter)
+        chapter_id = int(chapter.id or 0)
+        chapter.event = ""
+        chapter.event_state = 0
+        chapter.error_reason = None
         chapter.updated_at = now
         session.add(chapter)
-    await session.commit()
-    return NovelChapterBatchResult(affected=len(chapters))
+        items.append(
+            TaskItemCreate(
+                item_type=NOVEL_CHAPTER_CLEAN_TASK_TYPE,
+                item_key=f"chapter:{chapter_id}",
+                payload={
+                    "project_public_id": project_public_id,
+                    "chapter_id": chapter_id,
+                    "chapter_public_id": chapter.public_id,
+                    "chapter_index": chapter.chapter_index,
+                    "chapter_title": chapter.chapter,
+                    "reel": chapter.reel,
+                    "current_user_public_id": current_user_public_id,
+                },
+            )
+        )
+
+    await session.flush()
+    job = await default_async_task_engine.create_and_enqueue_task_job(
+        session,
+        TaskJobCreate(
+            task_type=NOVEL_CHAPTER_CLEAN_TASK_TYPE,
+            queue_name=NOVEL_CHAPTER_CLEAN_QUEUE_NAME,
+            name="批量清洗章节事件",
+            created_by=current_user_public_id,
+            payload={
+                "project_public_id": project_public_id,
+                "chapter_count": len(chapters),
+            },
+            items=items,
+        ),
+    )
+    return await get_batch_clean_job_progress(
+        session,
+        project_public_id,
+        current_user_public_id,
+        job.public_id,
+    )
+
+
+async def get_batch_clean_job_progress(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    job_public_id: str,
+) -> NovelChapterBatchCleanProgress:
+    """查询批量清洗任务当前进度快照。"""
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+    job = await _get_batch_clean_job_detail_or_raise(session, project_public_id, job_public_id)
+    chapter_ids = [_chapter_id_from_task_item(item) for item in job.items]
+    chapters = await _list_chapter_models_by_ids(
+        session,
+        project.id,
+        [chapter_id for chapter_id in chapter_ids if chapter_id > 0],
+    )
+    chapter_map = {int(chapter.id or 0): chapter for chapter in chapters}
+
+    counts: Counter[str] = Counter()
+    item_views: list[NovelChapterBatchCleanItem] = []
+    for item in job.items:
+        chapter_id = _chapter_id_from_task_item(item)
+        chapter = chapter_map.get(chapter_id)
+        item_status = _frontend_item_status(item.status, chapter)
+        counts[item_status] += 1
+        item_views.append(_to_batch_clean_item(item, chapter, chapter_id, item_status))
+
+    total_count = len(job.items)
+    finished_count = counts["succeeded"] + counts["failed"] + counts["canceled"]
+    return NovelChapterBatchCleanProgress(
+        jobPublicId=job.public_id,
+        jobStatus=_frontend_job_status(job.status, counts, total_count),
+        totalCount=total_count,
+        pendingCount=counts["pending"],
+        runningCount=counts["running"],
+        succeededCount=counts["succeeded"],
+        failedCount=counts["failed"],
+        canceledCount=counts["canceled"],
+        pausedCount=counts["paused"],
+        finishedCount=finished_count,
+        isFinished=total_count > 0 and finished_count == total_count,
+        items=item_views,
+    )
+
+
+async def stream_batch_clean_job_progress(
+    project_public_id: str,
+    current_user_public_id: str,
+    job_public_id: str,
+    *,
+    interval_seconds: float = BATCH_CLEAN_STREAM_INTERVAL_SECONDS,
+) -> AsyncIterator[NovelChapterBatchCleanProgress]:
+    """按 SSE 使用场景持续产出批量清洗任务进度。"""
+    while True:
+        async with database.async_session_maker() as session:
+            progress = await get_batch_clean_job_progress(
+                session,
+                project_public_id,
+                current_user_public_id,
+                job_public_id,
+            )
+        yield progress
+        if progress.is_finished:
+            return
+        await asyncio.sleep(max(interval_seconds, 0.1))
+
+
+async def cancel_batch_clean_job(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    job_public_id: str,
+) -> NovelChapterBatchCleanCancelResult:
+    """取消批量清洗任务中尚未执行的章节子项。"""
+    await _get_project_with_id(session, project_public_id, current_user_public_id)
+    before = await _get_batch_clean_job_detail_or_raise(session, project_public_id, job_public_id)
+    cancellable_count = sum(
+        1
+        for item in before.items
+        if item.status in {TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.PAUSED}
+    )
+    await default_async_task_engine.cancel_task_job(session, job_public_id)
+    return NovelChapterBatchCleanCancelResult(
+        jobPublicId=job_public_id,
+        canceledCount=cancellable_count,
+    )
+
+
+async def list_active_batch_clean_jobs(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+) -> NovelChapterBatchCleanActiveJobList:
+    """列出当前项目下未结束的批量清洗任务，用于客户端恢复 SSE 订阅。"""
+    await _get_project_with_id(session, project_public_id, current_user_public_id)
+    active_statuses = {TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.PAUSED}
+    statement = (
+        select(TaskJob)
+        .where(
+            TaskJob.task_type == NOVEL_CHAPTER_CLEAN_TASK_TYPE,
+            TaskJob.status.in_(active_statuses),
+            TaskJob.disabled_at.is_(None),
+        )
+        .order_by(TaskJob.created_at.desc(), TaskJob.id.desc())
+    )
+    result = await session.exec(statement)
+    items: list[NovelChapterBatchCleanActiveJob] = []
+    for job in result.all():
+        if _payload_project_public_id(job.payload) != project_public_id:
+            continue
+        task_job = await default_async_task_engine.get_task_job(session, job.public_id, include_items=True)
+        if not isinstance(task_job, TaskJobDetail):
+            continue
+        counts = Counter(_frontend_item_status(item.status, None) for item in task_job.items)
+        items.append(
+            NovelChapterBatchCleanActiveJob(
+                jobPublicId=task_job.public_id,
+                jobStatus=_frontend_active_job_status(task_job.status),
+                totalCount=len(task_job.items),
+                pendingCount=counts["pending"],
+                runningCount=counts["running"],
+                pausedCount=counts["paused"],
+                createdAt=task_job.created_at,
+            )
+        )
+    return NovelChapterBatchCleanActiveJobList(items=items)
+
+
+async def _get_batch_clean_job_detail_or_raise(
+    session: AsyncSession,
+    project_public_id: str,
+    job_public_id: str,
+) -> TaskJobDetail:
+    try:
+        task_job = await default_async_task_engine.get_task_job(session, job_public_id, include_items=True)
+    except task_service.TaskJobNotFoundError as exc:
+        raise NovelChapterNotFoundError("批量清洗任务不存在") from exc
+    if not isinstance(task_job, TaskJobDetail):
+        raise NovelChapterValidationError("批量清洗任务读取失败")
+    if task_job.task_type != NOVEL_CHAPTER_CLEAN_TASK_TYPE:
+        raise NovelChapterNotFoundError("批量清洗任务不存在")
+    if task_job.queue_name != NOVEL_CHAPTER_CLEAN_QUEUE_NAME:
+        raise NovelChapterNotFoundError("批量清洗任务不存在")
+    if str(task_job.payload.get("project_public_id") or "") != project_public_id:
+        raise NovelChapterNotFoundError("批量清洗任务不存在")
+    return task_job
+
+
+def _to_batch_clean_item(
+    item: TaskItemRead,
+    chapter: NovelChapter | None,
+    chapter_id: int,
+    item_status: str,
+) -> NovelChapterBatchCleanItem:
+    payload = item.payload
+    return NovelChapterBatchCleanItem(
+        chapterId=chapter_id,
+        chapterPublicId=str(payload.get("chapter_public_id") or (chapter.public_id if chapter is not None else "")),
+        chapterIndex=int(payload.get("chapter_index") or (chapter.chapter_index if chapter is not None else 0) or 0),
+        chapterTitle=str(payload.get("chapter_title") or (chapter.chapter if chapter is not None else "")),
+        reel=str(payload.get("reel") or (chapter.reel if chapter is not None else "")),
+        itemPublicId=item.public_id,
+        itemStatus=item_status,
+        eventState=_batch_clean_event_state(item, chapter),
+        event=(chapter.event if chapter is not None else str(item.result.get("event") or "")),
+        errorReason=_batch_clean_error_reason(item, chapter),
+    )
+
+
+def _chapter_id_from_task_item(item: TaskItemRead) -> int:
+    raw_value = item.payload.get("chapter_id")
+    if raw_value is None and item.item_key:
+        raw_value = item.item_key.removeprefix("chapter:")
+    try:
+        chapter_id = int(raw_value)
+    except (TypeError, ValueError):
+        return 0
+    return max(chapter_id, 0)
+
+
+def _frontend_item_status(status: TaskStatus, chapter: NovelChapter | None) -> str:
+    if status == TaskStatus.QUEUED:
+        return "pending"
+    if status == TaskStatus.CANCELLED:
+        return "canceled"
+    if status == TaskStatus.SUCCEEDED and chapter is not None and chapter.event_state == -1:
+        return "failed"
+    if status == TaskStatus.SUCCEEDED:
+        return "succeeded"
+    if status == TaskStatus.FAILED:
+        return "failed"
+    if status == TaskStatus.RUNNING:
+        return "running"
+    if status == TaskStatus.PAUSED:
+        return "paused"
+    return "pending"
+
+
+def _frontend_job_status(status: TaskStatus, counts: Counter[str], total_count: int) -> str:
+    finished_count = counts["succeeded"] + counts["failed"] + counts["canceled"]
+    if total_count > 0 and finished_count == total_count:
+        if counts["failed"] and counts["succeeded"]:
+            return "partial_failed"
+        if counts["failed"]:
+            return "failed"
+        if counts["canceled"]:
+            return "canceled"
+        return "succeeded"
+    if status == TaskStatus.CANCELLED:
+        return "canceled"
+    if status == TaskStatus.PARTIAL:
+        return "partial_failed"
+    if status == TaskStatus.QUEUED:
+        return "pending"
+    return status.value
+
+
+def _frontend_active_job_status(status: TaskStatus) -> str:
+    if status == TaskStatus.RUNNING:
+        return "running"
+    if status == TaskStatus.PAUSED:
+        return "paused"
+    return "pending"
+
+
+def _batch_clean_event_state(item: TaskItemRead, chapter: NovelChapter | None) -> int:
+    if chapter is not None:
+        return chapter.event_state
+    if item.status == TaskStatus.FAILED:
+        return -1
+    raw_state = item.result.get("event_state")
+    try:
+        return int(raw_state)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _batch_clean_error_reason(item: TaskItemRead, chapter: NovelChapter | None) -> str | None:
+    if chapter is not None and chapter.error_reason:
+        return chapter.error_reason
+    if item.error_message:
+        return item.error_message
+    raw_reason = item.result.get("error_reason")
+    return str(raw_reason) if raw_reason else None
+
+
+def _payload_project_public_id(raw_payload: str) -> str:
+    try:
+        payload = json.loads(raw_payload or "{}")
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("project_public_id") or "")
 
 
 async def update_event_state(
@@ -897,28 +1207,6 @@ async def _next_chapter_index(session: AsyncSession, project_id: int) -> int:
     result = await session.exec(statement)
     max_index = result.one()
     return int(max_index or 0) + 1
-
-
-def _apply_clean_result(chapter: NovelChapter) -> None:
-    """生成本地可复现的章节事件清洗结果。"""
-    content = chapter.chapter_data.strip()
-    if len(content) < 80:
-        chapter.event = ""
-        chapter.event_state = -1
-        chapter.error_reason = "正文字数过少，无法提取有效事件"
-        return
-
-    chapter.event = (
-        "## 主要事件\n"
-        f"- 由「{chapter.chapter}」自动清洗生成\n"
-        f"- 共 {len(content)} 字\n\n"
-        "## 关键人物\n"
-        "- 主角\n\n"
-        "## 场景\n"
-        "- 自动识别中..."
-    )
-    chapter.event_state = 1
-    chapter.error_reason = None
 
 
 async def _apply_chapter_event_extraction(chapter: NovelChapter, text_model: str) -> None:

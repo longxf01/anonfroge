@@ -507,6 +507,13 @@ export const getBatchCleanJobProgressApi = (
   )
 )
 
+export const batchCleanJobEventsUrl = (
+  projectPublicId: string,
+  jobPublicId: string,
+) => (
+  `/api${projectNovelPath(projectPublicId)}/batch-clean/jobs/${encodeURIComponent(jobPublicId)}/events`
+)
+
 export const listActiveBatchCleanJobsApi = (
   projectPublicId: string,
 ) => (

@@ -165,6 +165,73 @@ class NovelChapterBatchClean(BaseModel):
     ids: list[int] = Field(min_length=1)
 
 
+class NovelChapterBatchCleanItem(BaseModel):
+    """批量清洗任务中单个章节的进度。"""
+
+    model_config = SCHEMA_CONFIG
+
+    chapter_id: int
+    chapter_public_id: str
+    chapter_index: int
+    chapter_title: str = ""
+    reel: str = ""
+    item_public_id: str
+    item_status: str
+    event_state: int
+    event: str = ""
+    error_reason: str | None = None
+
+
+class NovelChapterBatchCleanProgress(BaseModel):
+    """批量清洗任务进度响应。"""
+
+    model_config = SCHEMA_CONFIG
+
+    job_public_id: str
+    job_status: str
+    total_count: int = 0
+    pending_count: int = 0
+    running_count: int = 0
+    succeeded_count: int = 0
+    failed_count: int = 0
+    canceled_count: int = 0
+    paused_count: int = 0
+    finished_count: int = 0
+    is_finished: bool = False
+    items: list[NovelChapterBatchCleanItem] = Field(default_factory=list)
+
+
+class NovelChapterBatchCleanCancelResult(BaseModel):
+    """批量清洗任务取消结果。"""
+
+    model_config = SCHEMA_CONFIG
+
+    job_public_id: str
+    canceled_count: int = 0
+
+
+class NovelChapterBatchCleanActiveJob(BaseModel):
+    """未结束批量清洗任务的轻量信息。"""
+
+    model_config = SCHEMA_CONFIG
+
+    job_public_id: str
+    job_status: str
+    total_count: int = 0
+    pending_count: int = 0
+    running_count: int = 0
+    paused_count: int = 0
+    created_at: datetime | None = None
+
+
+class NovelChapterBatchCleanActiveJobList(BaseModel):
+    """未结束批量清洗任务列表。"""
+
+    model_config = SCHEMA_CONFIG
+
+    items: list[NovelChapterBatchCleanActiveJob] = Field(default_factory=list)
+
+
 class NovelChapterEventStateUpdate(BaseModel):
     """批量更新事件状态请求。"""
 
