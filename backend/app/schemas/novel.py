@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 EVENT_STATES = {-1, 0, 1}
@@ -97,12 +97,44 @@ class NovelChapterPage(BaseModel):
     limit: int
 
 
+class NovelChapterImportItem(BaseModel):
+    """全文导入时前端预览得到的单章草稿。"""
+
+    model_config = SCHEMA_CONFIG
+
+    reel: str = Field(default="", max_length=120)
+    chapter: str = Field(min_length=1, max_length=255)
+    chapter_data: str = Field(min_length=1)
+
+
 class NovelChapterImport(BaseModel):
     """全文导入请求。"""
 
     model_config = SCHEMA_CONFIG
 
-    raw_text: str = Field(min_length=1)
+    raw_text: str = ""
+    chapters: list[NovelChapterImportItem] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_import_source(self) -> "NovelChapterImport":
+        if not self.raw_text.strip() and not self.chapters:
+            raise ValueError("raw_text or chapters is required")
+        return self
+
+
+class NovelImportSplitRule(BaseModel):
+    """Built-in chapter split rule returned to the frontend import dialog."""
+
+    model_config = SCHEMA_CONFIG
+
+    key: str = Field(min_length=1, max_length=64)
+    label: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="")
+    chapter_pattern: str = Field(default="")
+    chapter_flags_list: list[str] = Field(default_factory=list)
+    reel_pattern: str = Field(default="")
+    reel_flags_list: list[str] = Field(default_factory=list)
+    builtin: bool = True
 
 
 class NovelChapterBatchDelete(BaseModel):

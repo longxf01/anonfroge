@@ -18,6 +18,7 @@ from app.schemas.novel import (
     NovelChapterPage,
     NovelChapterRead,
     NovelChapterUpdate,
+    NovelImportSplitRule,
 )
 from app.services import novel as novel_service
 from app.services import project as project_service
@@ -135,6 +136,28 @@ class NovelView(BaseView):
         current_user_public_id = self._current_user_public_id(request)
         try:
             return await novel_service.import_chapters(session, project_public_id, current_user_public_id, payload)
+        except (project_service.ProjectServiceError, novel_service.NovelServiceError) as exc:
+            self._raise_as_http(exc)
+
+    @route(
+        "/import-split-rules",
+        methods=["GET"],
+        response_model=list[NovelImportSplitRule],
+        middlewares=NOVEL_ROUTE_MIDDLEWARES,
+        summary="获取小说导入切分规则",
+        description="获取服务端内置的全文导入章节切分规则。",
+    )
+    async def list_import_split_rules(
+        self,
+        project_public_id: str,
+        request: Request,
+        session: SessionDep,
+    ) -> list[NovelImportSplitRule]:
+        """获取全文导入切分规则。"""
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            await project_service.get_project_or_raise(session, project_public_id, current_user_public_id)
+            return novel_service.list_import_split_rules()
         except (project_service.ProjectServiceError, novel_service.NovelServiceError) as exc:
             self._raise_as_http(exc)
 

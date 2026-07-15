@@ -17,9 +17,11 @@ from app.schemas.novel import (
     NovelChapterPage,
     NovelChapterRead,
     NovelChapterUpdate,
+    NovelImportSplitRule,
 )
 from app.services import project as project_service
-from app.utils.novel_parser import parse_novel_chapters
+from app.utils.novel_import_rules import get_builtin_import_split_rules
+from app.utils.novel_parser import ParsedNovelChapter, parse_novel_chapters
 from app.utils.time_tools import utc_now
 
 
@@ -194,7 +196,7 @@ async def import_chapters(
 ) -> list[NovelChapterRead]:
     """解析全文并导入为章节。"""
     project = await _get_project_with_id(session, project_public_id, current_user_public_id)
-    parsed_chapters = parse_novel_chapters(payload.raw_text)
+    parsed_chapters = _parse_import_payload(payload)
     if not parsed_chapters:
         raise NovelChapterValidationError("No chapter content found")
 
@@ -221,6 +223,44 @@ async def import_chapters(
     for chapter in chapters:
         await session.refresh(chapter)
     return [_to_read(chapter) for chapter in chapters]
+
+
+def list_import_split_rules() -> list[NovelImportSplitRule]:
+    """Return built-in frontend import split rules."""
+    return [
+        NovelImportSplitRule(
+            key=rule.key,
+            label=rule.label,
+            description=rule.description,
+            chapter_pattern=rule.chapter_pattern,
+            chapter_flags_list=list(rule.chapter_flags_list),
+            reel_pattern=rule.reel_pattern,
+            reel_flags_list=list(rule.reel_flags_list),
+            builtin=True,
+        )
+        for rule in get_builtin_import_split_rules()
+    ]
+
+
+def _parse_import_payload(payload: NovelChapterImport) -> list[ParsedNovelChapter]:
+    """Return parsed chapters from preview drafts when present, otherwise parse raw text."""
+    if payload.chapters:
+        parsed_chapters: list[ParsedNovelChapter] = []
+        for index, item in enumerate(payload.chapters, start=1):
+            chapter = item.chapter.strip()
+            chapter_data = item.chapter_data.strip()
+            if not chapter or not chapter_data:
+                continue
+            parsed_chapters.append(
+                ParsedNovelChapter(
+                    chapter_index=index,
+                    reel=item.reel.strip(),
+                    chapter=chapter,
+                    chapter_data=chapter_data,
+                )
+            )
+        return parsed_chapters
+    return parse_novel_chapters(payload.raw_text)
 
 
 async def clean_chapter(

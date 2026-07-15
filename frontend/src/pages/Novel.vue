@@ -48,8 +48,8 @@
       <section class="main-panel">
         <header class="page-header">
           <div class="page-header__left">
-            <h1 class="title">小说原文</h1>
-            <p class="desc">管理项目章节、卷次结构与事件清洗结果</p>
+            <h1 class="title">我的小说</h1>
+            <p class="desc">管理章节、卷次结构与事件清洗结果</p>
           </div>
 
           <div class="page-header__right">
@@ -322,6 +322,12 @@
       </div>
     </el-drawer>
 
+    <NovelImportDialog
+      v-model="importDialogVisible"
+      :project-public-id="projectPublicId"
+      @submit="handleImportSubmit"
+    />
+
     <Settings v-model="settingsVisible" />
   </main>
 </template>
@@ -358,9 +364,11 @@ import {
   listNovelChaptersApi,
   updateNovelChapterApi,
   type EventState,
+  type NovelChapterImportItemPayload,
   type NovelChapterPayload,
   type NovelChapterRecord,
 } from '@/api/novel'
+import NovelImportDialog from '../components/NovelImportDialog.vue'
 import Settings from '../components/Settings.vue'
 
 interface NovelChapter extends NovelChapterRecord {
@@ -373,6 +381,12 @@ interface NovelChapterForm {
   chapter: string
   chapterData: string
   event: string
+}
+
+interface ImportChapterDraft {
+  reel: string
+  chapter: string
+  chapterData: string
 }
 
 const router = useRouter()
@@ -398,7 +412,6 @@ const editingId = ref<number | null>(null)
 const viewDrawerVisible = ref(false)
 const viewingNovelId = ref<number | null>(null)
 
-const crawlDialogVisible = ref(false)
 const settingsVisible = ref(false)
 
 const form = reactive<NovelChapterForm>({
@@ -626,17 +639,39 @@ const showComingSoon = () => {
   ElMessage.info('功能开发中')
 }
 
-
+const importDialogVisible = ref(false)
 const openImportDialog = () => {
   if (!ensureProjectReady()) return
-  ElMessage.info('功能开发中')
+  importDialogVisible.value = true
+}
+
+const handleImportSubmit = async (drafts: ImportChapterDraft[]) => {
+  if (!ensureProjectReady() || drafts.length === 0) return
+  const chapters: NovelChapterImportItemPayload[] = drafts
+    .map((draft) => ({
+      reel: draft.reel.trim(),
+      chapter: draft.chapter.trim(),
+      chapterData: draft.chapterData.trim(),
+    }))
+    .filter((draft) => draft.chapter && draft.chapterData)
+  if (chapters.length === 0) {
+    ElMessage.warning('没有可导入的章节正文')
+    return
+  }
+  try {
+    const { data } = await importNovelChaptersApi(projectPublicId.value, { chapters })
+    const importedCount = data.length
+    ElMessage.success(`已导入 ${importedCount} 个章节`)
+    currentPage.value = Math.max(1, Math.ceil((totalNovels.value + importedCount) / pageSize.value))
+    await fetchNovels()
+  } catch (error) {
+    ElMessage.error(`全文导入失败：${getErrorMessage(error)}`)
+  }
 }
 
 const openCrawlDialog = () => {
-  if (!ensureProjectReady()) return
-  ElMessage.info(`功能开发中`)
+  ElMessage.info('功能开发中')
 }
-
 
 const handleSearchClear = () => {
   searchKeyword.value = ''
@@ -653,7 +688,6 @@ const buildFormPayload = (): NovelChapterPayload => ({
   chapterData: form.chapterData.trim(),
   event: form.event.trim(),
 })
-
 
 const replaceChapter = (chapter: NovelChapter) => {
   const index = novels.value.findIndex((item) => item.id === chapter.id)
