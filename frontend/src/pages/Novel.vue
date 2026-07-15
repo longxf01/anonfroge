@@ -55,17 +55,17 @@
           <div class="page-header__right">
             <el-button class="header-action" size="large" @click="openImportDialog">
               <el-icon><Upload /></el-icon>
-              &nbsp;全文导入
+              全文导入
             </el-button>
 
             <el-button class="header-action" size="large" @click="openCrawlDialog">
               <el-icon><Download /></el-icon>
-              &nbsp;小说爬取
+              小说爬取
             </el-button>
 
             <el-button class="primary-button" type="primary" size="large" @click="openCreateDialog">
               <el-icon><Plus /></el-icon>
-              &nbsp;新建章节
+              新建章节
             </el-button>
           </div>
         </header>
@@ -76,7 +76,8 @@
             class="search-input"
             clearable
             placeholder="按章节标题搜索"
-            @clear="searchKeyword = ''"
+            @clear="handleSearchClear"
+            @keyup.enter="handleSearchSubmit"
           >
             <template #prefix>
               <el-icon><Search /></el-icon>
@@ -91,7 +92,7 @@
             @click="batchCleanSelected"
           >
             <el-icon><MagicStick /></el-icon>
-            &nbsp;清洗事件 ({{ selectedRows.length }})
+            清洗事件 ({{ selectedRows.length }})
           </el-button>
 
           <el-button
@@ -100,13 +101,12 @@
             @click="batchDeleteSelected"
           >
             <el-icon><Delete /></el-icon>
-            &nbsp;批量删除
+            批量删除
           </el-button>
         </section>
 
         <section class="table-wrap">
           <el-table
-            ref="tableRef"
             v-loading="loading"
             :data="pagedNovels"
             class="novel-table"
@@ -191,7 +191,7 @@
           <el-pagination
             v-model:current-page="currentPage"
             :page-size="pageSize"
-            :total="filteredNovels.length"
+            :total="totalNovels"
             layout="prev, pager, next, total"
             background
           />
@@ -327,8 +327,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import type { AxiosError } from 'axios'
 import type { FormInstance, FormRules } from 'element-plus'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -347,104 +348,40 @@ import {
   Upload,
   View,
 } from '@element-plus/icons-vue'
+import {
+  batchCleanNovelChaptersApi,
+  batchDeleteNovelChaptersApi,
+  cleanNovelChapterApi,
+  createNovelChapterApi,
+  deleteNovelChapterApi,
+  importNovelChaptersApi,
+  listNovelChaptersApi,
+  updateNovelChapterApi,
+  type EventState,
+  type NovelChapterPayload,
+  type NovelChapterRecord,
+} from '@/api/novel'
 import Settings from '../components/Settings.vue'
 
-type EventState = 0 | 1 | -1
+interface NovelChapter extends NovelChapterRecord {
+  cleaningInline?: boolean
+}
 
-interface NovelChapter {
-  id: number
-  projectId: number
+interface NovelChapterForm {
   chapterIndex: number
   reel: string
   chapter: string
   chapterData: string
   event: string
-  eventState: EventState
-  errorReason: string | null
-  cleaningInline?: boolean
-  crawlSourceKey?: string  // 来源 key
-  crawlNovelDirid?: string // 关联小说
-  crawlChapterId?: number  // 章节 ID
-  crawlTime?: string       // 章节时间
-  crawlMd5?: string        // 正文内容哈希
 }
 
 const router = useRouter()
-const tableRef = ref()
+const route = useRoute()
 const formRef = ref<FormInstance>()
 
-const CURRENT_PROJECT_ID = 1
-
-const mockNovels: NovelChapter[] = [
-  {
-    id: 101,
-    projectId: 1,
-    chapterIndex: 1,
-    reel: '第一卷 · 少年',
-    chapter: '第一章 · 走出小镇',
-    chapterData: '小镇坐落在群山之间，雨后泥土的气息混着青苔味弥漫开来。陈平安背着行囊，看着脚下一条蜿蜒山道，心中既忐忑又期待。山下的世界对他而言是陌生的，但少年没有回头，他知道，留在这里只会日复一日地重复着柴米油盐。出门前，宁姚的剑挂在他的腰间，她说过的那些话像风一样，吹散了他最后的犹豫。',
-    event: '## 主要事件\n- 陈平安离开小镇，走上未知山道\n- 携带宁姚赠予的剑\n- 心理：忐忑与期待并存\n\n## 关键人物\n- 陈平安：少年主角，离乡远行\n- 宁姚：曾鼓励陈平安，赠剑相送\n\n## 场景\n- 雨后小镇山道',
-    eventState: 1,
-    errorReason: null,
-  },
-  {
-    id: 102,
-    projectId: 1,
-    chapterIndex: 2,
-    reel: '第一卷 · 少年',
-    chapter: '第二章 · 山中逢老人',
-    chapterData: '山道盘桓，少年走得腿酸脚软。一棵老槐树下，一名白须老者闭目静坐，听到脚步声后睁开眼，目光像剑一样落在陈平安身上。"小子，你这剑，配不上你。"老人开口便是一句没头没尾的话，陈平安一愣，却没有反驳。老人指着前方道路，淡淡道："往北三百里，有一座剑山，去那里。"',
-    event: '## 主要事件\n- 陈平安在山中遇到神秘老者\n- 老者点评腰间之剑，并指引方向：往北三百里到剑山\n\n## 关键人物\n- 陈平安\n- 白须老者：身份不明，疑为高人\n\n## 场景\n- 山道上一棵老槐树下',
-    eventState: 1,
-    errorReason: null,
-  },
-  {
-    id: 103,
-    projectId: 1,
-    chapterIndex: 3,
-    reel: '第一卷 · 少年',
-    chapter: '第三章 · 北望剑山',
-    chapterData: '少年没有立刻动身。他在槐树下坐了一夜，反复思考老人那句话。天色微亮，他重新启程，每一步都带着某种新的笃定。山路渐陡，他偶尔回头，故乡的轮廓已经看不见了。他抚摸着腰间的剑，心想：宁姚，等我学到本事，再回去找你。',
-    event: '',
-    eventState: 0,
-    errorReason: null,
-  },
-  {
-    id: 104,
-    projectId: 1,
-    chapterIndex: 4,
-    reel: '第一卷 · 少年',
-    chapter: '第四章 · 山贼夜袭',
-    chapterData: '夜色深沉，营地的篝火跳动着。少年裹着粗布毯子刚要入睡，远处传来异响。三个山贼从林中扑出，刀光在火光下显得格外刺眼。陈平安没有犹豫，握紧剑柄，他听到的不仅是风声，还有自己心跳的声音。',
-    event: '',
-    eventState: -1,
-    errorReason: 'API 调用超时（30s），请稍后重试或检查网络',
-  },
-  {
-    id: 105,
-    projectId: 1,
-    chapterIndex: 5,
-    reel: '第二卷 · 远行',
-    chapter: '第五章 · 渡河',
-    chapterData: '一条黄褐色的河流横亘在前方，水势湍急。摆渡的老人嘴里叼着旱烟，懒洋洋地说道："五个铜板，过河。"陈平安摸了摸口袋，掏出最后几枚铜钱递了过去。船摇摇晃晃驶向对岸，他望着远处水雾中朦胧的山影，那里就是剑山。',
-    event: '## 主要事件\n- 陈平安抵达大河，付费过渡\n- 远眺剑山方向\n\n## 关键人物\n- 陈平安\n- 摆渡老人：性格懒散\n\n## 场景\n- 黄褐色大河上的渡船',
-    eventState: 1,
-    errorReason: null,
-  },
-  {
-    id: 106,
-    projectId: 1,
-    chapterIndex: 6,
-    reel: '第二卷 · 远行',
-    chapter: '第六章 · 剑山脚下',
-    chapterData: '剑山脚下，石阶蜿蜒向上，一直消失在云雾里。山门前两位青衣弟子拦住了他："拜山者何人？"陈平安拱手："小镇陈平安，求一剑。"两人对视一眼，露出某种古怪的笑意，转身入山禀报。',
-    event: '',
-    eventState: 0,
-    errorReason: null,
-  },
-]
-
-const novels = ref<NovelChapter[]>(mockNovels.map((item) => ({ ...item })))
+const projectPublicId = ref('')
+const novels = ref<NovelChapter[]>([])
+const totalNovels = ref(0)
 const searchKeyword = ref('')
 const currentPage = ref(1)
 const pageSize = ref(8)
@@ -461,11 +398,10 @@ const editingId = ref<number | null>(null)
 const viewDrawerVisible = ref(false)
 const viewingNovelId = ref<number | null>(null)
 
+const crawlDialogVisible = ref(false)
 const settingsVisible = ref(false)
 
-const importDialogVisible = ref(false)
-
-const form = reactive({
+const form = reactive<NovelChapterForm>({
   chapterIndex: 1,
   reel: '',
   chapter: '',
@@ -473,23 +409,13 @@ const form = reactive({
   event: '',
 })
 
-const formRules: FormRules<typeof form> = {
+const formRules: FormRules<NovelChapterForm> = {
   chapter: [{ required: true, message: '请输入章节标题', trigger: 'blur' }],
   chapterData: [{ required: true, message: '请输入章节正文', trigger: 'blur' }],
   chapterIndex: [{ required: true, message: '请填写章节序号', trigger: 'blur' }],
 }
 
-const filteredNovels = computed(() => {
-  const keyword = searchKeyword.value.trim().toLowerCase()
-  return novels.value
-    .filter((item) => (keyword ? item.chapter.toLowerCase().includes(keyword) : true))
-    .sort((a, b) => a.chapterIndex - b.chapterIndex)
-})
-
-const pagedNovels = computed(() => {
-  const start = (currentPage.value - 1) * pageSize.value
-  return filteredNovels.value.slice(start, start + pageSize.value)
-})
+const pagedNovels = computed(() => novels.value)
 
 const formDialogTitle = computed(() => (formMode.value === 'create' ? '新建章节' : '编辑章节'))
 
@@ -498,6 +424,30 @@ const viewingNovel = computed(() =>
 )
 
 const viewDrawerTitle = computed(() => (viewingNovel.value ? `章节预览：${viewingNovel.value.chapter}` : '章节预览'))
+
+const fetchNovels = async () => {
+  if (!projectPublicId.value) return
+  loading.value = true
+  try {
+    const { data } = await listNovelChaptersApi(projectPublicId.value, {
+      page: currentPage.value,
+      limit: pageSize.value,
+      search: searchKeyword.value.trim() || undefined,
+    })
+    const lastPage = Math.max(1, Math.ceil(data.total / pageSize.value))
+    if (data.total > 0 && data.data.length === 0 && currentPage.value > lastPage) {
+      currentPage.value = lastPage
+      return
+    }
+    novels.value = data.data.map((item) => ({ ...item }))
+    totalNovels.value = data.total
+    selectedRows.value = []
+  } catch (error) {
+    ElMessage.error(`章节加载失败：${getErrorMessage(error)}`)
+  } finally {
+    loading.value = false
+  }
+}
 
 const statusKey = (state: EventState) => {
   if (state === 1) return 'success'
@@ -518,7 +468,7 @@ const onSelectionChange = (rows: NovelChapter[]) => {
 }
 
 const nextChapterIndex = () => {
-  if (novels.value.length === 0) return 1
+  if (novels.value.length === 0) return totalNovels.value + 1
   return Math.max(...novels.value.map((item) => item.chapterIndex)) + 1
 }
 
@@ -531,6 +481,7 @@ const resetForm = () => {
 }
 
 const openCreateDialog = () => {
+  if (!ensureProjectReady()) return
   formMode.value = 'create'
   editingId.value = null
   resetForm()
@@ -538,6 +489,7 @@ const openCreateDialog = () => {
 }
 
 const openEditDialog = (row: NovelChapter) => {
+  if (!ensureProjectReady()) return
   formMode.value = 'edit'
   editingId.value = row.id
   form.chapterIndex = row.chapterIndex
@@ -549,49 +501,37 @@ const openEditDialog = (row: NovelChapter) => {
 }
 
 const submitForm = async () => {
-  if (!formRef.value) return
+  if (!formRef.value || !ensureProjectReady()) return
   const valid = await formRef.value.validate().catch(() => false)
   if (!valid) return
 
   submitting.value = true
-  await new Promise((resolve) => setTimeout(resolve, 200))
-
-  if (formMode.value === 'create') {
-    const newNovel: NovelChapter = {
-      id: Date.now(),
-      projectId: CURRENT_PROJECT_ID,
-      chapterIndex: form.chapterIndex,
-      reel: form.reel,
-      chapter: form.chapter,
-      chapterData: form.chapterData,
-      event: '',
-      eventState: 0,
-      errorReason: null,
-    }
-    novels.value.push(newNovel)
-    ElMessage.success('章节已新建，触发后台清洗')
-    triggerMockClean(newNovel.id)
-  } else if (editingId.value !== null) {
-    const target = novels.value.find((item) => item.id === editingId.value)
-    if (target) {
-      target.chapterIndex = form.chapterIndex
-      target.reel = form.reel
-      target.chapter = form.chapter
-      target.chapterData = form.chapterData
-      if (form.event !== target.event) {
-        target.event = form.event
-        target.eventState = form.event ? 1 : 0
-        target.errorReason = null
+  try {
+    const payload = buildFormPayload()
+    if (formMode.value === 'create') {
+      await createNovelChapterApi(projectPublicId.value, payload)
+      ElMessage.success('章节已新建')
+      const nextPage = Math.max(1, Math.ceil((totalNovels.value + 1) / pageSize.value))
+      if (currentPage.value === nextPage) {
+        await fetchNovels()
+      } else {
+        currentPage.value = nextPage
       }
+    } else if (editingId.value !== null) {
+      await updateNovelChapterApi(projectPublicId.value, editingId.value, payload)
       ElMessage.success('章节已更新')
+      await fetchNovels()
     }
+    formDialogVisible.value = false
+  } catch (error) {
+    ElMessage.error(`保存失败：${getErrorMessage(error)}`)
+  } finally {
+    submitting.value = false
   }
-
-  formDialogVisible.value = false
-  submitting.value = false
 }
 
 const handleDelete = async (row: NovelChapter) => {
+  if (!ensureProjectReady()) return
   try {
     await ElMessageBox.confirm(`确定删除「${row.chapter}」吗？删除后不可恢复。`, '删除章节', {
       confirmButtonText: '删除',
@@ -600,16 +540,21 @@ const handleDelete = async (row: NovelChapter) => {
       confirmButtonClass: 'el-button--danger',
       customClass: 'novel-dark-messagebox',
     })
-    novels.value = novels.value.filter((item) => item.id !== row.id)
+    await deleteNovelChapterApi(projectPublicId.value, row.id)
+    if (viewingNovelId.value === row.id) {
+      viewDrawerVisible.value = false
+      viewingNovelId.value = null
+    }
     ElMessage.success('章节已删除')
+    await fetchNovels()
   } catch (error) {
     if (error === 'cancel' || error === 'close') return
-    ElMessage.error('删除失败')
+    ElMessage.error(`删除失败：${getErrorMessage(error)}`)
   }
 }
 
 const batchDeleteSelected = async () => {
-  if (selectedRows.value.length === 0) return
+  if (!ensureProjectReady() || selectedRows.value.length === 0) return
   try {
     await ElMessageBox.confirm(`确定批量删除 ${selectedRows.value.length} 个章节吗？`, '批量删除', {
       confirmButtonText: '删除',
@@ -618,54 +563,54 @@ const batchDeleteSelected = async () => {
       confirmButtonClass: 'el-button--danger',
       customClass: 'novel-dark-messagebox',
     })
-    const ids = new Set(selectedRows.value.map((row) => row.id))
-    novels.value = novels.value.filter((item) => !ids.has(item.id))
+    const ids = selectedRows.value.map((row) => row.id)
+    await batchDeleteNovelChaptersApi(projectPublicId.value, { ids })
+    if (viewingNovelId.value && ids.includes(viewingNovelId.value)) {
+      viewDrawerVisible.value = false
+      viewingNovelId.value = null
+    }
     selectedRows.value = []
     ElMessage.success('选中章节已删除')
+    await fetchNovels()
   } catch (error) {
     if (error === 'cancel' || error === 'close') return
-    ElMessage.error('批量删除失败')
+    ElMessage.error(`批量删除失败：${getErrorMessage(error)}`)
   }
 }
 
-const triggerMockClean = (id: number) => {
-  const target = novels.value.find((item) => item.id === id)
-  if (!target) return
-  target.cleaningInline = true
-  target.eventState = 0
-  target.event = ''
-  target.errorReason = null
-  setTimeout(() => {
-    if (target.chapterData.length < 80) {
-      target.eventState = -1
-      target.errorReason = '正文字数过少，无法提取有效事件'
+const cleanSingle = async (row: NovelChapter) => {
+  if (!ensureProjectReady() || row.cleaningInline) return
+  row.cleaningInline = true
+  try {
+    const { data } = await cleanNovelChapterApi(projectPublicId.value, row.id)
+    replaceChapter({ ...data, cleaningInline: false })
+    if (data.eventState === 1) {
+      ElMessage.success(`「${data.chapter}」事件已生成`)
     } else {
-      target.eventState = 1
-      target.event = `## 主要事件\n- 由「${target.chapter}」自动清洗生成（演示数据）\n- 共 ${target.chapterData.length} 字\n\n## 关键人物\n- 主角\n\n## 场景\n- 自动识别中...`
+      ElMessage.warning(data.errorReason || `「${data.chapter}」暂未生成事件`)
     }
-    target.cleaningInline = false
-  }, 1200)
-}
-
-const cleanSingle = (row: NovelChapter) => {
-  if (row.cleaningInline) return
-  triggerMockClean(row.id)
-  ElMessage.info(`正在清洗「${row.chapter}」`)
+  } catch (error) {
+    row.cleaningInline = false
+    ElMessage.error(`清洗失败：${getErrorMessage(error)}`)
+  }
 }
 
 const batchCleanSelected = async () => {
-  if (selectedRows.value.length === 0) return
+  if (!ensureProjectReady() || selectedRows.value.length === 0) return
   cleaning.value = true
   const ids = selectedRows.value.map((row) => row.id)
-  selectedRows.value = []
-  for (const id of ids) {
-    triggerMockClean(id)
-    await new Promise((resolve) => setTimeout(resolve, 80))
-  }
-  ElMessage.success(`已提交 ${ids.length} 个章节进入清洗队列`)
-  setTimeout(() => {
+  markRowsCleaning(ids, true)
+  try {
+    await batchCleanNovelChaptersApi(projectPublicId.value, { ids })
+    selectedRows.value = []
+    ElMessage.success(`已清洗 ${ids.length} 个章节`)
+    await fetchNovels()
+  } catch (error) {
+    ElMessage.error(`批量清洗失败：${getErrorMessage(error)}`)
+  } finally {
+    markRowsCleaning(ids, false)
     cleaning.value = false
-  }, 1500)
+  }
 }
 
 const openViewDrawer = (row: NovelChapter) => {
@@ -681,18 +626,146 @@ const showComingSoon = () => {
   ElMessage.info('功能开发中')
 }
 
+
 const openImportDialog = () => {
+  if (!ensureProjectReady()) return
   ElMessage.info('功能开发中')
-  importDialogVisible.value = true
 }
-
-
-const crawlDialogVisible = ref(false)
 
 const openCrawlDialog = () => {
+  if (!ensureProjectReady()) return
   ElMessage.info(`功能开发中`)
-  crawlDialogVisible.value = true
 }
+
+
+const handleSearchClear = () => {
+  searchKeyword.value = ''
+}
+
+const handleSearchSubmit = () => {
+  runSearchNow()
+}
+
+const buildFormPayload = (): NovelChapterPayload => ({
+  chapterIndex: form.chapterIndex,
+  reel: form.reel.trim(),
+  chapter: form.chapter.trim(),
+  chapterData: form.chapterData.trim(),
+  event: form.event.trim(),
+})
+
+
+const replaceChapter = (chapter: NovelChapter) => {
+  const index = novels.value.findIndex((item) => item.id === chapter.id)
+  if (index >= 0) {
+    novels.value.splice(index, 1, chapter)
+  }
+}
+
+const markRowsCleaning = (ids: number[], value: boolean) => {
+  const idSet = new Set(ids)
+  novels.value.forEach((item) => {
+    if (idSet.has(item.id)) {
+      item.cleaningInline = value
+    }
+  })
+}
+
+const ensureProjectReady = () => {
+  if (projectPublicId.value) return true
+  ElMessage.warning('未指定项目')
+  router.push('/project')
+  return false
+}
+
+const resolveProjectPublicId = () => {
+  const id = route.query.id
+  if (Array.isArray(id)) return id[0] || ''
+  return typeof id === 'string' ? id : ''
+}
+
+const loadRouteProject = () => {
+  const id = resolveProjectPublicId().trim()
+  if (!id) {
+    ElMessage.warning('未指定项目')
+    router.push('/project')
+    return
+  }
+  if (projectPublicId.value !== id) {
+    projectPublicId.value = id
+    novels.value = []
+    totalNovels.value = 0
+    selectedRows.value = []
+  }
+  if (currentPage.value !== 1) {
+    currentPage.value = 1
+  } else {
+    void fetchNovels()
+  }
+}
+
+const runSearchNow = () => {
+  if (searchTimer !== undefined) {
+    window.clearTimeout(searchTimer)
+    searchTimer = undefined
+  }
+  if (currentPage.value !== 1) {
+    currentPage.value = 1
+  } else {
+    void fetchNovels()
+  }
+}
+
+const getErrorMessage = (error: unknown) => {
+  const axiosError = isRecord(error) ? (error as unknown as AxiosError<{ detail?: unknown; message?: unknown }>) : null
+  const responseMessage =
+    formatErrorDetail(axiosError?.response?.data?.detail) ||
+    formatErrorDetail(axiosError?.response?.data?.message)
+  if (responseMessage) return responseMessage
+  if (error instanceof Error && error.message) return error.message
+  return formatErrorDetail(error) || '请求失败'
+}
+
+const formatErrorDetail = (detail: unknown): string => {
+  if (!detail) return ''
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    return detail.map(formatErrorDetail).filter(Boolean).join('；')
+  }
+  if (isRecord(detail)) {
+    const record = detail as Record<string, unknown>
+    const message = formatErrorDetail(record.msg) || formatErrorDetail(record.message) || formatErrorDetail(record.detail)
+    const location = Array.isArray(record.loc) ? record.loc.map(String).join('.') : ''
+    if (message) return location ? `${location}: ${message}` : message
+    try {
+      return JSON.stringify(detail)
+    } catch {
+      return String(detail)
+    }
+  }
+  return String(detail)
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => (
+  typeof value === 'object' && value !== null
+)
+
+let searchTimer: number | undefined
+
+watch(() => route.query.id, loadRouteProject, { immediate: true })
+
+watch(currentPage, () => {
+  void fetchNovels()
+})
+
+watch(searchKeyword, () => {
+  if (searchTimer !== undefined) {
+    window.clearTimeout(searchTimer)
+  }
+  searchTimer = window.setTimeout(() => {
+    runSearchNow()
+  }, 300)
+})
 </script>
 
 <style scoped>
