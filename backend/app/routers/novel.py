@@ -29,6 +29,7 @@ from app.schemas.novel import (
     NovelChapterBatchClean,
     NovelChapterBatchDelete,
     NovelChapterBatchResult,
+    NovelChapterCleanStatus,
     NovelChapterCreate,
     NovelChapterEventStateUpdate,
     NovelChapterImport,
@@ -512,11 +513,12 @@ class NovelView(BaseView):
             async for event in events:
                 yield json.dumps(event, ensure_ascii=False) + "\n"
 
+        # StreamingResponse 流水响应响应对象，把当前视图方法中，yield产生的结果逐个返回给客户端
         return StreamingResponse(
             render_events(),
             media_type="application/x-ndjson",
             headers={
-                "Cache-Control": "no-cache",
+                "Cache-Control": "no-cache", # 如果没有这两个响应头，则有可能遭到浏览器的缓存
                 "X-Accel-Buffering": "no",
             },
         )
@@ -542,6 +544,52 @@ class NovelView(BaseView):
             return await novel_service.import_crawl_chapters(session, project_public_id, current_user_public_id, payload)
         except (project_service.ProjectServiceError, novel_service.NovelServiceError) as exc:
             self._raise_as_http(exc)
+
+    @route(
+        "/clean/status",
+        methods=["GET"],
+        response_model=list[NovelChapterCleanStatus],
+        middlewares=NOVEL_ROUTE_MIDDLEWARES,
+        summary="获取章节事件清洗状态",
+        description="按章节 ID 批量获取事件清洗状态，不返回章节正文。",
+    )
+    async def list_clean_statuses(
+        self,
+        project_public_id: str,
+        request: Request,
+        session: SessionDep,
+        ids: str = Query(default=""),
+    ) -> list[NovelChapterCleanStatus]:
+        """批量获取章节事件清洗状态。"""
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            chapter_ids = _parse_id_list(ids)
+            return await novel_service.list_chapter_clean_statuses(
+                session,
+                project_public_id,
+                current_user_public_id,
+                chapter_ids,
+            )
+        except (project_service.ProjectServiceError, novel_service.NovelServiceError) as exc:
+            self._raise_as_http(exc)
+
+    @route(
+        "/clean-status",
+        methods=["GET"],
+        response_model=list[NovelChapterCleanStatus],
+        middlewares=NOVEL_ROUTE_MIDDLEWARES,
+        summary="兼容获取章节事件清洗状态",
+        description="兼容旧前端按章节 ID 批量获取事件清洗状态，不返回章节正文。",
+    )
+    async def list_clean_statuses_legacy(
+        self,
+        project_public_id: str,
+        request: Request,
+        session: SessionDep,
+        ids: str = Query(default=""),
+    ) -> list[NovelChapterCleanStatus]:
+        """兼容旧版清洗状态查询路径。"""
+        return await self.list_clean_statuses(project_public_id, request, session, ids)
 
     @route(
         "/{chapter_id}",
@@ -599,9 +647,10 @@ class NovelView(BaseView):
         "/{chapter_id}/clean",
         methods=["POST"],
         response_model=NovelChapterRead,
+        status_code=status.HTTP_202_ACCEPTED,
         middlewares=NOVEL_ROUTE_MIDDLEWARES,
         summary="清洗章节事件",
-        description="为指定项目下的单个章节生成事件清洗结果。",
+        description="提交指定项目下的单个章节事件清洗任务，实际清洗在后台执行。",
     )
     async def clean_chapter(
         self,
@@ -610,12 +659,37 @@ class NovelView(BaseView):
         request: Request,
         session: SessionDep,
     ) -> NovelChapterRead:
-        """清洗章节事件。"""
+        """提交单章事件清洗后台任务。"""
         current_user_public_id = self._current_user_public_id(request)
         try:
-            return await novel_service.clean_chapter(session, project_public_id, chapter_id, current_user_public_id)
+            chapter = await novel_service.queue_clean_chapter(
+                session,
+                project_public_id,
+                chapter_id,
+                current_user_public_id,
+            )
+            novel_service.submit_clean_chapter_task(
+                project_public_id,
+                chapter_id,
+                current_user_public_id,
+            )
+            return chapter
         except (project_service.ProjectServiceError, novel_service.NovelServiceError) as exc:
             self._raise_as_http(exc)
 
 
 router = NovelView()()
+
+
+def _parse_id_list(raw_ids: str) -> list[int]:
+    """解析逗号分隔的章节 ID 查询参数。"""
+    ids: list[int] = []
+    for item in raw_ids.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        try:
+            ids.append(int(value))
+        except ValueError as exc:
+            raise novel_service.NovelChapterValidationError("章节 ID 必须是整数") from exc
+    return ids
