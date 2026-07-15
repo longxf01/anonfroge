@@ -51,6 +51,43 @@ const refreshAccessToken = (refreshToken: string) => {
   return refreshTokenRequest
 }
 
+
+const withAuthHeader = (init: RequestInit, accessToken = localStorage.getItem('access_token')) => {
+  const headers = new Headers(init.headers)
+  if (accessToken) {
+    headers.set('Authorization', `Bearer ${accessToken}`)
+  }
+  return {
+    ...init,
+    headers,
+  }
+}
+
+export const fetchWithAuthRetry = async (input: RequestInfo | URL, init: RequestInit = {}) => {
+  const firstResponse = await fetch(input, withAuthHeader(init))
+  if (firstResponse.status !== 401 || isAuthRoute(String(input))) {
+    return firstResponse
+  }
+
+  const refreshToken = localStorage.getItem('refresh_token')
+  if (!refreshToken) {
+    clearAuthStorage()
+    return firstResponse
+  }
+
+  try {
+    const accessToken = await refreshAccessToken(refreshToken)
+    return await fetch(input, withAuthHeader(init, accessToken))
+  } catch (refreshError) {
+    clearAuthStorage()
+    if (window.location.pathname !== '/login') {
+      window.location.href = '/login'
+    }
+    throw refreshError
+  }
+}
+
+
 // 网络请求守卫
 request.interceptors.request.use((config) => {
   const token = localStorage.getItem('access_token')
@@ -62,6 +99,7 @@ request.interceptors.request.use((config) => {
   return config
 })
 
+// 网络响应守卫
 request.interceptors.response.use(
   (response) => response,
   async (error: AxiosError<{ detail?: string }>) => {

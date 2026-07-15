@@ -328,6 +328,12 @@
       @submit="handleImportSubmit"
     />
 
+    <NovelCrawlDialog
+      v-model="crawlDialogVisible"
+      :project-public-id="projectPublicId"
+      @submit="handleCrawlSubmit"
+    />
+
     <Settings v-model="settingsVisible" />
   </main>
 </template>
@@ -360,14 +366,18 @@ import {
   cleanNovelChapterApi,
   createNovelChapterApi,
   deleteNovelChapterApi,
+  importCrawlChaptersApi,
   importNovelChaptersApi,
   listNovelChaptersApi,
   updateNovelChapterApi,
+  type CrawlChapterDraft,
+  type CrawlSearchResult,
   type EventState,
   type NovelChapterImportItemPayload,
   type NovelChapterPayload,
   type NovelChapterRecord,
 } from '@/api/novel'
+import NovelCrawlDialog from '../components/NovelCrawlDialog.vue'
 import NovelImportDialog from '../components/NovelImportDialog.vue'
 import Settings from '../components/Settings.vue'
 
@@ -669,8 +679,28 @@ const handleImportSubmit = async (drafts: ImportChapterDraft[]) => {
   }
 }
 
+const crawlDialogVisible = ref(false)
 const openCrawlDialog = () => {
-  ElMessage.info('功能开发中')
+  if (!ensureProjectReady()) return
+  crawlDialogVisible.value = true
+}
+
+const handleCrawlSubmit = async (drafts: CrawlChapterDraft[], book: CrawlSearchResult) => {
+  if (!ensureProjectReady() || drafts.length === 0) return
+  try {
+    const { data } = await importCrawlChaptersApi(projectPublicId.value, {
+      sourceKey: book.sourceKey,
+      book,
+      chapters: drafts,
+    })
+    ElMessage.success(`爬取导入完成：新增 ${data.created}，更新 ${data.updated}，跳过 ${data.skipped}`)
+    if (data.created > 0) {
+      currentPage.value = Math.max(1, Math.ceil((totalNovels.value + data.created) / pageSize.value))
+    }
+    await fetchNovels()
+  } catch (error) {
+    ElMessage.error(`小说爬取导入失败：${getErrorMessage(error)}`)
+  }
 }
 
 const handleSearchClear = () => {
@@ -1200,6 +1230,55 @@ watch(searchKeyword, () => {
   background-color: rgba(255, 255, 255, 0.24);
 }
 
+.novel-table :deep(.el-table__inner-wrapper),
+.novel-table :deep(.el-table__header-wrapper),
+.novel-table :deep(.el-table__body-wrapper),
+.novel-table :deep(.el-table__fixed),
+.novel-table :deep(.el-table__fixed-right),
+.novel-table :deep(.el-table__fixed-right-patch),
+.novel-table :deep(.el-table__empty-block),
+.novel-table :deep(.el-table__body),
+.novel-table :deep(.el-table__header) {
+  background-color: transparent !important;
+}
+
+.novel-table :deep(.el-table__inner-wrapper::before),
+.novel-table :deep(.el-table__border-left-patch),
+.novel-table :deep(.el-table__fixed-right::before) {
+  background-color: rgba(255, 255, 255, 0.06);
+}
+
+.novel-table :deep(.el-table__empty-text) {
+  color: #8b949e;
+}
+
+.novel-table :deep(.el-empty) {
+  --el-empty-padding: 28px 0;
+  --el-empty-description-margin-top: 10px;
+}
+
+.novel-table :deep(.el-empty__image svg) {
+  opacity: 0.58;
+  filter: saturate(0.75) brightness(0.72);
+}
+
+.novel-table :deep(.el-empty__description p) {
+  color: #8b949e;
+}
+
+.novel-table :deep(.el-loading-mask) {
+  background-color: rgba(13, 17, 23, 0.72) !important;
+  backdrop-filter: blur(2px);
+}
+
+.novel-table :deep(.el-loading-spinner .path) {
+  stroke: #60a5fa;
+}
+
+.novel-table :deep(.el-loading-spinner .el-loading-text) {
+  color: #c5cdd6;
+}
+
 .row-index {
   font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
   color: #93c5fd;
@@ -1325,6 +1404,22 @@ watch(searchKeyword, () => {
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 10px;
   background: rgba(255, 255, 255, 0.02);
+}
+
+.pagination-wrap :deep(.el-pagination.is-background .btn-prev:hover:not(:disabled)),
+.pagination-wrap :deep(.el-pagination.is-background .btn-next:hover:not(:disabled)),
+.pagination-wrap :deep(.el-pagination.is-background .el-pager li:hover:not(.is-active)) {
+  color: #ffffff;
+  border-color: rgba(96, 165, 250, 0.36);
+  background: rgba(37, 99, 235, 0.12);
+}
+
+.pagination-wrap :deep(.el-pagination.is-background .btn-prev:disabled),
+.pagination-wrap :deep(.el-pagination.is-background .btn-next:disabled),
+.pagination-wrap :deep(.el-pagination.is-background .el-pager li.is-disabled) {
+  color: #4d5560;
+  border-color: rgba(255, 255, 255, 0.05);
+  background: rgba(255, 255, 255, 0.015);
 }
 
 .pagination-wrap :deep(.el-pagination.is-background .el-pager li.is-active) {
@@ -1560,7 +1655,7 @@ watch(searchKeyword, () => {
 </style>
 
 <style>
-/* novel 页专用暗色弹窗、下拉与抽屉（element-plus teleport 到 body，需置于非 scoped 块） */
+/* 小说页专用暗色弹窗、下拉与抽屉（Element Plus 挂载到 body，需置于非 scoped 块） */
 .novel-dark-dialog {
   background: linear-gradient(180deg, #12161b 0%, #0f141a 100%);
   border: 1px solid rgba(255, 255, 255, 0.12);
@@ -1746,7 +1841,7 @@ watch(searchKeyword, () => {
   border-color: #1d4ed8;
 }
 
-/* select 浮层 */
+/* 选择器浮层 */
 .novel-dark-select.el-popper {
   background-color: #14181f;
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -1785,12 +1880,12 @@ watch(searchKeyword, () => {
   border-color: rgba(255, 255, 255, 0.08);
 }
 
-/* multiple 模式下浮层选项的"已选" 状态（element-plus 多选下拉的勾选指示） */
+/* 多选模式下浮层选项的"已选" 状态（Element Plus 多选下拉的勾选指示） */
 .novel-dark-select.el-popper .el-select-dropdown__item.is-selected::after {
   color: #93c5fd;
 }
 
-/* multiple select 输入框内的已选 tag、折叠 tag 暗色风格 */
+/* 多选下拉输入框内的已选标签、折叠标签暗色风格 */
 .novel-dark-dialog .el-select__wrapper .el-select__selected-item .el-tag,
 .novel-dark-dialog .el-select .el-select__tags-text + .el-tag,
 .novel-dark-dialog .el-select__wrapper .el-tag {
@@ -1811,7 +1906,7 @@ watch(searchKeyword, () => {
   color: #ffffff;
 }
 
-/* collapse-tags-tooltip 浮层（鼠标 hover 已选 + N 标签时显示的全部已选项）暗色风格 */
+/* 折叠标签提示浮层（鼠标悬停已选 + N 标签时显示的全部已选项）暗色风格 */
 .el-popper.is-dark.el-tooltip__popper.el-select__popper--multiple,
 .el-popper.is-dark[role="tooltip"] {
   background: linear-gradient(180deg, #14181f 0%, #0d1117 100%);
@@ -1824,7 +1919,7 @@ watch(searchKeyword, () => {
   border-color: rgba(255, 255, 255, 0.12);
 }
 
-/* el-table show-overflow-tooltip 浮层（章节标题超长时） */
+/* 表格溢出提示浮层（章节标题超长时） */
 .novel-cell-tooltip.el-popper {
   max-width: 520px;
   padding: 10px 14px;
@@ -1842,7 +1937,7 @@ watch(searchKeyword, () => {
   border-color: rgba(255, 255, 255, 0.12);
 }
 
-/* drawer 暗色 */
+/* 抽屉暗色 */
 .novel-dark-drawer {
   background: linear-gradient(180deg, #12161b 0%, #0f141a 100%);
   border-left: 1px solid rgba(255, 255, 255, 0.08);
@@ -1893,7 +1988,7 @@ watch(searchKeyword, () => {
   background-color: rgba(255, 255, 255, 0.24);
 }
 
-/* messagebox 暗色 */
+/* 消息框暗色 */
 .novel-dark-messagebox {
   background: linear-gradient(180deg, #14181f 0%, #0d1117 100%);
   border: 1px solid rgba(255, 255, 255, 0.08);
