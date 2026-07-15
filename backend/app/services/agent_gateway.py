@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from typing import Any
 
 from app.services import provider_runtime
@@ -25,6 +26,24 @@ class ProviderModelGateway:
         input_values: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> str:
+        raw_output = await self.generate_response(
+            model_id=model_id,
+            messages=messages,
+            provider_key=provider_key,
+            input_values=input_values,
+            **kwargs,
+        )
+        return self._extract_text(raw_output)
+
+    async def generate_response(
+        self,
+        *,
+        model_id: str,
+        messages: list[dict[str, str]],
+        provider_key: str | None = None,
+        input_values: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> Any:
         try:
             provider = provider_runtime.create_provider_for_model(
                 model_id,
@@ -33,8 +52,46 @@ class ProviderModelGateway:
                 timeout=self.timeout,
             )
             request = provider.generate(model_id=model_id, messages=messages, **kwargs)
-            raw_output = await asyncio.wait_for(request, timeout=self.timeout) if self.timeout > 0 else await request
-            return self._extract_text(raw_output)
+            return await asyncio.wait_for(request, timeout=self.timeout) if self.timeout > 0 else await request
+        except TimeoutError as exc:
+            raise ProviderModelGatewayError(f"模型调用超时：{self.timeout}秒") from exc
+        except ProviderModelGatewayError:
+            raise
+        except Exception as exc:
+            raise ProviderModelGatewayError(str(exc)) from exc
+
+    async def generate_stream(
+        self,
+        *,
+        model_id: str,
+        messages: list[dict[str, str]],
+        provider_key: str | None = None,
+        input_values: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[str]:
+        try:
+            provider = provider_runtime.create_provider_for_model(
+                model_id,
+                provider_key=provider_key,
+                input_values=input_values,
+                timeout=self.timeout,
+            )
+            stream = getattr(provider, "generate_stream", None)
+            if callable(stream):
+                async for chunk in stream(model_id=model_id, messages=messages, **kwargs):
+                    text = str(chunk or "")
+                    if text:
+                        yield text
+                return
+
+            raw_output = await self.generate_response(
+                model_id=model_id,
+                messages=messages,
+                provider_key=provider_key,
+                input_values=input_values,
+                **kwargs,
+            )
+            yield self._extract_text(raw_output)
         except TimeoutError as exc:
             raise ProviderModelGatewayError(f"模型调用超时：{self.timeout}秒") from exc
         except ProviderModelGatewayError:

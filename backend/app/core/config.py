@@ -47,6 +47,24 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    """从逗号分隔的环境变量解析整数元组。"""
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    items = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    return items or default
+
+
+def _env_str_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """从逗号分隔的环境变量解析字符串元组。"""
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    items = tuple(item.strip() for item in value.split(",") if item.strip())
+    return items or default
+
+
 # frozen=True 冻结属性值，不允许配置类Settings实例化以后，被其他地方的程序修改属性值
 @dataclass(frozen=True)
 class Settings(object):
@@ -56,6 +74,7 @@ class Settings(object):
     app_env: str = field(default_factory=lambda: os.getenv("APP_ENV", "development"))  # 应用运行环境
     host: str = field(default_factory=lambda: os.getenv("HOST", "0.0.0.0"))  # 后端监听地址
     port: int = field(default_factory=lambda: int(os.getenv("PORT", "8000")))  # 后端监听端口
+    reload: bool = field(default_factory=lambda: _env_bool("RELOAD", False))  # 是否开启代码热重载（仅开发用，RELOAD=true 开启）
     api_prefix: str = field(default_factory=lambda: os.getenv("API_PREFIX", "/api"))  # API 路由前缀
     oss_root: str = field(default_factory=lambda: os.getenv("OSS_ROOT", "./data/oss"))  # 本地 OSS 根目录
     db_engine: str = field(default_factory=lambda: os.getenv("DB_ENGINE", "postgres"))  # 数据库类型
@@ -114,7 +133,23 @@ class Settings(object):
     director_manual_root: str = field(default_factory=lambda: os.getenv("DIRECTOR_MANUAL_ROOT", "./data/skills/director_manual"))  # 导演手册资源根目录
     skills_root: str = field(default_factory=lambda: os.getenv("SKILLS_ROOT", "./data/skills"))  # 技能文档根目录
     chapter_event_extraction_prompt_name: str = field( default_factory=lambda: os.getenv("CHAPTER_EVENT_EXTRACTION_PROMPT_NAME", "chapter_event_extraction") )  # 章节事件提取提示词名称
-    
+    novel_crawl_http_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("NOVEL_CRAWL_HTTP_TIMEOUT_SECONDS", "20.0")))  # 小说爬虫 HTTP 总超时秒数
+    novel_crawl_http_connect_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("NOVEL_CRAWL_HTTP_CONNECT_TIMEOUT_SECONDS", "10.0")))  # 小说爬虫 HTTP 连接超时秒数
+    novel_crawl_impersonate: str = field(default_factory=lambda: os.getenv("NOVEL_CRAWL_IMPERSONATE", "chrome110"))  # 小说 rule 来源浏览器 TLS 指纹画像
+    novel_crawl_proxy: str = field(default_factory=lambda: os.getenv("NOVEL_CRAWL_PROXY", ""))  # 小说爬虫代理地址，留空则不启用代理
+    novel_crawl_chapter_coroutines_per_process: int = field(default_factory=lambda: int(os.getenv("NOVEL_CRAWL_CHAPTER_COROUTINES_PER_PROCESS", "8")))  # 小说章节抓取每进程协程数
+    novel_crawl_max_processes: int = field(default_factory=lambda: int(os.getenv("NOVEL_CRAWL_MAX_PROCESSES", "4")))  # 小说章节抓取最大进程数
+    novel_crawl_stream_concurrency: int = field(default_factory=lambda: int(os.getenv("NOVEL_CRAWL_STREAM_CONCURRENCY", "8")))  # 小说章节流式抓取默认并发数
+    novel_crawl_http_retries: int = field(default_factory=lambda: int(os.getenv("NOVEL_CRAWL_HTTP_RETRIES", "2")))  # 小说爬虫 HTTP 请求重试次数
+    novel_crawl_http_retry_backoff_seconds: float = field(default_factory=lambda: float(os.getenv("NOVEL_CRAWL_HTTP_RETRY_BACKOFF_SECONDS", "0.5")))  # 小说爬虫 HTTP 重试基础退避秒数
+    novel_crawl_max_search_pages: int = field(default_factory=lambda: int(os.getenv("NOVEL_CRAWL_MAX_SEARCH_PAGES", "10")))  # 小说搜索翻页上限
+    novel_crawl_max_content_pages: int = field(default_factory=lambda: int(os.getenv("NOVEL_CRAWL_MAX_CONTENT_PAGES", "20")))  # 小说单章正文分页拼接上限
+    novel_crawl_rule_concurrency: int = field(default_factory=lambda: int(os.getenv("NOVEL_CRAWL_RULE_CONCURRENCY", "3")))  # 小说 rule 来源章节抓取并发数
+    novel_crawl_rule_jitter_seconds: float = field(default_factory=lambda: float(os.getenv("NOVEL_CRAWL_RULE_JITTER_SECONDS", "0.4")))  # 小说 rule 来源请求随机抖动秒数
+    novel_crawl_throttle_backoff_seconds: float = field(default_factory=lambda: float(os.getenv("NOVEL_CRAWL_THROTTLE_BACKOFF_SECONDS", "3.0")))  # 小说来源命中限流后的退避秒数
+    novel_crawl_throttle_status_codes: tuple[int, ...] = field(default_factory=lambda: _env_int_tuple("NOVEL_CRAWL_THROTTLE_STATUS_CODES", (403, 429)))  # 小说来源限流状态码
+    novel_crawl_next_page_labels: tuple[str, ...] = field(default_factory=lambda: _env_str_tuple("NOVEL_CRAWL_NEXT_PAGE_LABELS", ("下一页", "下页", "下一頁", "下一张")))  # 小说 rule 正文下一页链接文案
+
     model_request_timeout_seconds: float = field( default_factory=lambda: float(os.getenv("MODEL_REQUEST_TIMEOUT_SECONDS", "180")) )  # 模型请求超时秒数
     media_generation_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("MEDIA_GENERATION_TIMEOUT_SECONDS", DEFAULT_MEDIA_GENERATION_TIMEOUT_SECONDS)))  # 媒体生成通用超时秒数
     image_generation_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("IMAGE_GENERATION_TIMEOUT_SECONDS", DEFAULT_IMAGE_GENERATION_TIMEOUT_SECONDS)))  # 图片生成超时秒数

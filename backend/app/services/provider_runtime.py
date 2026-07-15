@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import sys
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -41,26 +43,7 @@ class OpenAICompatibleTextProvider(BaseProvider):
 
     async def generate(self, *, model_id: str | None = None, **kwargs: Any) -> Any:
         """调用 OpenAI 兼容的 chat completions 接口生成文本。"""
-        resolved_model_id = (model_id or "").strip()
-        if not resolved_model_id:
-            raise ProviderRuntimeError("model_id 不能为空")
-        messages = kwargs.get("messages")
-        if not isinstance(messages, list) or not messages:
-            raise ProviderRuntimeError("messages 不能为空")
-
-        payload: dict[str, Any] = {
-            "model": resolved_model_id,
-            "messages": messages,
-        }
-        for key in ("temperature", "top_p", "max_tokens", "response_format"):
-            if key in kwargs and kwargs[key] is not None:
-                payload[key] = kwargs[key]
-
-        headers = {
-            "Authorization": f"Bearer {_resolve_openai_api_key(self.config, self.input_values)}",
-            "Content-Type": "application/json",
-        }
-        url = _build_chat_completions_url(self.base_url)
+        payload, headers, url = self._build_request(model_id=model_id, **kwargs)
         try:
             if self.client is not None:
                 response = await self.client.post(url, headers=headers, json=payload)
@@ -76,6 +59,109 @@ class OpenAICompatibleTextProvider(BaseProvider):
             return response.json()
         except ValueError as exc:
             raise ProviderRuntimeError("文本生成响应不是合法 JSON") from exc
+
+    async def generate_stream(self, *, model_id: str | None = None, **kwargs: Any) -> AsyncIterator[str]:
+        """调用 OpenAI 兼容的 chat completions 流式接口。"""
+        payload, headers, url = self._build_request(model_id=model_id, **kwargs)
+        payload["stream"] = True
+
+        try:
+            if self.client is not None:
+                async with self.client.stream("POST", url, headers=headers, json=payload) as response:
+                    if response.status_code >= 400:
+                        error_text = await _read_stream_error_text(response)
+                        raise ProviderRuntimeError(
+                            f"文本生成流式请求失败，HTTP {response.status_code}: {error_text}"
+                        )
+                    async for chunk in self._iterate_stream_response(response):
+                        yield chunk
+            else:
+                async with httpx.AsyncClient(timeout=_build_httpx_timeout(self.timeout)) as client:
+                    async with client.stream("POST", url, headers=headers, json=payload) as response:
+                        if response.status_code >= 400:
+                            error_text = await _read_stream_error_text(response)
+                            raise ProviderRuntimeError(
+                                f"文本生成流式请求失败，HTTP {response.status_code}: {error_text}"
+                            )
+                        async for chunk in self._iterate_stream_response(response):
+                            yield chunk
+        except httpx.HTTPError as exc:
+            raise ProviderRuntimeError(f"文本生成流式请求失败: {_format_http_error(exc, url)}") from exc
+
+    def _build_request(self, *, model_id: str | None = None, **kwargs: Any) -> tuple[dict[str, Any], dict[str, str], str]:
+        resolved_model_id = (model_id or "").strip()
+        if not resolved_model_id:
+            raise ProviderRuntimeError("model_id 不能为空")
+        messages = kwargs.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise ProviderRuntimeError("messages 不能为空")
+
+        payload: dict[str, Any] = {
+            "model": resolved_model_id,
+            "messages": messages,
+        }
+        for key in (
+            "temperature",
+            "top_p",
+            "max_tokens",
+            "response_format",
+            "stop",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+        ):
+            if key in kwargs and kwargs[key] is not None:
+                payload[key] = kwargs[key]
+
+        headers = {
+            "Authorization": f"Bearer {_resolve_openai_api_key(self.config, self.input_values)}",
+            "Content-Type": "application/json",
+        }
+        return payload, headers, _build_chat_completions_url(self.base_url)
+
+    @staticmethod
+    async def _iterate_stream_response(response: Any) -> AsyncIterator[str]:
+        async for line in response.aiter_lines():
+            if not line:
+                continue
+            data = line.strip()
+            if not data:
+                continue
+            if data.startswith("data:"):
+                data = data[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            chunk = OpenAICompatibleTextProvider._extract_stream_text(payload)
+            if chunk:
+                yield chunk
+
+    @staticmethod
+    def _extract_stream_text(payload: Any) -> str:
+        if isinstance(payload, dict):
+            if isinstance(payload.get("output_text"), str):
+                return payload["output_text"].strip()
+            choices = payload.get("choices")
+            if isinstance(choices, list) and choices:
+                choice = choices[0]
+                if isinstance(choice, dict):
+                    for key in ("delta", "message"):
+                        part = choice.get(key)
+                        if isinstance(part, dict):
+                            content = part.get("content")
+                            if isinstance(content, str):
+                                return content
+                            if isinstance(content, list):
+                                return "".join(str(item) for item in content if item is not None)
+                    text = choice.get("text")
+                    if isinstance(text, str):
+                        return text
+        if isinstance(payload, str):
+            return payload
+        return ""
 
 
 def create_provider(
@@ -168,6 +254,15 @@ def _format_http_error(exc: httpx.HTTPError, url: str) -> str:
     if message:
         return f"{error_type}: {message}（{url}）"
     return f"{error_type}（{url}）"
+
+
+async def _read_stream_error_text(response: Any) -> str:
+    """读取流式错误响应文本。"""
+    aread = getattr(response, "aread", None)
+    if callable(aread):
+        await aread()
+    text = getattr(response, "text", "")
+    return str(text or "").strip()
 
 
 def _build_httpx_timeout(timeout: float) -> httpx.Timeout:

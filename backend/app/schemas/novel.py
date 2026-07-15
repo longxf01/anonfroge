@@ -280,7 +280,7 @@ class NovelChapterBatchResult(BaseModel):
 
 
 CRAWL_HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
-CRAWL_SOURCE_TYPES = {"api"}
+CRAWL_SOURCE_TYPES = {"api", "rule"}
 CRAWL_SOURCE_SCOPES = {"private", "public"}
 
 
@@ -345,7 +345,7 @@ class CrawlSourceFields(BaseModel):
     def validate_source_type(cls, value: str) -> str:
         normalized = value.strip().lower()
         if normalized not in CRAWL_SOURCE_TYPES:
-            raise ValueError("source_type must be api")
+            raise ValueError("source_type must be api or rule")
         return normalized
 
     @field_validator(

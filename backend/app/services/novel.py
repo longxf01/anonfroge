@@ -151,6 +151,10 @@ class NovelCrawlSourceValidationError(NovelServiceError):
     """小说爬取来源配置或爬取请求不合法。"""
 
 
+def _crawl_error_message(exc: Exception) -> str:
+    return str(exc).strip() or f"爬取请求失败: {exc.__class__.__name__}"
+
+
 async def list_chapters(
     session: AsyncSession,
     project_public_id: str,
@@ -573,7 +577,7 @@ async def search_crawl_books(
     try:
         return await novel_crawler.search_books(source, payload.query)
     except Exception as exc:
-        raise NovelCrawlSourceValidationError(str(exc)) from exc
+        raise NovelCrawlSourceValidationError(_crawl_error_message(exc)) from exc
 
 
 async def fetch_crawl_book_detail(
@@ -588,7 +592,7 @@ async def fetch_crawl_book_detail(
     try:
         book = await novel_crawler.fetch_book_detail(source, payload.book)
     except Exception as exc:
-        raise NovelCrawlSourceValidationError(str(exc)) from exc
+        raise NovelCrawlSourceValidationError(_crawl_error_message(exc)) from exc
     await _upsert_crawl_book(session, project.id, source.key, book)
     await session.commit()
     return CrawlBookDetailResult(book=book)
@@ -606,7 +610,7 @@ async def fetch_crawl_book_chapter_count(
     try:
         count = await novel_crawler.fetch_chapter_count(source, payload.book)
     except Exception as exc:
-        raise NovelCrawlSourceValidationError(str(exc)) from exc
+        raise NovelCrawlSourceValidationError(_crawl_error_message(exc)) from exc
     book = payload.book.model_copy(update={"lastchapterid": count, "source_key": payload.source_key})
     await _upsert_crawl_book(session, project.id, source.key, book)
     await session.commit()
@@ -625,7 +629,7 @@ async def fetch_crawl_chapters(
     try:
         return await novel_crawler.fetch_chapters(source, payload.book, payload.start_chapter, payload.end_chapter)
     except Exception as exc:
-        raise NovelCrawlSourceValidationError(str(exc)) from exc
+        raise NovelCrawlSourceValidationError(_crawl_error_message(exc)) from exc
 
 
 async def build_crawl_chapter_stream(

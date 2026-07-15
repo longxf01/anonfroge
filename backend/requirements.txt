@@ -7,9 +7,17 @@ pillow
 python-multipart
 
 httpx
+parsel
+cryptography
+curl_cffi
 crewai
 langgraph
 langchain-openai
+deepagents==0.6.6
+numpy
+onnxruntime
+chromadb
+tokenizers
 
 pytest
 alembic

@@ -26,10 +26,13 @@
         <el-table-column prop="key" label="标识" width="100" show-overflow-tooltip />
         <el-table-column prop="baseUrl" label="站点" min-width="200" show-overflow-tooltip />
         <el-table-column prop="desc" label="说明" min-width="200" show-overflow-tooltip />
-        <el-table-column label="类型" width="80">
+        <el-table-column label="类型" width="130">
           <template #default="{ row }">
             <el-tag size="small" :type="row.builtin ? 'info' : 'success'" effect="plain">
               {{ row.builtin ? '内置' : '自定义' }}
+            </el-tag>
+            <el-tag size="small" type="warning" effect="plain" style="margin-left: 4px">
+              {{ row.sourceType === 'rule' ? '规则' : 'API' }}
             </el-tag>
           </template>
         </el-table-column>
@@ -124,6 +127,18 @@
             <label>名称 <span class="required">*</span></label>
             <el-input v-model="sourceForm.name" size="default" placeholder="如 笔趣阁" />
           </div>
+          <div class="source-form__field">
+            <label>来源类型 <span class="required">*</span></label>
+            <el-select
+              v-model="sourceForm.sourceType"
+              size="default"
+              class="source-form__type-select"
+              popper-class="novel-dark-select"
+            >
+              <el-option label="API 接口（JSON）" value="api" />
+              <el-option label="规则解析（HTML / CSS）" value="rule" />
+            </el-select>
+          </div>
           <div class="source-form__field source-form__field--full">
             <label>站点 URL</label>
             <el-input v-model="sourceForm.baseUrl" size="default" placeholder="https://www.example.com" />
@@ -137,9 +152,11 @@
 
       <section class="source-form__section">
         <header class="source-form__section-head">
-          <h4>API 接口</h4>
+          <h4>{{ isRuleSource ? '规则解析（HTML）' : 'API 接口' }}</h4>
           <span class="source-form__section-hint">
-            填写接口 URL、请求参数与字段选择器
+            {{ isRuleSource
+              ? '填写页面 URL 与 CSS 选择器；选择器支持 ::text 取文本、::attr(name) 取属性'
+              : '填写接口 URL、请求参数与字段选择器' }}
           </span>
         </header>
 
@@ -236,7 +253,7 @@
         <div class="source-form__subgroup">
           <div class="source-form__subgroup-head">
             <span class="source-form__subgroup-tag">小说详情页</span>
-            <span class="source-form__subgroup-hint">获取单本小说信息；返回 JSON 用 JSONPath 抽取字段</span>
+            <span class="source-form__subgroup-hint">{{ isRuleSource ? '获取单本小说信息；返回 HTML 用 CSS 选择器抽取字段' : '获取单本小说信息；返回 JSON 用 JSONPath 抽取字段' }}</span>
           </div>
           <div class="source-form__grid">
             <div class="source-form__field source-form__field--full">
@@ -629,10 +646,16 @@
             aria-valuemin="0"
             aria-valuemax="100"
           >
-            <div class="crawl-progress-meter__track">
-              <div
-                class="crawl-progress-meter__fill"
-                :style="{ width: `${crawlProgress}%` }"
+            <div class="crawl-progress-meter__dots">
+              <span
+                v-for="chapterKey in crawlProgressDotChapters"
+                :key="chapterKey"
+                class="crawl-progress-meter__dot"
+                :class="{
+                  'is-complete': isCrawlChapterFetched(chapterKey),
+                  'is-error': isCrawlChapterFailed(chapterKey),
+                }"
+                :title="getCrawlProgressDotTitle(chapterKey)"
               />
             </div>
             <span class="crawl-progress-meter__value">{{ crawlProgress }}%</span>
@@ -640,17 +663,17 @@
         </div>
         <p class="crawl-progress__text">{{ crawlProgressText || '点击下方“开始爬取”按钮启动抓取' }}</p>
 
-        <div v-if="crawling && crawledChapters.length > 0" class="crawl-progress__list">
+        <div v-if="crawling && recentCrawledChapters.length > 0" class="crawl-progress__list">
           <div
-            v-for="item in crawledChapters.slice(-6).reverse()"
+            v-for="item in recentCrawledChapters"
             :key="item.key"
             class="crawl-progress__item"
           >
             <el-icon><Check /></el-icon>
             <span>{{ item.chaptername }}</span>
           </div>
-          <div v-if="crawledChapters.length > 6" class="crawl-progress__more">
-            … 已抓取 {{ crawledChapters.length }} 章，仅显示最新 6 条
+          <div v-if="crawledChapterCount > recentCrawledChapters.length" class="crawl-progress__more">
+            … 已抓取 {{ crawledChapterCount }} 章，仅显示最新 {{ recentCrawledChapters.length }} 条
           </div>
         </div>
       </section>
@@ -660,7 +683,7 @@
     <div v-show="crawlStep === 3" class="crawl-step">
       <div class="import-preview__head">
         <div class="import-preview__summary">
-          共爬取 <strong>{{ crawledChapters.length }}</strong> 章，已选 <strong>{{ crawlImportSelectedRows.length }}</strong> 章入库
+          共爬取 <strong>{{ crawledChapterCount }}</strong> 章，已选 <strong>{{ crawlImportSelectedRows.length }}</strong> 章入库
         </div>
         <div class="import-preview__tools">
           <el-popover
@@ -773,7 +796,7 @@
 
       <el-table
         ref="crawlImportTableRef"
-        :data="crawledChapters"
+        :data="crawlPreviewChapters"
         class="novel-table import-preview__table"
         height="380"
         row-key="key"
@@ -875,7 +898,7 @@
           title="清空当前小说的本地章节缓存"
         >清空缓存</el-button>
         <el-button
-          v-if="!crawling && crawledChapters.length === 0"
+          v-if="!crawling && crawledChapterCount === 0"
           type="primary"
           @click="startCrawl"
         >开始爬取</el-button>
@@ -888,11 +911,11 @@
           继续爬取 ({{ nextCrawlStartChapter }}-{{ crawlEndChapter }})
         </el-button>
         <el-button
-          v-if="!crawling && crawledChapters.length > 0"
+          v-if="!crawling && crawledChapterCount > 0"
           type="primary"
           :plain="canContinueCrawl"
           @click="goCrawlPreview"
-        >预览并入库 ({{ crawledChapters.length }})</el-button>
+        >预览并入库 ({{ crawledChapterCount }})</el-button>
       </template>
       <!-- 步骤 3 footer -->
       <template v-else>
@@ -1020,6 +1043,8 @@ const emit = defineEmits<{
   (e: 'submit', drafts: CrawlChapterDraft[], book: CrawlSearchResult): void
 }>()
 
+const DEFAULT_CRAWL_END_CHAPTER = 20
+
 const createEmptySource = (): CrawlSource => ({
   key: '',
   name: '',
@@ -1078,7 +1103,7 @@ const createEmptySource = (): CrawlSource => ({
 const normalizeCrawlSource = (source: Partial<CrawlSource>): CrawlSource => ({
   ...createEmptySource(),
   ...source,
-  sourceType: 'api',
+  sourceType: source.sourceType ?? 'api',
 })
 
 const crawlSources = ref<CrawlSource[]>([])
@@ -1100,10 +1125,14 @@ const crawlDetailedBookKeys = ref<Set<string>>(new Set())
 const crawlBookDetailLoading = ref(false)
 const crawlBookCountLoading = ref(false)
 const crawlStartChapter = ref(1)
-const crawlEndChapter = ref(20)
+const crawlEndChapter = ref(DEFAULT_CRAWL_END_CHAPTER)
 const crawling = ref(false)
 const crawlAborted = ref(false)
-const crawledChapters = ref<CrawlChapterDraft[]>([])
+const crawlChapterSlots = ref<Array<CrawlChapterDraft | null>>([])
+const crawlChapterSlotStart = ref(0)
+const crawlChapterSlotEnd = ref(0)
+const crawledChapterCount = ref(0)
+const recentCrawledChapters = ref<CrawlChapterDraft[]>([])
 const crawlProgressText = ref('')
 let crawlAbortController: AbortController | null = null
 const crawlImportTableRef = ref()
@@ -1286,34 +1315,42 @@ const crawlCache = {
 
 const crawlTargetTotal = computed(() => Math.max(crawlEndChapter.value - crawlStartChapter.value + 1, 1))
 
+const crawledChapters = computed(() => (
+  crawlChapterSlots.value.filter((item): item is CrawlChapterDraft => Boolean(item))
+))
+
+const crawlPreviewChapters = computed(() => (crawlStep.value === 3 ? crawledChapters.value : []))
+
+const crawlProgressDotChapters = computed(() => (
+  Array.from({ length: crawlTargetTotal.value }, (_, index) => crawlStartChapter.value + index)
+))
+
 const crawlProgress = computed(() => {
   if (!crawlSelectedBook.value) return 0
-  return Math.min(Math.round((crawledChapters.value.length / crawlTargetTotal.value) * 100), 100)
+  return Math.min(Math.round((crawledChapterCount.value / crawlTargetTotal.value) * 100), 100)
 })
 
 const crawlCompleted = computed(
-  () => crawledChapters.value.length > 0 && crawledChapters.value.length >= crawlTargetTotal.value,
+  () => crawledChapterCount.value > 0 && crawledChapterCount.value >= crawlTargetTotal.value,
 )
 
 const nextCrawlStartChapter = computed(() => {
-  let maxFetchedKey = crawlStartChapter.value - 1
-  for (const item of crawledChapters.value) {
-    if (
-      item.key >= crawlStartChapter.value
-      && item.key <= crawlEndChapter.value
-      && item.key > maxFetchedKey
-    ) {
-      maxFetchedKey = item.key
-    }
+  if (
+    crawlChapterSlotStart.value !== crawlStartChapter.value
+    || crawlChapterSlotEnd.value !== crawlEndChapter.value
+  ) return crawlStartChapter.value
+  const slots = crawlChapterSlots.value
+  for (let index = 0; index < crawlTargetTotal.value; index += 1) {
+    if (!slots[index]) return crawlStartChapter.value + index
   }
-  return Math.min(maxFetchedKey + 1, crawlEndChapter.value + 1)
+  return crawlEndChapter.value + 1
 })
 
 const canContinueCrawl = computed(
   () => Boolean(
     !crawling.value
     && crawlSelectedBook.value
-    && crawledChapters.value.length > 0
+    && crawledChapterCount.value > 0
     && nextCrawlStartChapter.value <= crawlEndChapter.value,
   ),
 )
@@ -1322,9 +1359,73 @@ const crawlProgressStatus = computed<'' | 'success' | 'exception' | 'warning'>((
   if (crawling.value) return ''
   if (crawlAborted.value) return 'exception'
   if (crawlCompleted.value) return 'success'
-  if (crawledChapters.value.length > 0) return 'warning'
+  if (crawledChapterCount.value > 0) return 'warning'
   return ''
 })
+
+const getCrawlSlotIndex = (chapterKey: number) => chapterKey - crawlStartChapter.value
+
+const getCrawlSlotChapter = (chapterKey: number) => {
+  if (
+    crawlChapterSlotStart.value !== crawlStartChapter.value
+    || crawlChapterSlotEnd.value !== crawlEndChapter.value
+  ) return null
+  const index = getCrawlSlotIndex(chapterKey)
+  if (index < 0 || index >= crawlChapterSlots.value.length) return null
+  return crawlChapterSlots.value[index]
+}
+
+const isCrawlChapterFetched = (chapterKey: number) => Boolean(getCrawlSlotChapter(chapterKey))
+
+const isCrawlChapterFailed = (chapterKey: number) => getCrawlSlotChapter(chapterKey)?.eventState === -1
+
+const getCrawlProgressDotTitle = (chapterKey: number) => {
+  const chapter = getCrawlSlotChapter(chapterKey)
+  return chapter ? `第 ${chapterKey} 章：${chapter.chaptername}` : `第 ${chapterKey} 章：未抓取`
+}
+
+const rebuildCrawlChapterSlots = (chapters: CrawlChapterDraft[] = []) => {
+  const slots: Array<CrawlChapterDraft | null> = Array.from({ length: crawlTargetTotal.value }, () => null)
+  let completed = 0
+  for (const chapter of chapters) {
+    const index = chapter.key - crawlStartChapter.value
+    if (index < 0 || index >= slots.length) continue
+    if (!slots[index]) completed += 1
+    slots[index] = chapter
+  }
+  crawlChapterSlots.value = slots
+  crawlChapterSlotStart.value = crawlStartChapter.value
+  crawlChapterSlotEnd.value = crawlEndChapter.value
+  crawledChapterCount.value = completed
+  recentCrawledChapters.value = chapters
+    .filter((chapter) => chapter.key >= crawlStartChapter.value && chapter.key <= crawlEndChapter.value)
+    .slice(-6)
+    .reverse()
+}
+
+const resetCrawlChapterSlots = () => {
+  crawlChapterSlots.value = []
+  crawlChapterSlotStart.value = 0
+  crawlChapterSlotEnd.value = 0
+  crawledChapterCount.value = 0
+  recentCrawledChapters.value = []
+}
+
+const ensureCrawlChapterSlots = () => {
+  if (
+    crawlChapterSlots.value.length === crawlTargetTotal.value
+    && crawlChapterSlotStart.value === crawlStartChapter.value
+    && crawlChapterSlotEnd.value === crawlEndChapter.value
+  ) return
+  rebuildCrawlChapterSlots(crawledChapters.value)
+}
+
+const rememberRecentCrawledChapter = (draft: CrawlChapterDraft) => {
+  recentCrawledChapters.value = [
+    draft,
+    ...recentCrawledChapters.value.filter((item) => item.key !== draft.key),
+  ].slice(0, 6)
+}
 
 const currentCrawlSource = computed(
   () => crawlSources.value.find((s) => s.key === crawlSourceKey.value) || crawlSources.value[0],
@@ -1382,10 +1483,10 @@ const resetCrawlState = () => {
   crawlBookCountRequestId += 1
   crawlBookCountLoading.value = false
   crawlStartChapter.value = 1
-  crawlEndChapter.value = 20
+  crawlEndChapter.value = DEFAULT_CRAWL_END_CHAPTER
   crawling.value = false
   crawlAborted.value = false
-  crawledChapters.value = []
+  resetCrawlChapterSlots()
   crawlProgressText.value = ''
   crawlImportSelectedRows.value = []
   crawlSubmitting.value = false
@@ -1409,6 +1510,8 @@ const searchCrawlBooks = async (options: { skipCache?: boolean } = {}) => {
   crawlSearching.value = true
   crawlResults.value = []
   crawlSelectedBook.value = null
+  resetCrawlChapterSlots()
+  crawlImportSelectedRows.value = []
   crawlDetailedBookKeys.value = new Set()
   crawlBookDetailRequestId += 1
   crawlBookDetailLoading.value = false
@@ -1461,7 +1564,7 @@ const clearCrawlChaptersCache = () => {
   }
   const sourceKey = crawlSelectedBook.value.sourceKey || crawlSourceKey.value
   crawlCache.clearChapters(props.projectPublicId, sourceKey, crawlSelectedBook.value.dirid)
-  crawledChapters.value = []
+  resetCrawlChapterSlots()
   crawlImportSelectedRows.value = []
   crawlProgressText.value = '已清空本地章节缓存，可重新开始爬取'
   ElMessage.success(`已清空《${crawlSelectedBook.value.title}》的本地章节缓存`)
@@ -1516,10 +1619,10 @@ const mergeCrawlSearchResults = (
 ): CrawlSearchResult[] => {
   const merged: CrawlSearchResult[] = []
   for (const book of books) {
-    const normalized: CrawlSearchResult = {
+    const normalized = normalizeCrawlBook({
       ...book,
       sourceKey: book.sourceKey || fallbackSourceKey,
-    }
+    })
     const existing = merged.find((item) => isSameCrawlBook(item, normalized))
     if (existing) {
       Object.assign(existing, mergeCrawlBook(existing, normalized, fallbackSourceKey))
@@ -1536,7 +1639,7 @@ const mergeCrawlBook = (
   fallbackSourceKey: string,
 ): CrawlSearchResult => {
   const pickText = (next: string, current: string) => next.trim() || current
-  return {
+  return normalizeCrawlBook({
     dirid: pickText(incoming.dirid, base.dirid),
     id: incoming.id > 0 ? incoming.id : base.id,
     full: pickText(incoming.full, base.full),
@@ -1544,11 +1647,36 @@ const mergeCrawlBook = (
     author: pickText(incoming.author, base.author),
     cover: pickText(incoming.cover, base.cover),
     lastchapter: pickText(incoming.lastchapter, base.lastchapter),
-    lastchapterid: base.lastchapterid > 0 ? base.lastchapterid : incoming.lastchapterid,
+    lastchapterid: incoming.lastchapterid > 0 ? incoming.lastchapterid : base.lastchapterid,
     lastupdate: pickText(incoming.lastupdate, base.lastupdate),
     sortname: pickText(incoming.sortname, base.sortname),
     intro: pickText(incoming.intro, base.intro),
     sourceKey: incoming.sourceKey || base.sourceKey || fallbackSourceKey,
+  })
+}
+
+const normalizeCrawlBook = (book: CrawlSearchResult): CrawlSearchResult => {
+  const diridAsNumber = Number.parseInt(book.dirid, 10)
+  const chapterCountLooksLikeBookId = (
+    book.lastchapterid > 0
+    && (
+      book.lastchapterid === book.id
+      || (!Number.isNaN(diridAsNumber) && book.lastchapterid === diridAsNumber)
+    )
+  )
+  return {
+    ...book,
+    lastchapterid: chapterCountLooksLikeBookId ? 0 : book.lastchapterid,
+  }
+}
+
+const syncCrawlEndChapterFromBook = (book: CrawlSearchResult) => {
+  if (
+    !crawling.value
+    && book.lastchapterid > 0
+    && crawlEndChapter.value === DEFAULT_CRAWL_END_CHAPTER
+  ) {
+    crawlEndChapter.value = book.lastchapterid
   }
 }
 
@@ -1556,13 +1684,18 @@ const updateCrawlBookInResults = (book: CrawlSearchResult, options: { select?: b
   crawlResults.value = crawlResults.value.map((item) => (
     isSameCrawlBook(item, book) ? book : item
   ))
-  if (options.select ?? isSelectedCrawlBook(book)) {
+  const shouldSelect = options.select ?? isSelectedCrawlBook(book)
+  if (shouldSelect) {
     crawlSelectedBook.value = book
+    syncCrawlEndChapterFromBook(book)
   }
   writeCurrentSearchCache()
 }
 
-const fetchSelectedBookDetail = async (book: CrawlSearchResult) => {
+const fetchSelectedBookDetail = async (
+  book: CrawlSearchResult,
+  options: { fetchChapterCountIfMissing?: boolean } = {},
+) => {
   if ((!book.dirid && !(book.id > 0)) || !crawlSourceKey.value) return
   const requestId = ++crawlBookDetailRequestId
   crawlBookDetailLoading.value = true
@@ -1576,8 +1709,14 @@ const fetchSelectedBookDetail = async (book: CrawlSearchResult) => {
     const shouldUpdateSelection = isSelectedCrawlBook(book)
     markCrawlBookDetailsLoaded(nextBook)
     updateCrawlBookInResults(nextBook, { select: shouldUpdateSelection })
+    if (options.fetchChapterCountIfMissing && shouldUpdateSelection && nextBook.lastchapterid <= 0) {
+      void fetchSelectedBookChapterCount(nextBook)
+    }
   } catch (error) {
     if (requestId !== crawlBookDetailRequestId) return
+    if (options.fetchChapterCountIfMissing && isSelectedCrawlBook(book) && latestCrawlBook(book).lastchapterid <= 0) {
+      void fetchSelectedBookChapterCount(book)
+    }
     ElMessage.warning(`详情获取失败：${getErrorMessage(error)}`)
   } finally {
     if (requestId === crawlBookDetailRequestId) {
@@ -1603,9 +1742,6 @@ const fetchSelectedBookChapterCount = async (book: CrawlSearchResult) => {
     }
     const shouldUpdateSelection = isSelectedCrawlBook(book)
     updateCrawlBookInResults(nextBook, { select: shouldUpdateSelection })
-    if (shouldUpdateSelection && data.lastchapterid > 0 && crawlEndChapter.value === 20) {
-      crawlEndChapter.value = data.lastchapterid
-    }
   } catch (error) {
     if (requestId !== crawlBookCountRequestId) return
     ElMessage.warning(`章节数获取失败：${getErrorMessage(error)}`)
@@ -1621,29 +1757,31 @@ const selectCrawlBook = (book: CrawlSearchResult) => {
   const nextBook = latestCrawlBook(book)
   crawlSelectedBook.value = nextBook
   crawlStartChapter.value = 1
-  crawlEndChapter.value = 20
+  crawlEndChapter.value = DEFAULT_CRAWL_END_CHAPTER
   if (isSwitchingBook) {
-    crawledChapters.value = []
+    resetCrawlChapterSlots()
     crawlImportSelectedRows.value = []
     crawlProgressText.value = ''
     crawlAborted.value = false
     crawlPreviewVisible.value = false
     crawlPreviewChapter.value = null
   }
-  if (hasCrawlBookDetails(nextBook)) {
+  const detailsLoaded = hasCrawlBookDetails(nextBook)
+  if (detailsLoaded) {
     crawlBookDetailRequestId += 1
     crawlBookDetailLoading.value = false
   } else {
-    void fetchSelectedBookDetail(nextBook)
+    void fetchSelectedBookDetail(nextBook, { fetchChapterCountIfMissing: true })
   }
   if (nextBook.lastchapterid > 0) {
     crawlBookCountRequestId += 1
     crawlBookCountLoading.value = false
-    if (crawlEndChapter.value === 20) {
-      crawlEndChapter.value = nextBook.lastchapterid
-    }
-  } else {
+    syncCrawlEndChapterFromBook(nextBook)
+  } else if (detailsLoaded) {
     void fetchSelectedBookChapterCount(nextBook)
+  } else {
+    crawlBookCountRequestId += 1
+    crawlBookCountLoading.value = false
   }
 }
 
@@ -1698,10 +1836,11 @@ const requestCrawlRange = async (
   if (!crawlSelectedBook.value) return
   crawling.value = true
   crawlAborted.value = false
-  const previousCount = options.append ? crawledChapters.value.length : 0
   if (!options.append) {
-    crawledChapters.value = []
+    rebuildCrawlChapterSlots()
     crawlImportSelectedRows.value = []
+  } else {
+    ensureCrawlChapterSlots()
   }
   const controller = new AbortController()
   crawlAbortController = controller
@@ -1712,6 +1851,8 @@ const requestCrawlRange = async (
   }
   const overallTotal = crawlTargetTotal.value
   const endChapter = crawlEndChapter.value
+  const fetchedChapters: CrawlChapterDraft[] = []
+  const previousCount = crawledChapterCount.value
 
   const cachedChapters = crawlCache.readChapters(
     props.projectPublicId,
@@ -1721,10 +1862,10 @@ const requestCrawlRange = async (
     endChapter,
   )
   if (cachedChapters && cachedChapters.length > 0) {
-    crawledChapters.value = options.append
-      ? [...crawledChapters.value, ...cachedChapters]
-      : [...cachedChapters]
-    crawlProgressText.value = `已使用本地缓存，共 ${crawledChapters.value.length}/${overallTotal} 章`
+    for (const chapter of cachedChapters) {
+      upsertCrawledChapter(normalizeCrawlDraft(chapter, chapter.key - crawlStartChapter.value, book))
+    }
+    crawlProgressText.value = `已使用本地缓存，共 ${crawledChapterCount.value}/${overallTotal} 章`
     ElMessage.success(`本段命中本地缓存（共 ${cachedChapters.length} 章），点「清空缓存」可重新爬取`)
     crawling.value = false
     if (crawlAbortController === controller) {
@@ -1761,32 +1902,32 @@ const requestCrawlRange = async (
       previousCount,
       requestStart: startChapter,
       requestEnd: endChapter,
+      fetchedChapters,
     })
     if (crawlAborted.value) {
-      crawlProgressText.value = `已取消，共爬取 ${crawledChapters.value.length}/${overallTotal} 章`
+      crawlProgressText.value = `已取消，共爬取 ${crawledChapterCount.value}/${overallTotal} 章`
       return
     }
     crawlProgressText.value = crawlCompleted.value
-      ? `爬取完成，共 ${crawledChapters.value.length}/${overallTotal} 章`
-      : `本次爬取结束，已获取 ${crawledChapters.value.length}/${overallTotal} 章，可继续爬取`
-    const justFetched = crawledChapters.value.slice(previousCount)
-    if (justFetched.length > 0) {
+      ? `爬取完成，共 ${crawledChapterCount.value}/${overallTotal} 章`
+      : `本次爬取结束，已获取 ${crawledChapterCount.value}/${overallTotal} 章，可继续爬取`
+    if (fetchedChapters.length > 0) {
       crawlCache.writeChapters(
         props.projectPublicId,
         book.sourceKey,
         book.dirid,
         startChapter,
         endChapter,
-        justFetched,
+        fetchedChapters,
       )
     }
   } catch (error) {
     if (isAbortError(error)) {
-      crawlProgressText.value = `已取消，共爬取 ${crawledChapters.value.length}/${overallTotal} 章`
+      crawlProgressText.value = `已取消，共爬取 ${crawledChapterCount.value}/${overallTotal} 章`
       return
     }
     crawlAborted.value = true
-    crawlProgressText.value = `爬取失败，已获取 ${crawledChapters.value.length}/${overallTotal} 章`
+    crawlProgressText.value = `爬取失败，已获取 ${crawledChapterCount.value}/${overallTotal} 章`
     ElMessage.error(`爬取失败：${getErrorMessage(error)}`)
   } finally {
     crawling.value = false
@@ -1802,7 +1943,7 @@ const cancelCrawl = () => {
   crawlAbortController?.abort()
   crawlAbortController = null
   crawling.value = false
-  crawlProgressText.value = `已取消，共爬取 ${crawledChapters.value.length}/${crawlTargetTotal.value} 章`
+  crawlProgressText.value = `已取消，共爬取 ${crawledChapterCount.value}/${crawlTargetTotal.value} 章`
   ElMessage.info('已取消爬取')
 }
 
@@ -1811,6 +1952,7 @@ interface CrawlProgressContext {
   previousCount: number
   requestStart: number
   requestEnd: number
+  fetchedChapters: CrawlChapterDraft[]
 }
 
 const readCrawlStream = async (
@@ -1854,13 +1996,15 @@ const handleCrawlStreamLine = (
     return
   }
   if (event.type === 'chapter') {
-    const draft = normalizeCrawlDraft(event.chapter, crawledChapters.value.length, book)
-    upsertCrawledChapter(draft)
-    crawlProgressText.value = `正在爬取 ${crawledChapters.value.length}/${progress.overallTotal}：${draft.chaptername}`
+    const draft = normalizeCrawlDraft(event.chapter, crawledChapterCount.value, book)
+    if (upsertCrawledChapter(draft)) {
+      progress.fetchedChapters.push(draft)
+    }
+    crawlProgressText.value = `正在爬取 ${crawledChapterCount.value}/${progress.overallTotal}：${draft.chaptername}`
     return
   }
   if (event.type === 'done') {
-    crawlProgressText.value = `本段完成，已获取 ${crawledChapters.value.length}/${progress.overallTotal} 章`
+    crawlProgressText.value = `本段完成，已获取 ${crawledChapterCount.value}/${progress.overallTotal} 章`
     return
   }
   if (event.type === 'error') {
@@ -1874,7 +2018,7 @@ const normalizeCrawlDraft = (
   book: CrawlSearchResult,
 ): CrawlChapterDraft => ({
   ...draft,
-  key: draft.key || index + 1,
+  key: draft.key || crawlStartChapter.value + index,
   novelDirid: draft.novelDirid || book.dirid,
   event: draft.event || '',
   eventState: draft.eventState ?? 0,
@@ -1882,14 +2026,16 @@ const normalizeCrawlDraft = (
 })
 
 const upsertCrawledChapter = (draft: CrawlChapterDraft) => {
-  const next = [...crawledChapters.value]
-  const existingIndex = next.findIndex((item) => item.key === draft.key)
-  if (existingIndex >= 0) {
-    next[existingIndex] = draft
-  } else {
-    next.push(draft)
+  ensureCrawlChapterSlots()
+  const index = getCrawlSlotIndex(draft.key)
+  if (index < 0 || index >= crawlChapterSlots.value.length) return false
+  const hadChapter = Boolean(crawlChapterSlots.value[index])
+  crawlChapterSlots.value[index] = draft
+  if (!hadChapter) {
+    crawledChapterCount.value += 1
   }
-  crawledChapters.value = next.sort((a, b) => a.key - b.key || a.chapterid - b.chapterid)
+  rememberRecentCrawledChapter(draft)
+  return true
 }
 
 const readFetchError = async (response: Response) => {
@@ -1910,7 +2056,7 @@ const goCrawlPreview = () => {
     ElMessage.warning('请先等待爬取完成或取消')
     return
   }
-  if (crawledChapters.value.length === 0) {
+  if (crawledChapterCount.value === 0) {
     ElMessage.warning('暂无可预览的章节，请先开始爬取')
     return
   }
@@ -2109,7 +2255,12 @@ const cleanCrawlChapterEvent = (row: CrawlChapterDraft) => {
 }
 
 const removeCrawlChapter = (row: CrawlChapterDraft) => {
-  crawledChapters.value = crawledChapters.value.filter((item) => item.key !== row.key)
+  const index = getCrawlSlotIndex(row.key)
+  if (index >= 0 && index < crawlChapterSlots.value.length && crawlChapterSlots.value[index]) {
+    crawlChapterSlots.value[index] = null
+    crawledChapterCount.value = Math.max(crawledChapterCount.value - 1, 0)
+  }
+  recentCrawledChapters.value = recentCrawledChapters.value.filter((item) => item.key !== row.key)
   crawlImportSelectedRows.value = crawlImportSelectedRows.value.filter((item) => item.key !== row.key)
   ElMessage.info(`已移除《${row.chaptername}》`)
 }
@@ -2175,6 +2326,8 @@ const sourceManageVisible = ref(false)
 const sourceMode = ref<SourceMode>('list')
 const sourceForm = ref<CrawlSource>(createEmptySource())
 const sourceEditingKey = ref('')
+
+const isRuleSource = computed(() => sourceForm.value.sourceType === 'rule')
 
 const openSourceManager = () => {
   sourceMode.value = 'list'
@@ -2359,7 +2512,7 @@ const buildSourceUpdatePayload = (source: CrawlSource): Omit<CrawlSourcePayload,
   name: source.name.trim(),
   baseUrl: source.baseUrl.trim(),
   desc: source.desc.trim(),
-  sourceType: 'api',
+  sourceType: source.sourceType,
   searchUrlTemplate: source.searchUrlTemplate.trim(),
   apiBookUrl: source.apiBookUrl.trim(),
   apiBookTitlePath: source.apiBookTitlePath.trim(),
@@ -2482,6 +2635,14 @@ const formatErrorDetail = (detail: unknown): string => {
 const isRecord = (value: unknown): value is Record<string, unknown> => (
   typeof value === 'object' && value !== null
 )
+
+watch([crawlStartChapter, crawlEndChapter], () => {
+  if (crawling.value || crawlChapterSlots.value.length === 0) return
+  rebuildCrawlChapterSlots(crawledChapters.value)
+  crawlImportSelectedRows.value = crawlImportSelectedRows.value.filter(
+    (item) => item.key >= crawlStartChapter.value && item.key <= crawlEndChapter.value,
+  )
+})
 
 watch(() => props.modelValue, (visible) => {
   if (visible) {
@@ -2916,32 +3077,54 @@ watch(() => props.projectPublicId, () => {
 
 .novel-crawl-dialog .crawl-progress-meter {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 44px;
-  align-items: center;
+  grid-template-columns: minmax(0, 1fr) 52px;
+  align-items: start;
   gap: 10px;
   width: 100%;
   min-width: 0;
 }
 
-.novel-crawl-dialog .crawl-progress-meter__track {
-  position: relative;
-  height: 14px;
+.novel-crawl-dialog .crawl-progress-meter__dots {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, 5px);
+  grid-auto-rows: 5px;
+  justify-content: start;
+  align-content: start;
+  gap: 2px;
+  max-height: 112px;
   min-width: 0;
-  overflow: hidden;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.06);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+  overflow-y: auto;
+  padding: 8px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
 }
 
-.novel-crawl-dialog .crawl-progress-meter__fill {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  width: 0;
-  border-radius: inherit;
-  background-color: #2563eb;
-  transition: width 220ms ease;
+.novel-crawl-dialog .crawl-progress-meter__dots::-webkit-scrollbar {
+  width: 6px;
+}
+
+.novel-crawl-dialog .crawl-progress-meter__dots::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+}
+
+.novel-crawl-dialog .crawl-progress-meter__dot {
+  display: block;
+  width: 5px;
+  height: 5px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.novel-crawl-dialog .crawl-progress-meter__dot.is-complete {
+  background: #2563eb;
+}
+
+.novel-crawl-dialog .crawl-progress-meter__dot.is-error {
+  background: #ef4444;
 }
 
 .novel-crawl-dialog .crawl-progress-meter__value {
@@ -2953,7 +3136,7 @@ watch(() => props.projectPublicId, () => {
   font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
 }
 
-.novel-crawl-dialog .crawl-progress-meter.is-success .crawl-progress-meter__fill {
+.novel-crawl-dialog .crawl-progress-meter.is-success .crawl-progress-meter__dot.is-complete {
   background-color: #22c55e;
 }
 
@@ -2961,15 +3144,11 @@ watch(() => props.projectPublicId, () => {
   color: #86efac;
 }
 
-.novel-crawl-dialog .crawl-progress-meter.is-exception .crawl-progress-meter__fill {
-  background-color: #ef4444;
-}
-
 .novel-crawl-dialog .crawl-progress-meter.is-exception .crawl-progress-meter__value {
   color: #fca5a5;
 }
 
-.novel-crawl-dialog .crawl-progress-meter.is-warning .crawl-progress-meter__fill {
+.novel-crawl-dialog .crawl-progress-meter.is-warning .crawl-progress-meter__dot.is-complete {
   background-color: #f59e0b;
 }
 
