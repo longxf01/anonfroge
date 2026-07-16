@@ -15,7 +15,8 @@ from app.schemas.screenwriting import (
     ScreenwritingRagWarmupResponse,
 )
 from app.services import project as project_service
-from app.services import screenwriting as screenwriting_service
+from app.services.screenwriting import chat as screenwriting_service
+from app.services.screenwriting.stream import format_ndjson_event
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
@@ -95,21 +96,19 @@ class ScreenwritingView(BaseView):
         session: SessionDep,
     ) -> StreamingResponse:
         current_user_public_id = self._current_user_public_id(request)
-        try:
-            events = await screenwriting_service.build_screenwriting_chat_stream(
-                session,
-                project_public_id,
-                current_user_public_id,
-                payload,
-            )
-        except (project_service.ProjectServiceError, screenwriting_service.ScreenwritingServiceError) as exc:
-            self._raise_as_http(exc)
+        # 异步生成器在迭代时才执行；准备阶段异常由流内 error 事件承载。
+        events = screenwriting_service.build_screenwriting_chat_stream(
+            session,
+            project_public_id,
+            current_user_public_id,
+            payload,
+        )
 
         async def render_events():
             async for event in events:
                 if await request.is_disconnected():
                     break
-                yield screenwriting_service.format_ndjson_event(event)
+                yield format_ndjson_event(event)
 
         return StreamingResponse(
             render_events(),

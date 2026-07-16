@@ -58,6 +58,7 @@ from app.services.prompt_registry import PromptRegistry
 from app.services import novel_crawler
 from app.services import project as project_service
 from app.services import tasks as task_service
+from app.services.screenwriting.event_extraction import events_to_json, parse_chapter_events
 from app.utils.novel_import_rules import get_builtin_import_split_rules
 from app.utils.novel_parser import ParsedNovelChapter, parse_novel_chapters
 from app.utils.time_tools import utc_now
@@ -1336,11 +1337,12 @@ async def _apply_chapter_event_extraction(chapter: NovelChapter, text_model: str
         )
         prompt_trace["raw_output"] = raw_event
         payload = _parse_chapter_event_payload(raw_event)
+        structured_events = parse_chapter_events(payload)
     except Exception as exc:
         _mark_event_extraction_failed(chapter, str(exc))
         return prompt_trace
 
-    chapter.event = json.dumps(payload, ensure_ascii=False, indent=2)
+    chapter.event = events_to_json(structured_events)
     chapter.event_state = 1
     chapter.error_reason = None
     return prompt_trace

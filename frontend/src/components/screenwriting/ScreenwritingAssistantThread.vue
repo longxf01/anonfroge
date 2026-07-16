@@ -43,46 +43,70 @@
             code-theme="atom"
           />
           <div
-            v-if="message.rag"
-            class="assistant-rag"
-            :class="{ 'has-failure': hasRagFailure(message) }"
+            v-if="hasAssistantDiagnostics(message)"
+            class="assistant-diagnostics"
+            :class="{
+              'is-collapsed': isAssistantDiagnosticsCollapsed(message),
+              'has-failure': hasRagFailure(message),
+            }"
           >
-            <div class="assistant-rag__summary" aria-label="本轮资料检索状态">
-              <span>{{ ragRetrievalModeLabel(message) }}</span>
-              <span>命中 {{ message.rag.hitCount }} / 文档 {{ message.rag.documentCount }}</span>
-              <span v-if="message.rag.runtime.indexCacheHit">索引缓存命中</span>
-              <span v-if="hasRagFailure(message)">资料检索降级</span>
+            <button
+              type="button"
+              class="assistant-diagnostics__toggle"
+              :aria-expanded="!isAssistantDiagnosticsCollapsed(message)"
+              @click="toggleAssistantDiagnostics(message)"
+            >
+              <el-icon class="assistant-diagnostics__toggle-icon"><CaretBottom /></el-icon>
+              <span>
+                {{ isAssistantDiagnosticsCollapsed(message) ? '展开检索详情' : '收起检索详情' }}
+              </span>
+            </button>
+            <div
+              v-if="message.rag"
+              class="assistant-rag"
+            >
+              <div class="assistant-rag__summary" aria-label="本轮资料检索状态">
+                <span>{{ ragRetrievalModeLabel(message) }}</span>
+                <span>命中 {{ message.rag.hitCount }} / 文档 {{ message.rag.documentCount }}</span>
+                <span v-if="message.rag.runtime.indexCacheHit">索引缓存命中</span>
+                <span v-if="hasRagFailure(message)">资料检索降级</span>
+              </div>
             </div>
-            <ul
-              v-if="visibleRagHits(message).length"
-              class="assistant-rag__hits"
-              aria-label="本轮参考资料"
+            <div
+              v-show="!isAssistantDiagnosticsCollapsed(message)"
+              class="assistant-diagnostics__details"
             >
-              <li
-                v-for="hit in visibleRagHits(message)"
-                :key="hit.sourceId"
+              <ul
+                v-if="message.rag && visibleRagHits(message).length"
+                class="assistant-rag__hits"
+                aria-label="本轮参考资料"
               >
-                <span class="assistant-rag__hit-title" :title="hit.title">{{ hit.title }}</span>
-                <span class="assistant-rag__hit-type">{{ ragSourceTypeLabel(hit.sourceType) }}</span>
-                <span class="assistant-rag__hit-score">{{ ragScoreLabel(hit.score) }}</span>
-              </li>
-            </ul>
-          </div>
-          <div
-            v-if="message.serverTimings"
-            class="assistant-server-timings"
-            aria-label="服务端阶段耗时"
-          >
-            <span>服务端 {{ formatDurationMs(message.serverTimings.totalMs) }}</span>
-            <span v-if="shouldShowClientToServerTiming(message)">
-              请求 {{ formatDurationMs(message.serverTimings.clientToServerMs) }}
-            </span>
-            <span
-              v-for="stage in visibleServerTimingStages(message)"
-              :key="stage.name"
-            >
-              {{ serverTimingStageLabel(stage.name) }} {{ formatDurationMs(stage.durationMs) }}
-            </span>
+                <li
+                  v-for="hit in visibleRagHits(message)"
+                  :key="hit.sourceId"
+                >
+                  <span class="assistant-rag__hit-title" :title="hit.title">{{ hit.title }}</span>
+                  <span class="assistant-rag__hit-type">{{ ragSourceTypeLabel(hit.sourceType) }}</span>
+                  <span class="assistant-rag__hit-score">{{ ragScoreLabel(hit.score) }}</span>
+                </li>
+              </ul>
+              <div
+                v-if="message.serverTimings"
+                class="assistant-server-timings"
+                aria-label="服务端阶段耗时"
+              >
+                <span>服务端 {{ formatDurationMs(message.serverTimings.totalMs) }}</span>
+                <span v-if="shouldShowClientToServerTiming(message)">
+                  请求 {{ formatDurationMs(message.serverTimings.clientToServerMs) }}
+                </span>
+                <span
+                  v-for="stage in visibleServerTimingStages(message)"
+                  :key="stage.name"
+                >
+                  {{ serverTimingStageLabel(stage.name) }} {{ formatDurationMs(stage.durationMs) }}
+                </span>
+              </div>
+            </div>
           </div>
           <time class="assistant-bubble__time">{{ message.time }}</time>
           <div
@@ -122,6 +146,7 @@ const props = defineProps<{
 const assistantThreadRef = ref<HTMLElement | null>(null)
 const showAssistantScrollBottom = ref(false)
 const assistantAutoScrollEnabled = ref(true)
+const collapsedDiagnosticsMessageIds = ref<Set<number>>(new Set())
 const SERVER_TIMING_STAGE_ORDER = ['project', 'rag', 'agentSetup', 'agentRun', 'modelStream']
 const SERVER_TIMING_STAGE_LABELS: Record<string, string> = {
   project: '项目',
@@ -175,6 +200,24 @@ const visibleRagHits = (message: ChatMessage): ScreenwritingRagHit[] => (
 const hasRagFailure = (message: ChatMessage) => (
   Boolean(message.rag?.runtime.failureReason)
 )
+
+const hasAssistantDiagnostics = (message: ChatMessage) => (
+  Boolean(message.rag || message.serverTimings)
+)
+
+const isAssistantDiagnosticsCollapsed = (message: ChatMessage) => (
+  collapsedDiagnosticsMessageIds.value.has(message.id)
+)
+
+const toggleAssistantDiagnostics = (message: ChatMessage) => {
+  const nextIds = new Set(collapsedDiagnosticsMessageIds.value)
+  if (nextIds.has(message.id)) {
+    nextIds.delete(message.id)
+  } else {
+    nextIds.add(message.id)
+  }
+  collapsedDiagnosticsMessageIds.value = nextIds
+}
 
 const isServerTimingStage = (
   stage: ScreenwritingServerTimingStage | undefined,
@@ -414,12 +457,53 @@ defineExpose({
   font-variant-numeric: tabular-nums;
 }
 
+.assistant-diagnostics {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  padding-top: 7px;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.assistant-diagnostics__toggle {
+  justify-self: start;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #8da2ba;
+  font-size: 11px;
+  line-height: 1.3;
+  cursor: pointer;
+}
+
+.assistant-diagnostics__toggle:hover {
+  color: #cbd5e1;
+}
+
+.assistant-diagnostics__toggle-icon {
+  flex-shrink: 0;
+  font-size: 12px;
+  transition: transform 0.16s ease;
+}
+
+.assistant-diagnostics.is-collapsed .assistant-diagnostics__toggle-icon {
+  transform: rotate(-90deg);
+}
+
+.assistant-diagnostics__details {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
 .assistant-rag {
   min-width: 0;
   display: grid;
   gap: 5px;
-  padding-top: 7px;
-  border-top: 1px solid rgba(148, 163, 184, 0.12);
 }
 
 .assistant-rag__summary {
@@ -443,7 +527,7 @@ defineExpose({
   background: rgba(148, 163, 184, 0.06);
 }
 
-.assistant-rag.has-failure .assistant-rag__summary span:last-child {
+.assistant-diagnostics.has-failure .assistant-rag__summary span:last-child {
   color: #fcd34d;
   border-color: rgba(245, 158, 11, 0.22);
   background: rgba(245, 158, 11, 0.08);

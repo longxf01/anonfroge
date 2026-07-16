@@ -78,10 +78,17 @@ class ProviderModelGateway:
             )
             stream = getattr(provider, "generate_stream", None)
             if callable(stream):
-                async for chunk in stream(model_id=model_id, messages=messages, **kwargs):
-                    text = str(chunk or "")
-                    if text:
-                        yield text
+                if self.timeout > 0:
+                    async with asyncio.timeout(self.timeout):
+                        async for chunk in stream(model_id=model_id, messages=messages, **kwargs):
+                            text = str(chunk or "")
+                            if text:
+                                yield text
+                else:
+                    async for chunk in stream(model_id=model_id, messages=messages, **kwargs):
+                        text = str(chunk or "")
+                        if text:
+                            yield text
                 return
 
             raw_output = await self.generate_response(

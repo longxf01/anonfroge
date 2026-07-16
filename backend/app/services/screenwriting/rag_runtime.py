@@ -18,10 +18,18 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from app.core import database
 from app.core.config import Settings, project_path, settings
 from app.core.rag import RagDocument
+from app.core.rag.constants import DEFAULT_SCREENWRITING_RAG_RETRIEVE_LIMIT
 from app.services import project as project_service
 from app.services.screenwriting.rag_documents import (
     iter_screenwriting_knowledge_document_batches,
     load_screenwriting_knowledge_documents,
+)
+from app.services.screenwriting.query_intent import (
+    ScreenwritingQueryIntent,
+    parse_screenwriting_query_intent,
+)
+from app.services.screenwriting.query_intent_llm import (
+    parse_screenwriting_query_intent_with_llm,
 )
 from app.services.screenwriting.rag_index import (
     ScreenwritingRagContext,
@@ -49,44 +57,62 @@ class ScreenwritingRagWarmupSchedule:
 class ScreenwritingRagRuntime:
     """管理 RAG 索引复用、文档指纹失效和运行时序列化。"""
 
-    def __init__(self, *, session_maker: Callable[[], Any] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        session_maker: Callable[[], Any] | None = None,
+        intent_gateway: Any | None = None,
+        config: Settings | None = None,
+    ) -> None:
         self._lock = RLock()
         self._indexes: dict[str, Any] = {}
         self._index_factory_id: int | None = None
         self._indexed_document_fingerprints: dict[str, str] = {}
         self._warmup_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_maker = session_maker or database.async_session_maker
+        self._intent_gateway = intent_gateway
+        self._config = config or settings
 
     async def prepare_context(
         self,
         session: AsyncSession,
         project: Any,
         project_public_id: str,
+        current_user_public_id: str,
         query: str,
     ) -> ScreenwritingRagPreparation:
-        """准备本轮 RAG 上下文；失败时不阻断聊天主链路。"""
+        """准备本轮 RAG 上下文；失败时不阻断聊天主链路。
+
+        聊天请求路径绝不同步构建向量索引：文档指纹与缓存不一致时仅调度
+        后台增量刷新，本轮直接基于现有持久化索引和内存检索作答。
+        """
         document_count = 0
         rag_isolation_key = build_project_rag_isolation_key(project_public_id)
         try:
-            rag_documents = await load_screenwriting_knowledge_documents(session, project)
+            rag_documents, query_intent = await asyncio.gather(
+                load_screenwriting_knowledge_documents(session, project),
+                self._resolve_query_intent(project, query),
+            )
             document_count = len(rag_documents)
             rag_index = await asyncio.to_thread(
                 self._get_index,
                 project_public_id,
                 rag_isolation_key,
             )
-            index_cache_hit = await asyncio.to_thread(
-                self._index_documents_if_needed,
-                rag_index,
-                rag_isolation_key,
-                rag_documents,
-            )
+            fingerprint = await asyncio.to_thread(_rag_documents_fingerprint, rag_documents)
+            index_cache_hit = self._fingerprint_matches(rag_isolation_key, fingerprint)
+            index_refresh_scheduled = False
+            if not index_cache_hit:
+                self._invalidate_stale_fingerprint(rag_isolation_key, fingerprint)
+                schedule = self.schedule_index_warmup(project_public_id, current_user_public_id)
+                index_refresh_scheduled = schedule.status in {"started", "running"}
             rag_context = await asyncio.to_thread(
                 rag_index.retrieve_context,
                 rag_isolation_key,
                 query,
                 rag_documents,
-                limit=5,
+                limit=self._retrieve_limit(),
+                query_intent=query_intent,
             )
             return ScreenwritingRagPreparation(
                 context=_rag_context_with_runtime(
@@ -94,6 +120,7 @@ class ScreenwritingRagRuntime:
                     _rag_scope_runtime(
                         rag_isolation_key,
                         index_cache_hit=index_cache_hit,
+                        index_refresh_scheduled=index_refresh_scheduled,
                     ),
                 ),
                 document_count=document_count,
@@ -106,6 +133,43 @@ class ScreenwritingRagRuntime:
                 ),
                 document_count=document_count,
             )
+
+    def _fingerprint_matches(self, rag_isolation_key: str, fingerprint: str) -> bool:
+        with self._lock:
+            return self._indexed_document_fingerprints.get(rag_isolation_key) == fingerprint
+
+    def _invalidate_stale_fingerprint(self, rag_isolation_key: str, fingerprint: str) -> None:
+        """仅当已记录指纹与当前指纹不同（陈旧）时移除记录，让后台预热得以重新调度。"""
+        with self._lock:
+            stored = self._indexed_document_fingerprints.get(rag_isolation_key)
+            if stored is not None and stored != fingerprint:
+                self._indexed_document_fingerprints.pop(rag_isolation_key, None)
+
+    def _retrieve_limit(self) -> int:
+        configured = getattr(
+            self._config,
+            "screenwriting_rag_retrieve_limit",
+            DEFAULT_SCREENWRITING_RAG_RETRIEVE_LIMIT,
+        )
+        return max(1, int(configured))
+
+    async def _resolve_query_intent(
+        self,
+        project: Any,
+        query: str,
+    ) -> ScreenwritingQueryIntent:
+        """优先用大模型解析查询意图，未启用或缺模型时走确定性兜底。"""
+        if not self._config.screenwriting_rag_intent_enabled:
+            return parse_screenwriting_query_intent(query)
+        model_id = str(getattr(project, "text_model", "") or "").strip()
+        if not model_id:
+            return parse_screenwriting_query_intent(query)
+        return await parse_screenwriting_query_intent_with_llm(
+            query,
+            model_id=model_id,
+            gateway=self._intent_gateway,
+            timeout_seconds=self._config.screenwriting_rag_intent_timeout_seconds,
+        )
 
     def clear_cache(self) -> None:
         """清理已缓存的 RAG 索引实例和文档指纹。"""
@@ -168,22 +232,6 @@ class ScreenwritingRagRuntime:
                 return existing_index
             self._indexes[rag_isolation_key] = new_index
             return new_index
-
-    def _index_documents_if_needed(
-        self,
-        rag_index: Any,
-        isolation_key: str,
-        rag_documents: Sequence[RagDocument],
-    ) -> bool:
-        fingerprint = _rag_documents_fingerprint(rag_documents)
-        with self._lock:
-            if self._indexed_document_fingerprints.get(isolation_key) == fingerprint:
-                return True
-        rag_index.index_documents(isolation_key, rag_documents)
-        with self._lock:
-            if self._indexes.get(isolation_key) is rag_index:
-                self._indexed_document_fingerprints[isolation_key] = fingerprint
-        return False
 
     async def _warmup_project_index(
         self,
@@ -271,14 +319,6 @@ class ScreenwritingRagRuntime:
                 flush=True,
             )
 
-    def _index_documents_for_scope(
-        self,
-        rag_isolation_key: str,
-        rag_documents: Sequence[RagDocument],
-    ) -> bool:
-        rag_index = self._get_index(rag_isolation_key, rag_isolation_key)
-        return self._index_documents_if_needed(rag_index, rag_isolation_key, rag_documents)
-
 
 _RAG_RUNTIME = ScreenwritingRagRuntime()
 _PROJECT_VECTOR_STORE_PART_RE = re.compile(r"[^A-Za-z0-9_-]+")
@@ -288,10 +328,17 @@ async def prepare_rag_context(
     session: AsyncSession,
     project: Any,
     project_public_id: str,
+    current_user_public_id: str,
     query: str,
 ) -> ScreenwritingRagPreparation:
     """准备单轮聊天可用的 RAG 上下文。"""
-    return await _RAG_RUNTIME.prepare_context(session, project, project_public_id, query)
+    return await _RAG_RUNTIME.prepare_context(
+        session,
+        project,
+        project_public_id,
+        current_user_public_id,
+        query,
+    )
 
 
 def schedule_rag_index_warmup(
@@ -314,11 +361,9 @@ def build_project_rag_vector_store_dir(
 ) -> Path:
     """生成项目级 RAG ChromaDB 持久化目录。"""
     current = config or settings
-    return (
-        project_path(current.screenwriting_rag_vector_store_root)
-        / "projects"
-        / _safe_project_vector_store_name(project_public_id)
-    )
+    chroma_root = project_path(current.screenwriting_rag_vector_store_root)
+    rag_root = chroma_root if chroma_root.name == "screenwriting-rag" else chroma_root / "screenwriting-rag"
+    return rag_root / "projects" / _safe_project_vector_store_name(project_public_id)
 
 
 def clear_rag_runtime_cache() -> None:
@@ -386,10 +431,15 @@ def _rag_documents_fingerprint(rag_documents: Sequence[RagDocument]) -> str:
 
 
 class _RagDocumentsFingerprintBuilder:
-    """增量计算 RAG 文档指纹，避免为 hash 再复制一份完整 payload。"""
+    """增量计算顺序无关的 RAG 文档指纹。
+
+    每个文档先独立哈希，聚合时按 digest 排序后再整体哈希，
+    保证指纹只取决于文档集合内容，与加载顺序和分批策略解耦，
+    使预热（分批交错）与聊天（全量加载）两条路径产出一致指纹。
+    """
 
     def __init__(self) -> None:
-        self._hasher = hashlib.sha256()
+        self._document_digests: list[bytes] = []
 
     def update_many(self, rag_documents: Sequence[RagDocument]) -> None:
         for document in rag_documents:
@@ -409,12 +459,13 @@ class _RagDocumentsFingerprintBuilder:
             default=str,
             separators=(",", ":"),
         ).encode("utf-8")
-        self._hasher.update(str(len(encoded)).encode("ascii"))
-        self._hasher.update(b":")
-        self._hasher.update(encoded)
+        self._document_digests.append(hashlib.sha256(encoded).digest())
 
     def hexdigest(self) -> str:
-        return self._hasher.hexdigest()
+        hasher = hashlib.sha256()
+        for digest in sorted(self._document_digests):
+            hasher.update(digest)
+        return hasher.hexdigest()
 
 
 def _rag_context_with_runtime(rag_context: ScreenwritingRagContext, runtime: dict[str, Any]) -> ScreenwritingRagContext:
@@ -425,11 +476,17 @@ def _rag_context_with_runtime(rag_context: ScreenwritingRagContext, runtime: dic
     )
 
 
-def _rag_scope_runtime(rag_isolation_key: str, *, index_cache_hit: bool) -> dict[str, Any]:
+def _rag_scope_runtime(
+    rag_isolation_key: str,
+    *,
+    index_cache_hit: bool,
+    index_refresh_scheduled: bool = False,
+) -> dict[str, Any]:
     return {
         "indexScope": "project",
         "ragIsolationKey": rag_isolation_key,
         "indexCacheHit": index_cache_hit,
+        "indexRefreshScheduled": index_refresh_scheduled,
     }
 
 

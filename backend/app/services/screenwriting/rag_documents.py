@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import AsyncIterator, Iterator, Sequence
 from pathlib import Path
@@ -13,6 +14,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from app.core.config import BASE_DIR, Settings, settings
 from app.core.rag import RagDocument
 from app.models.novel import NovelChapter, NovelCrawlBook
+from app.services.screenwriting.event_extraction import StructuredEvent, parse_chapter_events
 
 
 DEFAULT_CHAPTER_EXCERPT_CHARS = 0
@@ -32,6 +34,7 @@ async def load_screenwriting_knowledge_documents(
         *build_project_basic_documents(project),
         *build_novel_basic_documents(novel_books),
         *build_chapter_documents(chapters, last_chapter_index=_chapter_sequence_last_index(chapters)),
+        *build_event_documents(chapters, last_chapter_index=_chapter_sequence_last_index(chapters)),
         *build_project_skill_documents(project, config=config),
     ]
 
@@ -63,7 +66,10 @@ async def iter_screenwriting_knowledge_document_batches(
 
     last_chapter_index = await _load_project_last_chapter_index(session, project)
     async for chapters in _iter_project_chapter_batches(session, project, batch_size=safe_batch_size):
-        documents = build_chapter_documents(chapters, last_chapter_index=last_chapter_index)
+        documents = [
+            *build_chapter_documents(chapters, last_chapter_index=last_chapter_index),
+            *build_event_documents(chapters, last_chapter_index=last_chapter_index),
+        ]
         if documents:
             yield documents
 
@@ -218,6 +224,61 @@ def build_chapter_documents(
     return documents
 
 
+def build_event_documents(
+    chapters: Sequence[Any],
+    *,
+    last_chapter_index: int | None = None,
+) -> list[RagDocument]:
+    """把章节结构化事件标准化为 RAG 事件文档。"""
+    documents: list[RagDocument] = []
+    resolved_last_chapter_index = (
+        int(last_chapter_index)
+        if last_chapter_index is not None and int(last_chapter_index) > 0
+        else _chapter_sequence_last_index(chapters)
+    )
+    for chapter in sorted(chapters, key=_chapter_sort_key):
+        if int(getattr(chapter, "event_state", 0) or 0) != 1:
+            continue
+        events = _chapter_structured_events(chapter)
+        if not events:
+            continue
+        chapter_index = int(getattr(chapter, "chapter_index", 0) or 0)
+        chapter_public_id = str(getattr(chapter, "public_id", "") or getattr(chapter, "chapter_public_id", "") or "")
+        if not chapter_public_id:
+            chapter_public_id = str(getattr(chapter, "id", chapter_index) or chapter_index)
+        chapter_title = _normalize_text(getattr(chapter, "chapter", "") or getattr(chapter, "chapter_title", ""))
+        for offset, event in enumerate(events, start=1):
+            sequence = event.sequence or offset
+            documents.append(
+                RagDocument(
+                    source_id=f"event:{chapter_public_id}:{sequence}",
+                    source_type="event",
+                    title=f"第{chapter_index}章 {chapter_title} 事件{sequence}".strip(),
+                    content=_event_document_content(
+                        event,
+                        chapter_index=chapter_index,
+                        chapter_title=chapter_title,
+                    ),
+                    metadata={
+                        "chapter_id": getattr(chapter, "id", None),
+                        "chapter_public_id": chapter_public_id,
+                        "chapter_index": chapter_index,
+                        "chapter_max_index": resolved_last_chapter_index,
+                        "chapter_title": chapter_title,
+                        "event_sequence": sequence,
+                        "summary": event.summary,
+                        "characters": _metadata_join(event.characters),
+                        "scenes": _metadata_join(event.scenes),
+                        "organizations": _metadata_join(event.organizations),
+                        "event_type": event.event_type,
+                        "conflict": event.conflict,
+                        "outcome": event.outcome,
+                    },
+                )
+            )
+    return documents
+
+
 def build_project_skill_documents(project: Any, *, config: Settings | None = None) -> list[RagDocument]:
     """读取项目配置中的视觉风格和导演手册 Markdown 资料。"""
     current = config or settings
@@ -326,6 +387,47 @@ def _novel_book_sort_key(book: Any) -> tuple[int, str]:
 def _chapter_sequence_last_index(chapters: Sequence[Any]) -> int:
     indices = [int(getattr(chapter, "chapter_index", 0) or 0) for chapter in chapters]
     return max(indices, default=0)
+
+
+def _chapter_structured_events(chapter: Any) -> tuple[StructuredEvent, ...]:
+    raw_event = str(getattr(chapter, "event", "") or "").strip()
+    if not raw_event:
+        return ()
+    try:
+        return parse_chapter_events(raw_event)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ()
+    return ()
+
+
+def _event_document_content(
+    event: StructuredEvent,
+    *,
+    chapter_index: int,
+    chapter_title: str,
+) -> str:
+    parts = [
+        f"章节序号: {chapter_index}",
+        f"章节序列: 第{chapter_index}章",
+        f"章节标题: {chapter_title}" if chapter_title else "",
+        f"事件序号: {event.sequence}",
+        f"事件摘要: {event.summary}" if event.summary else "",
+        f"角色: {_human_join(event.characters)}" if event.characters else "",
+        f"场景: {_human_join(event.scenes)}" if event.scenes else "",
+        f"组织: {_human_join(event.organizations)}" if event.organizations else "",
+        f"事件类型: {event.event_type}" if event.event_type else "",
+        f"冲突: {event.conflict}" if event.conflict else "",
+        f"结果: {event.outcome}" if event.outcome else "",
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def _metadata_join(values: Sequence[str]) -> str:
+    return ",".join(str(value).strip() for value in values if str(value).strip())
+
+
+def _human_join(values: Sequence[str]) -> str:
+    return ", ".join(str(value).strip() for value in values if str(value).strip())
 
 
 def _labeled_parts(item: Any, fields: Sequence[tuple[str, str]]) -> list[str]:

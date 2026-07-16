@@ -24,6 +24,7 @@ from app.schemas.screenwriting import (
 )
 from app.services import project as project_service
 from app.services.screenwriting.prompts import build_guide_system_prompt
+from app.services.screenwriting.query_intent import normalize_lookup_text
 from app.services.screenwriting.rag_index import ScreenwritingRagContext
 from app.services.screenwriting.rag_runtime import (
     build_rag_tools,
@@ -141,6 +142,29 @@ async def chat_screenwriting(
             payload,
             agent_factory=agent_factory,
         )
+        direct_answer_started_at = perf_counter()
+        direct_answer = _metadata_direct_answer(context)
+        if direct_answer:
+            context.server_timings.mark("directAnswer", direct_answer_started_at)
+            response = ScreenwritingChatResponse(
+                conversation_id=context.conversation_id,
+                isolation_key=context.isolation_key,
+                model_id=context.model_id,
+                active_tab=context.active_tab,
+                content=direct_answer,
+                messages=_response_messages(payload, direct_answer),
+                runtime={
+                    "agent": "metadata_direct",
+                    "conversation": "multi_turn",
+                    "rag": rag_runtime_payload(context.rag_context, document_count=context.rag_document_count),
+                    "directAnswer": True,
+                    "thinkingElapsedMs": _thinking_elapsed_ms(context),
+                    "serverTimings": context.server_timings.payload(),
+                },
+            )
+            status = "completed"
+            return response
+
         agent_run_started_at = perf_counter()
         try:
             result = await context.agent.run_chat(context.agent_input())
@@ -181,15 +205,65 @@ async def build_screenwriting_chat_stream(
     *,
     agent_factory: ScreenwritingAgentFactory | None = None,
 ) -> AsyncIterator[ScreenwritingStreamEvent]:
-    """构建剧本创作多轮对话流式事件。"""
-    context = await _prepare_chat_context(
-        session,
-        project_public_id,
-        current_user_public_id,
-        payload,
-        agent_factory=agent_factory,
+    """构建剧本创作多轮对话流式事件。
+
+    本函数是异步生成器：首个 start(preparing) 事件在项目加载与 RAG 准备
+    开始前即发出，保证客户端立即获得服务端反馈；准备阶段的任何异常都
+    转换为 error 事件而不是 HTTP 异常。
+    """
+    server_timings = ScreenwritingServerTimings.start(payload.client_request_started_at_ms)
+    conversation_id = _resolve_conversation_id(payload)
+    isolation_key = _build_isolation_key(project_public_id, current_user_public_id, conversation_id)
+    yield ScreenwritingStreamEvent(
+        type="start",
+        content="",
+        conversation_id=conversation_id,
+        isolation_key=isolation_key,
+        model_id="",
+        active_tab=payload.active_tab,
+        data={
+            "phase": "preparing",
+            "thinkingElapsedMs": _elapsed_ms_since(server_timings.started_at),
+            "serverTimings": server_timings.payload(),
+        },
     )
-    return _stream_prepared_chat(context)
+    try:
+        project, model_id = await _load_chat_project(
+            session,
+            project_public_id,
+            current_user_public_id,
+            server_timings,
+        )
+        context = await _build_chat_context(
+            session,
+            project,
+            project_public_id,
+            current_user_public_id,
+            payload,
+            model_id=model_id,
+            conversation_id=conversation_id,
+            isolation_key=isolation_key,
+            server_timings=server_timings,
+            agent_factory=agent_factory,
+        )
+    except Exception as exc:
+        yield ScreenwritingStreamEvent(
+            type="error",
+            content="",
+            conversation_id=conversation_id,
+            isolation_key=isolation_key,
+            model_id="",
+            active_tab=payload.active_tab,
+            data={
+                "detail": _exception_detail(exc),
+                "errorType": exc.__class__.__name__,
+                "thinkingElapsedMs": _elapsed_ms_since(server_timings.started_at),
+                "serverTimings": server_timings.payload(),
+            },
+        )
+        return
+    async for event in _stream_prepared_chat(context):
+        yield event
 
 
 async def warmup_screenwriting_rag_index(
@@ -220,7 +294,25 @@ async def _stream_prepared_chat(context: ScreenwritingChatContext) -> AsyncItera
         model_stream_marked = True
 
     try:
-        yield _stream_event(context, "start")
+        direct_answer_started_at = perf_counter()
+        direct_answer = _metadata_direct_answer(context)
+        if direct_answer:
+            context.server_timings.mark("directAnswer", direct_answer_started_at)
+            status = "completed"
+            yield _stream_event(
+                context,
+                "done",
+                content=direct_answer,
+                data={
+                    "directAnswer": True,
+                    "assistantMessage": direct_answer,
+                    "messages": [
+                        message.model_dump(by_alias=True, mode="json")
+                        for message in _response_messages(context.payload, direct_answer)
+                    ],
+                },
+            )
+            return
 
         model_stream_started_at = perf_counter()
         try:
@@ -291,19 +383,66 @@ async def _prepare_chat_context(
     agent_factory: ScreenwritingAgentFactory | None,
 ) -> ScreenwritingChatContext:
     server_timings = ScreenwritingServerTimings.start(payload.client_request_started_at_ms)
-    thinking_started_at = server_timings.started_at
+    project, model_id = await _load_chat_project(
+        session,
+        project_public_id,
+        current_user_public_id,
+        server_timings,
+    )
+    conversation_id = _resolve_conversation_id(payload)
+    isolation_key = _build_isolation_key(project_public_id, current_user_public_id, conversation_id)
+    return await _build_chat_context(
+        session,
+        project,
+        project_public_id,
+        current_user_public_id,
+        payload,
+        model_id=model_id,
+        conversation_id=conversation_id,
+        isolation_key=isolation_key,
+        server_timings=server_timings,
+        agent_factory=agent_factory,
+    )
+
+
+async def _load_chat_project(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    server_timings: ScreenwritingServerTimings,
+) -> tuple[Any, str]:
+    """加载项目并校验文本模型配置；访问类异常在此抛出以映射为 HTTP 错误。"""
     project_started_at = perf_counter()
     project = await project_service.get_project_or_raise(session, project_public_id, current_user_public_id)
     model_id = str(project.text_model or "").strip()
     if not model_id:
         raise ScreenwritingValidationError("项目尚未配置文本模型，请先在项目设置中选择文本模型")
     server_timings.mark("project", project_started_at)
+    return project, model_id
 
-    conversation_id = _resolve_conversation_id(payload)
-    isolation_key = _build_isolation_key(project_public_id, current_user_public_id, conversation_id)
+
+async def _build_chat_context(
+    session: AsyncSession,
+    project: Any,
+    project_public_id: str,
+    current_user_public_id: str,
+    payload: ScreenwritingChatPayload,
+    *,
+    model_id: str,
+    conversation_id: str,
+    isolation_key: str,
+    server_timings: ScreenwritingServerTimings,
+    agent_factory: ScreenwritingAgentFactory | None,
+) -> ScreenwritingChatContext:
     active_tab = payload.active_tab
     rag_started_at = perf_counter()
-    rag_preparation = await prepare_rag_context(session, project, project_public_id, payload.message)
+    rag_preparation = await prepare_rag_context(
+        session,
+        project,
+        project_public_id,
+        current_user_public_id,
+        payload.message,
+    )
     server_timings.mark("rag", rag_started_at)
     agent_setup_started_at = perf_counter()
     tools = build_rag_tools(rag_preparation.context)
@@ -325,7 +464,7 @@ async def _prepare_chat_context(
         payload=payload,
         rag_context=rag_preparation.context,
         rag_document_count=rag_preparation.document_count,
-        thinking_started_at=thinking_started_at,
+        thinking_started_at=server_timings.started_at,
         server_timings=server_timings,
         agent=agent,
     )
@@ -362,6 +501,86 @@ def _response_messages(payload: ScreenwritingChatPayload, assistant_content: str
         ScreenwritingChatTurn(role="user", content=payload.message, time=_format_chat_time()),
         ScreenwritingChatTurn(role="assistant", content=assistant_content, time=_format_chat_time()),
     ]
+
+
+def _metadata_direct_answer(context: ScreenwritingChatContext) -> str:
+    """对确定性的 metadata 字段查询直接返回命中字段，避免简单问题等待模型生成。"""
+    rag_context = context.rag_context
+    runtime = rag_context.runtime
+    if runtime.get("retrievalMode") != "metadata":
+        return ""
+    if runtime.get("retrievalStrategy") != "field_lookup_exact":
+        return ""
+
+    lookup_specs = _runtime_field_lookup_specs(runtime)
+    if not lookup_specs:
+        return ""
+
+    answer_lines: list[str] = []
+    for hit in rag_context.hits:
+        markers = [
+            marker
+            for source_type, source_markers in lookup_specs
+            if source_type == hit.document.source_type
+            for marker in source_markers
+        ]
+        if not markers:
+            continue
+        answer_lines.extend(_matching_field_lines(hit.chunk_text, markers))
+
+    return "\n".join(_dedupe_preserve_order(answer_lines[:5]))
+
+
+def _runtime_field_lookup_specs(runtime: dict[str, Any]) -> list[tuple[str, tuple[str, ...]]]:
+    raw_specs = runtime.get("intentFieldLookups")
+    if not isinstance(raw_specs, list):
+        return []
+    specs: list[tuple[str, tuple[str, ...]]] = []
+    for raw_spec in raw_specs:
+        if not isinstance(raw_spec, dict):
+            continue
+        source_type = str(raw_spec.get("sourceType") or raw_spec.get("source_type") or "").strip()
+        raw_markers = raw_spec.get("documentMarkers") or raw_spec.get("document_markers")
+        if not source_type or not isinstance(raw_markers, list):
+            continue
+        markers = tuple(str(marker).strip() for marker in raw_markers if str(marker).strip())
+        if markers:
+            specs.append((source_type, markers))
+    return specs
+
+
+def _matching_field_lines(text: str, markers: list[str]) -> list[str]:
+    normalized_markers = tuple(normalize_lookup_text(marker) for marker in markers)
+    lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        label, value = _split_field_line(raw_line)
+        if not label or not value:
+            continue
+        normalized_label = normalize_lookup_text(label)
+        if not any(marker and marker in normalized_label for marker in normalized_markers):
+            continue
+        lines.append(f"{label.strip()}: {value.strip()}")
+    return lines
+
+
+def _split_field_line(line: str) -> tuple[str, str]:
+    text = str(line or "").strip()
+    for delimiter in ("：", ":"):
+        if delimiter in text:
+            label, value = text.split(delimiter, 1)
+            return label.strip(), value.strip()
+    return "", ""
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
 
 
 def _normalize_agent_delta(current_content: str, incoming_content: str) -> str:
@@ -448,6 +667,10 @@ def _stream_event(
         active_tab=context.active_tab,
         data=event_data,
     )
+
+
+def _elapsed_ms_since(started_at: float) -> int:
+    return max(0, int((perf_counter() - started_at) * 1000))
 
 
 def _thinking_elapsed_ms(context: ScreenwritingChatContext) -> int:
