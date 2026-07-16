@@ -5,11 +5,13 @@ from dataclasses import dataclass, field
 from time import perf_counter, time
 from typing import Any
 
+from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.harness import HarnessAgent, ScriptAgentEvent, ScriptAgentInput
 from app.core.harness.runtime.deepagents import DeepAgentsRuntime
 from app.core.harness.tools.adapter import ModelGatewayAdapter
+from app.models.novel import NovelChapter
 from app.schemas.screenwriting import (
     ScreenwritingActiveTab,
     ScreenwritingChatPayload,
@@ -18,25 +20,51 @@ from app.schemas.screenwriting import (
     ScreenwritingStreamEvent,
 )
 from app.services import project as project_service
+from app.services.screenwriting.agent_tools import build_screenwriting_agent_tools
 from app.services.screenwriting.errors import (
     ScreenwritingServiceError,
     ScreenwritingValidationError,
+)
+from app.services.screenwriting.project_config import (
+    ensure_project_config,
+    format_project_config,
+    resolve_project_config_dialog,
 )
 from app.services.screenwriting.prompts import build_guide_system_prompt
 from app.services.screenwriting.query_intent import normalize_lookup_text
 from app.services.screenwriting.rag_index import ScreenwritingRagContext
 from app.services.screenwriting.rag_runtime import (
-    build_rag_tools,
     build_system_prompt_with_rag,
     prepare_rag_context,
     rag_runtime_payload,
     schedule_rag_index_warmup,
 )
+from app.services.screenwriting.quality import ensure_stage_output_quality
+from app.services.screenwriting.stage_generation import (
+    StageGenerationPlan,
+    build_stage_repair_message,
+    build_stage_system_prompt,
+    clean_stage_output,
+    clear_pending_script_repair,
+    configured_episode_duration_minutes,
+    mark_stage_completed,
+    merge_script_episode_blocks,
+    resolve_script_repair_dialog,
+    resolve_stage_generation,
+    save_pending_script_repair,
+    script_block_matches_episode,
+    script_episode_message,
+    script_repair_confirmation_prompt,
+    stage_completion_reply,
+)
+from app.services.screenwriting.constants import STAGE_SELF_REPAIR_MAX_ATTEMPTS
 from app.services.screenwriting.state import (
     ScreenwritingSessionState,
     acquire_session_lock,
     commit_chat_turns,
+    commit_stage_output,
     load_chat_session_state,
+    stage_label,
 )
 
 
@@ -113,6 +141,31 @@ class ScreenwritingChatContext:
     db_session: AsyncSession
     project: Any
     session_state: ScreenwritingSessionState
+    stage_plan: StageGenerationPlan | None = None
+    chapter_events: list[dict[str, Any]] = field(default_factory=list)
+    stage_agent_builder: Callable[[str], HarnessAgent] | None = None
+
+    def build_stage_agent(self, stage_message: str) -> HarnessAgent:
+        """为阶段生成/修复轮构建子 Agent（系统提示词随消息重建）。"""
+        assert self.stage_agent_builder is not None
+        return self.stage_agent_builder(stage_message)
+
+    def stage_agent_input(self, agent: HarnessAgent, stage_message: str) -> ScriptAgentInput:
+        """阶段子 Agent 的单次调用输入（不携带对话历史）。"""
+        del agent
+        rag_runtime = rag_runtime_payload(self.rag_context, document_count=self.rag_document_count)
+        return ScriptAgentInput(
+            project_public_id=self.project_public_id,
+            user_public_id=self.user_public_id,
+            isolation_key=self.isolation_key,
+            messages=[{"role": "user", "content": stage_message}],
+            model_id=self.model_id,
+            metadata={
+                "conversation_id": self.conversation_id,
+                "active_tab": self.active_tab,
+                "rag": rag_runtime,
+            },
+        )
 
     def agent_input(self) -> ScriptAgentInput:
         """转换为 Harness Agent 单次调用输入。"""
@@ -131,6 +184,17 @@ class ScreenwritingChatContext:
         )
 
 
+@dataclass(frozen=True)
+class _PreparedChatTurn:
+    """单轮对话准备结果：配置链路直答或完整 Agent 上下文（二选一）。"""
+
+    project: Any
+    state: ScreenwritingSessionState
+    model_id: str
+    config_reply: str = ""
+    context: ScreenwritingChatContext | None = None
+
+
 async def chat_screenwriting(
     session: AsyncSession,
     project_public_id: str,
@@ -145,13 +209,49 @@ async def chat_screenwriting(
     lock = await acquire_session_lock(project_public_id, current_user_public_id)
     async with lock:
         try:
-            context = await _prepare_chat_context(
+            server_timings = ScreenwritingServerTimings.start(payload.client_request_started_at_ms)
+            turn = await _prepare_chat_turn(
                 session,
                 project_public_id,
                 current_user_public_id,
                 payload,
+                server_timings=server_timings,
                 agent_factory=agent_factory,
             )
+            if turn.config_reply:
+                state = await commit_chat_turns(
+                    session,
+                    turn.project,
+                    turn.state,
+                    user_content=payload.message,
+                    assistant_content=turn.config_reply,
+                    active_tab=payload.active_tab,
+                )
+                status = "completed"
+                return ScreenwritingChatResponse(
+                    conversation_id=turn.state.conversation_id,
+                    isolation_key=_build_isolation_key(
+                        project_public_id, current_user_public_id, turn.state.conversation_id
+                    ),
+                    model_id=turn.model_id,
+                    active_tab=payload.active_tab,
+                    content=turn.config_reply,
+                    messages=list(state.messages),
+                    runtime={
+                        "agent": "project_config",
+                        "conversation": "multi_turn",
+                        "directAnswer": True,
+                        "thinkingElapsedMs": _elapsed_ms_since(server_timings.started_at),
+                        "serverTimings": server_timings.payload(),
+                    },
+                )
+
+            context = turn.context
+            assert context is not None
+            if context.stage_plan is not None:
+                response = await _run_stage_generation(context)
+                status = "completed"
+                return response
             direct_answer_started_at = perf_counter()
             direct_answer = _metadata_direct_answer(context)
             if direct_answer:
@@ -255,30 +355,23 @@ async def build_screenwriting_chat_stream(
     lock = await acquire_session_lock(project_public_id, current_user_public_id)
     async with lock:
         try:
-            project, model_id = await _load_chat_project(
+            turn = await _prepare_chat_turn(
                 session,
-                project_public_id,
-                current_user_public_id,
-                server_timings,
-            )
-            state = await load_chat_session_state(
-                session,
-                project,
-                project_public_id,
-                current_user_public_id,
-                reset=payload.reset,
-            )
-            context = await _build_chat_context(
-                session,
-                project,
                 project_public_id,
                 current_user_public_id,
                 payload,
-                model_id=model_id,
-                state=state,
                 server_timings=server_timings,
                 agent_factory=agent_factory,
             )
+            if turn.config_reply:
+                await commit_chat_turns(
+                    session,
+                    turn.project,
+                    turn.state,
+                    user_content=payload.message,
+                    assistant_content=turn.config_reply,
+                    active_tab=payload.active_tab,
+                )
         except Exception as exc:
             yield ScreenwritingStreamEvent(
                 type="error",
@@ -295,7 +388,32 @@ async def build_screenwriting_chat_stream(
                 },
             )
             return
-        async for event in _stream_prepared_chat(context):
+        if turn.config_reply:
+            yield ScreenwritingStreamEvent(
+                type="done",
+                content=turn.config_reply,
+                conversation_id=turn.state.conversation_id,
+                isolation_key=_build_isolation_key(
+                    project_public_id, current_user_public_id, turn.state.conversation_id
+                ),
+                model_id=turn.model_id,
+                active_tab=payload.active_tab,
+                data={
+                    "directAnswer": True,
+                    "agent": "project_config",
+                    "assistantMessage": turn.config_reply,
+                    "messages": _state_message_payload(turn.state),
+                    "thinkingElapsedMs": _elapsed_ms_since(server_timings.started_at),
+                    "serverTimings": server_timings.payload(),
+                },
+            )
+            return
+        assert turn.context is not None
+        if turn.context.stage_plan is not None:
+            async for event in _stream_stage_generation(turn.context):
+                yield event
+            return
+        async for event in _stream_prepared_chat(turn.context):
             yield event
 
 
@@ -417,16 +535,609 @@ async def _stream_prepared_chat(context: ScreenwritingChatContext) -> AsyncItera
         _print_server_timing_log(context, operation="chat.stream", status=status)
 
 
-async def _prepare_chat_context(
+async def _run_stage_generation(context: ScreenwritingChatContext) -> ScreenwritingChatResponse:
+    """聚合路径执行阶段生成：质量校验 + 自修复循环；script 阶段逐集生成。"""
+    plan = context.stage_plan
+    assert plan is not None
+    agent_run_started_at = perf_counter()
+    pending_prompt = ""
+    if plan.stage == "script":
+        stage_content, quality_warnings, pending_prompt = await _run_script_episodes_aggregate(context, plan)
+    else:
+        stage_content, quality_warnings = await _run_single_stage_aggregate(context, plan)
+    context.server_timings.mark("agentRun", agent_run_started_at)
+
+    state = context.session_state
+    if pending_prompt:
+        # 单集修复预算耗尽：状态与回滚稿已落库，把确认请求作为本轮回复返回。
+        return ScreenwritingChatResponse(
+            conversation_id=context.conversation_id,
+            isolation_key=context.isolation_key,
+            model_id=context.model_id,
+            active_tab="script",
+            content=pending_prompt,
+            messages=list(state.messages),
+            runtime={
+                "agent": "stage_generation",
+                "stage": plan.stage,
+                "requestedStage": plan.requested_stage,
+                "pendingScriptRepair": True,
+                "conversation": "multi_turn",
+                "rag": rag_runtime_payload(context.rag_context, document_count=context.rag_document_count),
+                "workspace": _workspace_payload(state),
+                "thinkingElapsedMs": _thinking_elapsed_ms(context),
+                "serverTimings": context.server_timings.payload(),
+            },
+        )
+
+    assistant_content = f"{plan.dispatch_reply}\n\n{stage_completion_reply(plan)}"
+    mark_stage_completed(context.session_state, plan.stage)
+    state = await commit_stage_output(
+        context.db_session,
+        context.project,
+        context.session_state,
+        stage=plan.stage,
+        content=stage_content,
+        user_content=context.payload.message,
+        assistant_content=assistant_content,
+    )
+    return ScreenwritingChatResponse(
+        conversation_id=context.conversation_id,
+        isolation_key=context.isolation_key,
+        model_id=context.model_id,
+        active_tab=plan.stage,  # type: ignore[arg-type]
+        content=assistant_content,
+        messages=list(state.messages),
+        runtime={
+            "agent": "stage_generation",
+            "stage": plan.stage,
+            "requestedStage": plan.requested_stage,
+            "blockedStage": plan.blocked_stage,
+            "qualityWarnings": quality_warnings,
+            "conversation": "multi_turn",
+            "rag": rag_runtime_payload(context.rag_context, document_count=context.rag_document_count),
+            "workspace": _workspace_payload(state),
+            "thinkingElapsedMs": _thinking_elapsed_ms(context),
+            "serverTimings": context.server_timings.payload(),
+        },
+    )
+
+
+async def _run_single_stage_aggregate(
+    context: ScreenwritingChatContext,
+    plan: StageGenerationPlan,
+) -> tuple[str, list[str]]:
+    """聚合路径生成 skeleton/strategy：质量失败时自修复重试。"""
+    stage_message = plan.stage_message
+    last_error: ScreenwritingServiceError | None = None
+    for attempt in range(STAGE_SELF_REPAIR_MAX_ATTEMPTS + 1):
+        agent = context.build_stage_agent(stage_message)
+        try:
+            result = await agent.run_chat(context.stage_agent_input(agent, stage_message))
+        except Exception as exc:
+            raise ScreenwritingServiceError(f"阶段生成失败：{exc}") from exc
+        content = clean_stage_output(str(result.content or ""))
+        try:
+            warnings = ensure_stage_output_quality(
+                plan.stage,
+                content,
+                chapter_events=context.chapter_events,
+            )
+            return content, warnings
+        except ScreenwritingServiceError as exc:
+            last_error = exc
+            if attempt >= STAGE_SELF_REPAIR_MAX_ATTEMPTS:
+                raise
+            stage_message = build_stage_repair_message(
+                plan.stage,
+                stage_message=plan.stage_message,
+                failure_reason=str(exc),
+                failed_output=content,
+            )
+    raise last_error or ScreenwritingServiceError("阶段生成失败")
+
+
+async def _run_script_episodes_aggregate(
+    context: ScreenwritingChatContext,
+    plan: StageGenerationPlan,
+) -> tuple[str, list[str], str]:
+    """聚合路径逐集生成剧本；单集修复预算耗尽时落库 pending 并返回确认文案。"""
+    state = context.session_state
+    duration_minutes = configured_episode_duration_minutes(state)
+    generated_script = state.workspace.script
+    quality_warnings: list[str] = []
+    episode_numbers = plan.episode_numbers or (1,)
+
+    for index, episode_no in enumerate(episode_numbers):
+        base_message = script_episode_message(
+            plan.stage_message, episode_no, duration_minutes=duration_minutes
+        )
+        if plan.repair and index == 0:
+            base_message = build_stage_repair_message(
+                "script",
+                stage_message=base_message,
+                failure_reason=plan.repair_failure,
+                failed_output=plan.repair_failed_output,
+            )
+        current_message = base_message
+        last_failure = ""
+        last_output = ""
+        for attempt in range(STAGE_SELF_REPAIR_MAX_ATTEMPTS + 1):
+            agent = context.build_stage_agent(current_message)
+            try:
+                result = await agent.run_chat(context.stage_agent_input(agent, current_message))
+            except Exception as exc:
+                raise ScreenwritingServiceError(f"剧本生成失败：{exc}") from exc
+            content = clean_stage_output(str(result.content or ""))
+            last_output = content
+            try:
+                _ensure_script_episode_output(content, episode_no, context, duration_minutes, quality_warnings)
+                generated_script = merge_script_episode_blocks(
+                    generated_script, content, target_episode_numbers=(episode_no,)
+                )
+                last_failure = ""
+                break
+            except ScreenwritingServiceError as exc:
+                last_failure = str(exc)
+                if attempt >= STAGE_SELF_REPAIR_MAX_ATTEMPTS:
+                    break
+                current_message = build_stage_repair_message(
+                    "script",
+                    stage_message=base_message,
+                    failure_reason=last_failure,
+                    failed_output=content,
+                )
+        if last_failure:
+            rollback_script = _script_rollback_content(generated_script, last_output, episode_no)
+            save_pending_script_repair(
+                state,
+                failure_reason=last_failure,
+                failed_output=last_output,
+                stage_message=plan.stage_message,
+                episode_no=episode_no,
+                remaining_episode_numbers=tuple(episode_numbers[index + 1 :]),
+            )
+            confirmation_prompt = script_repair_confirmation_prompt(last_failure, episode_no)
+            await commit_stage_output(
+                context.db_session,
+                context.project,
+                state,
+                stage="script",
+                content=rollback_script,
+                user_content=context.payload.message,
+                assistant_content=confirmation_prompt,
+            )
+            return rollback_script, quality_warnings, confirmation_prompt
+
+    if plan.repair:
+        clear_pending_script_repair(state)
+    return generated_script, quality_warnings, ""
+
+
+def _ensure_script_episode_output(
+    content: str,
+    episode_no: int,
+    context: ScreenwritingChatContext,
+    duration_minutes: int,
+    quality_warnings: list[str],
+) -> None:
+    """单集产出校验：集号匹配 + 剧本质量规则；软警告累积进 quality_warnings。"""
+    if not script_block_matches_episode(content, episode_no):
+        raise ScreenwritingServiceError(
+            f"剧本输出未以 EP{episode_no:02d} 标题开头，疑似串集或缺少分集标题"
+        )
+    quality_warnings.extend(
+        ensure_stage_output_quality(
+            "script",
+            content,
+            chapter_events=context.chapter_events,
+            target_duration_minutes=duration_minutes,
+        )
+    )
+
+
+def _script_rollback_content(generated_script: str, failed_output: str, episode_no: int) -> str:
+    """回滚剧本 = 已通过校验的集 + 本集失败尝试稿（可解析时并入，便于人工查看）。"""
+    if failed_output and script_block_matches_episode(failed_output, episode_no):
+        return merge_script_episode_blocks(
+            generated_script, failed_output, target_episode_numbers=(episode_no,)
+        )
+    return generated_script
+
+
+async def _stream_stage_generation(context: ScreenwritingChatContext) -> AsyncIterator[ScreenwritingStreamEvent]:
+    """流式路径执行阶段生成。
+
+    对话区只承载调度与收尾文案；阶段正文经 workspace.delta（targetTab 定向、
+    携带累计全文）写入右侧工作区；质量校验失败触发自修复（stage.repair 事件），
+    script 阶段逐集生成（script.episode.start 事件），单集预算耗尽转入
+    "回滚 + 人工确认补全"闭环。
+    """
+    plan = context.stage_plan
+    assert plan is not None
+    state = context.session_state
+    status = "cancelled"
+    model_stream_started_at: float | None = None
+    model_stream_marked = False
+
+    def mark_model_stream() -> None:
+        nonlocal model_stream_marked
+        if model_stream_marked or model_stream_started_at is None:
+            return
+        context.server_timings.mark("modelStream", model_stream_started_at)
+        model_stream_marked = True
+
+    try:
+        yield _stream_event(
+            context,
+            "agent.action",
+            data={
+                "phase": "stage.repair.confirmed" if plan.repair else "request.received",
+                "message": "用户已确认补全剧本单集" if plan.repair else "已接收创作需求",
+                "detail": plan.repair_failure if plan.repair else context.payload.message,
+                "targetTab": plan.stage,
+            },
+        )
+        yield _stream_event(context, "message.delta", content=plan.dispatch_reply)
+        yield _stream_event(
+            context,
+            "agent.action",
+            data={
+                "phase": "subagent.dispatch",
+                "message": f"调用{stage_label(plan.stage)}助理",
+                "detail": f"{stage_label(plan.stage)}助理会把结果实时写入右侧工作区。",
+                "targetTab": plan.stage,
+                "agentName": f"screenwriting-{plan.stage}-agent",
+            },
+        )
+
+        model_stream_started_at = perf_counter()
+        duration_minutes = configured_episode_duration_minutes(state)
+        quality_warnings: list[str] = []
+
+        if plan.stage == "script":
+            generated_script = state.workspace.script
+            episode_numbers = plan.episode_numbers or (1,)
+            for index, episode_no in enumerate(episode_numbers):
+                yield _stream_event(
+                    context,
+                    "agent.action",
+                    data={
+                        "phase": "script.episode.start",
+                        "message": f"开始生成 EP{episode_no:02d}",
+                        "detail": f"EP{episode_no:02d}",
+                        "targetTab": "script",
+                        "agentName": "screenwriting-script-agent",
+                    },
+                )
+                base_message = script_episode_message(
+                    plan.stage_message, episode_no, duration_minutes=duration_minutes
+                )
+                if plan.repair and index == 0:
+                    base_message = build_stage_repair_message(
+                        "script",
+                        stage_message=base_message,
+                        failure_reason=plan.repair_failure,
+                        failed_output=plan.repair_failed_output,
+                    )
+                current_message = base_message
+                last_failure = ""
+                last_output = ""
+                for attempt in range(STAGE_SELF_REPAIR_MAX_ATTEMPTS + 1):
+                    agent = context.build_stage_agent(current_message)
+                    attempt_content = ""
+                    try:
+                        async for event in agent.stream_chat(
+                            context.stage_agent_input(agent, current_message)
+                        ):
+                            if event.type == "message.delta":
+                                delta = _normalize_agent_delta(attempt_content, event.content)
+                                if not delta:
+                                    continue
+                                attempt_content += delta
+                                preview = (
+                                    f"{generated_script}\n\n---\n\n{attempt_content}"
+                                    if generated_script
+                                    else attempt_content
+                                )
+                                yield _stream_event(
+                                    context,
+                                    "workspace.delta",
+                                    content=delta,
+                                    data={"targetTab": "script", "workspaceContent": preview},
+                                )
+                                continue
+                            if event.type == "done":
+                                final_content = _agent_final_content(event)
+                                if final_content:
+                                    attempt_content += _normalize_agent_delta(attempt_content, final_content)
+                                break
+                            if event.type == "error":
+                                mark_model_stream()
+                                status = "error"
+                                yield _agent_error_event(context, event)
+                                return
+                            yield _event_from_agent_event(context, event)
+                    except Exception as exc:
+                        mark_model_stream()
+                        status = "error"
+                        yield _stream_event(
+                            context,
+                            "error",
+                            data={"detail": _exception_detail(exc), "errorType": exc.__class__.__name__},
+                        )
+                        return
+                    content = clean_stage_output(attempt_content)
+                    last_output = content
+                    try:
+                        _ensure_script_episode_output(
+                            content, episode_no, context, duration_minutes, quality_warnings
+                        )
+                        generated_script = merge_script_episode_blocks(
+                            generated_script, content, target_episode_numbers=(episode_no,)
+                        )
+                        last_failure = ""
+                        break
+                    except ScreenwritingServiceError as exc:
+                        last_failure = str(exc)
+                        if attempt >= STAGE_SELF_REPAIR_MAX_ATTEMPTS:
+                            break
+                        current_message = build_stage_repair_message(
+                            "script",
+                            stage_message=base_message,
+                            failure_reason=last_failure,
+                            failed_output=content,
+                        )
+                        yield _stream_event(
+                            context,
+                            "agent.action",
+                            data={
+                                "phase": "stage.repair",
+                                "message": f"EP{episode_no:02d} 质量校验未通过，正在触发助理自我修复",
+                                "detail": last_failure,
+                                "targetTab": "script",
+                                "agentName": "screenwriting-script-agent",
+                            },
+                        )
+                if last_failure:
+                    mark_model_stream()
+                    rollback_script = _script_rollback_content(generated_script, last_output, episode_no)
+                    save_pending_script_repair(
+                        state,
+                        failure_reason=last_failure,
+                        failed_output=last_output,
+                        stage_message=plan.stage_message,
+                        episode_no=episode_no,
+                        remaining_episode_numbers=tuple(episode_numbers[index + 1 :]),
+                    )
+                    confirmation_prompt = script_repair_confirmation_prompt(last_failure, episode_no)
+                    committed = await commit_stage_output(
+                        context.db_session,
+                        context.project,
+                        state,
+                        stage="script",
+                        content=rollback_script,
+                        user_content=context.payload.message,
+                        assistant_content=confirmation_prompt,
+                    )
+                    status = "pending_repair_confirmation"
+                    yield _stream_event(
+                        context,
+                        "workspace.delta",
+                        content=rollback_script,
+                        data={
+                            "targetTab": "script",
+                            "workspaceContent": rollback_script,
+                            "workspace": _workspace_payload(committed),
+                        },
+                    )
+                    yield _stream_event(
+                        context,
+                        "agent.action",
+                        data={
+                            "phase": "stage.repair.confirmation_required",
+                            "message": f"EP{episode_no:02d} 自动修复未通过，需要确认是否继续补全",
+                            "detail": last_failure,
+                            "targetTab": "script",
+                        },
+                    )
+                    yield _stream_event(context, "message.delta", content=f"\n\n{confirmation_prompt}")
+                    yield _stream_event(
+                        context,
+                        "done",
+                        content=f"{plan.dispatch_reply}\n\n{confirmation_prompt}",
+                        data={
+                            "assistantMessage": confirmation_prompt,
+                            "messages": _state_message_payload(committed),
+                            "workspace": _workspace_payload(committed),
+                            "stage": "script",
+                            "pendingScriptRepair": True,
+                        },
+                    )
+                    return
+                yield _stream_event(
+                    context,
+                    "workspace.delta",
+                    content=generated_script,
+                    data={"targetTab": "script", "workspaceContent": generated_script},
+                )
+            if plan.repair:
+                clear_pending_script_repair(state)
+            stage_content = generated_script
+        else:
+            stage_message = plan.stage_message
+            stage_content = ""
+            for attempt in range(STAGE_SELF_REPAIR_MAX_ATTEMPTS + 1):
+                agent = context.build_stage_agent(stage_message)
+                attempt_content = ""
+                try:
+                    async for event in agent.stream_chat(
+                        context.stage_agent_input(agent, stage_message)
+                    ):
+                        if event.type == "message.delta":
+                            delta = _normalize_agent_delta(attempt_content, event.content)
+                            if not delta:
+                                continue
+                            attempt_content += delta
+                            yield _stream_event(
+                                context,
+                                "workspace.delta",
+                                content=delta,
+                                data={"targetTab": plan.stage, "workspaceContent": attempt_content},
+                            )
+                            continue
+                        if event.type == "done":
+                            final_content = _agent_final_content(event)
+                            if final_content:
+                                attempt_content += _normalize_agent_delta(attempt_content, final_content)
+                            break
+                        if event.type == "error":
+                            mark_model_stream()
+                            status = "error"
+                            yield _agent_error_event(context, event)
+                            return
+                        yield _event_from_agent_event(context, event)
+                except Exception as exc:
+                    mark_model_stream()
+                    status = "error"
+                    yield _stream_event(
+                        context,
+                        "error",
+                        data={"detail": _exception_detail(exc), "errorType": exc.__class__.__name__},
+                    )
+                    return
+                content = clean_stage_output(attempt_content)
+                try:
+                    quality_warnings = ensure_stage_output_quality(
+                        plan.stage,
+                        content,
+                        chapter_events=context.chapter_events,
+                    )
+                    stage_content = content
+                    break
+                except ScreenwritingServiceError as exc:
+                    if attempt >= STAGE_SELF_REPAIR_MAX_ATTEMPTS:
+                        mark_model_stream()
+                        status = "quality_failed"
+                        yield _stream_event(
+                            context,
+                            "error",
+                            data={"detail": str(exc), "errorType": "ScreenwritingServiceError"},
+                        )
+                        return
+                    stage_message = build_stage_repair_message(
+                        plan.stage,
+                        stage_message=plan.stage_message,
+                        failure_reason=str(exc),
+                        failed_output=content,
+                    )
+                    yield _stream_event(
+                        context,
+                        "agent.action",
+                        data={
+                            "phase": "stage.repair",
+                            "message": f"{stage_label(plan.stage)}质量校验未通过，正在触发助理自我修复",
+                            "detail": str(exc),
+                            "targetTab": plan.stage,
+                            "agentName": f"screenwriting-{plan.stage}-agent",
+                        },
+                    )
+
+        mark_model_stream()
+        if not stage_content:
+            status = "empty_response"
+            yield _stream_event(
+                context,
+                "error",
+                data={"detail": "模型未返回可用阶段内容", "errorType": "ScreenwritingServiceError"},
+            )
+            return
+
+        status = "completed"
+        completion_reply = stage_completion_reply(plan)
+        assistant_content = f"{plan.dispatch_reply}\n\n{completion_reply}"
+        mark_stage_completed(context.session_state, plan.stage)
+        committed = await commit_stage_output(
+            context.db_session,
+            context.project,
+            context.session_state,
+            stage=plan.stage,
+            content=stage_content,
+            user_content=context.payload.message,
+            assistant_content=assistant_content,
+        )
+        for warning in quality_warnings:
+            yield _stream_event(
+                context,
+                "agent.action",
+                data={
+                    "phase": "quality.warning",
+                    "message": f"{stage_label(plan.stage)}已生成，但存在需要补强的质量提示",
+                    "detail": warning,
+                    "targetTab": plan.stage,
+                },
+            )
+        yield _stream_event(
+            context,
+            "agent.action",
+            data={
+                "phase": "workspace.sync",
+                "message": f"{stage_label(plan.stage)}已同步到右侧工作区",
+                "detail": stage_label(plan.stage),
+                "targetTab": plan.stage,
+            },
+        )
+        yield _stream_event(
+            context,
+            "workspace.delta",
+            content=stage_content,
+            data={
+                "targetTab": plan.stage,
+                "workspaceContent": stage_content,
+                "workspace": _workspace_payload(committed),
+            },
+        )
+        yield _stream_event(context, "message.delta", content=f"\n\n{completion_reply}")
+        yield _stream_event(
+            context,
+            "done",
+            content=assistant_content,
+            data={
+                "assistantMessage": assistant_content,
+                "messages": _state_message_payload(committed),
+                "workspace": _workspace_payload(committed),
+                "stage": plan.stage,
+                "requestedStage": plan.requested_stage,
+                "blockedStage": plan.blocked_stage,
+                "qualityWarnings": quality_warnings,
+            },
+        )
+    finally:
+        mark_model_stream()
+        _print_server_timing_log(context, operation="chat.stage_stream", status=status)
+
+
+def _workspace_payload(state: ScreenwritingSessionState) -> dict[str, str]:
+    return {
+        "skeleton": state.workspace.skeleton,
+        "strategy": state.workspace.strategy,
+        "script": state.workspace.script,
+    }
+
+
+async def _prepare_chat_turn(
     session: AsyncSession,
     project_public_id: str,
     current_user_public_id: str,
     payload: ScreenwritingChatPayload,
     *,
+    server_timings: ScreenwritingServerTimings,
     agent_factory: ScreenwritingAgentFactory | None,
-) -> ScreenwritingChatContext:
-    """准备聚合对话上下文；调用方必须已持有会话锁。"""
-    server_timings = ScreenwritingServerTimings.start(payload.client_request_started_at_ms)
+) -> _PreparedChatTurn:
+    """准备单轮对话：先走创作配置链路分流，未命中再构建完整 Agent 上下文。
+
+    调用方必须已持有会话锁。
+    """
     project, model_id = await _load_chat_project(
         session,
         project_public_id,
@@ -440,7 +1151,52 @@ async def _prepare_chat_context(
         current_user_public_id,
         reset=payload.reset,
     )
-    return await _build_chat_context(
+    config_started_at = perf_counter()
+    chapter_events = await _load_chapter_events(session, project)
+    chapter_index_range = _chapter_index_bounds(chapter_events)
+
+    # 剧本单集修复确认优先于配置链路（"确认"一词两个状态机都识别）。
+    repair_dialog = resolve_script_repair_dialog(state, payload.message)
+    if isinstance(repair_dialog, str):
+        server_timings.mark("configDialog", config_started_at)
+        return _PreparedChatTurn(
+            project=project,
+            state=state,
+            model_id=model_id,
+            config_reply=repair_dialog,
+        )
+    if isinstance(repair_dialog, StageGenerationPlan):
+        server_timings.mark("configDialog", config_started_at)
+        context = await _build_chat_context(
+            session,
+            project,
+            project_public_id,
+            current_user_public_id,
+            payload,
+            model_id=model_id,
+            state=state,
+            agent_message=payload.message,
+            chapter_events=chapter_events,
+            chapter_index_range=chapter_index_range,
+            stage_plan=repair_dialog,
+            server_timings=server_timings,
+            agent_factory=agent_factory,
+        )
+        return _PreparedChatTurn(project=project, state=state, model_id=model_id, context=context)
+
+    dialog = resolve_project_config_dialog(state, payload.message, chapter_index_range)
+    server_timings.mark("configDialog", config_started_at)
+    if dialog is not None and dialog.reply:
+        return _PreparedChatTurn(
+            project=project,
+            state=state,
+            model_id=model_id,
+            config_reply=dialog.reply,
+        )
+
+    agent_message = dialog.proceed_message if dialog is not None and dialog.proceed_message else payload.message
+    stage_plan = resolve_stage_generation(state, agent_message)
+    context = await _build_chat_context(
         session,
         project,
         project_public_id,
@@ -448,9 +1204,53 @@ async def _prepare_chat_context(
         payload,
         model_id=model_id,
         state=state,
+        agent_message=agent_message,
+        chapter_events=chapter_events,
+        chapter_index_range=chapter_index_range,
+        stage_plan=stage_plan,
         server_timings=server_timings,
         agent_factory=agent_factory,
     )
+    return _PreparedChatTurn(
+        project=project,
+        state=state,
+        model_id=model_id,
+        context=context,
+    )
+
+
+async def _load_chapter_events(session: AsyncSession, project: Any) -> list[dict[str, Any]]:
+    """加载项目内事件提取就绪的章节事件，供 Agent 工具与配置草拟使用。"""
+    project_id = getattr(project, "id", None)
+    if not project_id:
+        return []
+    statement = (
+        select(NovelChapter)
+        .where(
+            NovelChapter.project_id == project_id,
+            NovelChapter.event_state == 1,
+        )
+        .order_by(NovelChapter.chapter_index, NovelChapter.id)
+    )
+    result = await session.exec(statement)
+    return [
+        {
+            "chapterIndex": int(chapter.chapter_index or 0),
+            "chapterTitle": chapter.chapter,
+            "reel": chapter.reel,
+            "event": chapter.event.strip(),
+        }
+        for chapter in result.all()
+        if str(chapter.event or "").strip()
+    ]
+
+
+def _chapter_index_bounds(chapter_events: list[dict[str, Any]]) -> tuple[int, int] | None:
+    indexes = [int(event.get("chapterIndex", 0) or 0) for event in chapter_events]
+    indexes = [index for index in indexes if index > 0]
+    if not indexes:
+        return None
+    return min(indexes), max(indexes)
 
 
 async def _load_chat_project(
@@ -478,6 +1278,10 @@ async def _build_chat_context(
     *,
     model_id: str,
     state: ScreenwritingSessionState,
+    agent_message: str,
+    chapter_events: list[dict[str, Any]],
+    chapter_index_range: tuple[int, int] | None,
+    stage_plan: StageGenerationPlan | None = None,
     server_timings: ScreenwritingServerTimings,
     agent_factory: ScreenwritingAgentFactory | None,
 ) -> ScreenwritingChatContext:
@@ -490,17 +1294,52 @@ async def _build_chat_context(
         project,
         project_public_id,
         current_user_public_id,
-        payload.message,
+        agent_message,
     )
     server_timings.mark("rag", rag_started_at)
     agent_setup_started_at = perf_counter()
-    tools = build_rag_tools(rag_preparation.context)
-    system_prompt = build_system_prompt_with_rag(build_guide_system_prompt(active_tab), rag_preparation.context)
-    agent = (agent_factory or _default_agent_factory)(
-        model_id=model_id,
-        system_prompt=system_prompt,
-        tools=tools,
+    tools = build_screenwriting_agent_tools(
+        rag_preparation.context,
+        state,
+        chapter_events,
+        chapter_index_range,
     )
+    resolved_factory = agent_factory or _default_agent_factory
+    stage_agent_builder: Callable[[str], HarnessAgent] | None = None
+    if stage_plan is not None:
+        rag_text = rag_preparation.context.text
+
+        def _build_stage_agent(stage_message: str) -> HarnessAgent:
+            # 阶段子 Agent 为纯文本生成：数据已注入提示词，不绑定工具，
+            # 避免模型发起工具调用导致流式通道零文本产出。
+            return resolved_factory(
+                model_id=model_id,
+                system_prompt=build_stage_system_prompt(
+                    stage_plan.stage,
+                    state,
+                    stage_message=stage_message,
+                    rag_text=rag_text,
+                    chapter_events=chapter_events,
+                ),
+                tools=[],
+            )
+
+        stage_agent_builder = _build_stage_agent
+        agent = stage_agent_builder(stage_plan.stage_message)
+        agent_messages = [{"role": "user", "content": stage_plan.stage_message}]
+    else:
+        base_prompt = build_guide_system_prompt(
+            active_tab,
+            project_config_block=format_project_config(ensure_project_config(state, chapter_index_range)),
+            workspace_overview=_workspace_overview(state),
+        )
+        system_prompt = build_system_prompt_with_rag(base_prompt, rag_preparation.context)
+        agent_messages = _agent_messages(state, agent_message)
+        agent = resolved_factory(
+            model_id=model_id,
+            system_prompt=system_prompt,
+            tools=tools,
+        )
     server_timings.mark("agentSetup", agent_setup_started_at)
     return ScreenwritingChatContext(
         project_public_id=project_public_id,
@@ -509,7 +1348,7 @@ async def _build_chat_context(
         isolation_key=isolation_key,
         model_id=model_id,
         active_tab=active_tab,
-        messages=_agent_messages(state, payload),
+        messages=agent_messages,
         payload=payload,
         rag_context=rag_preparation.context,
         rag_document_count=rag_preparation.document_count,
@@ -519,7 +1358,28 @@ async def _build_chat_context(
         db_session=session,
         project=project,
         session_state=state,
+        stage_plan=stage_plan,
+        chapter_events=chapter_events,
+        stage_agent_builder=stage_agent_builder,
     )
+
+
+def _workspace_overview(state: ScreenwritingSessionState) -> str:
+    """生成三阶段工作区概览（标题与字数），全文由 get_workspace 工具按需读取。"""
+    labels = (("故事骨架", state.workspace.skeleton), ("改编策略", state.workspace.strategy), ("剧本草案", state.workspace.script))
+    lines = []
+    for label, content in labels:
+        text = content.strip()
+        if not text:
+            lines.append(f"- {label}：（空）")
+            continue
+        heading = next(
+            (line.lstrip("#").strip() for line in text.splitlines() if line.strip().startswith("#")),
+            "",
+        )
+        summary = f"约{len(text)}字" + (f"，标题「{heading}」" if heading else "")
+        lines.append(f"- {label}：{summary}")
+    return "\n".join(lines)
 
 
 def _default_agent_factory(
@@ -537,14 +1397,14 @@ def _default_agent_factory(
     return HarnessAgent(runtime=runtime)
 
 
-def _agent_messages(state: ScreenwritingSessionState, payload: ScreenwritingChatPayload) -> list[dict[str, str]]:
+def _agent_messages(state: ScreenwritingSessionState, agent_message: str) -> list[dict[str, str]]:
     """从服务端会话状态构造 Agent 输入消息（截取最近若干轮 + 本轮输入）。"""
     messages = [
         {"role": turn.role, "content": turn.content}
         for turn in state.messages[-MAX_HISTORY_MESSAGES:]
         if turn.content.strip()
     ]
-    messages.append({"role": "user", "content": payload.message.strip()})
+    messages.append({"role": "user", "content": agent_message.strip()})
     return messages
 
 

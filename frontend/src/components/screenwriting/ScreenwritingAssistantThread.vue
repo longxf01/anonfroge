@@ -20,6 +20,35 @@
       >
         <div class="assistant-bubble">
           <div
+            v-if="message.actions?.length"
+            class="assistant-process"
+            :class="{ 'is-collapsed': isProcessCollapsed(message) }"
+          >
+            <button
+              type="button"
+              class="assistant-process__toggle"
+              :aria-expanded="!isProcessCollapsed(message)"
+              @click="toggleProcess(message)"
+            >
+              <el-icon class="assistant-process__toggle-icon"><CaretBottom /></el-icon>
+              <span class="assistant-process__latest">{{ latestActionMessage(message) }}</span>
+              <span class="assistant-process__count">{{ message.actions.length }} 步</span>
+            </button>
+            <ul
+              v-show="!isProcessCollapsed(message)"
+              class="assistant-process__list"
+              aria-label="执行过程"
+            >
+              <li v-for="(action, index) in message.actions" :key="index">
+                <div class="assistant-process__row">
+                  <code>{{ action.phase }}</code>
+                  <span>{{ action.message }}</span>
+                </div>
+                <p v-if="action.detail" class="assistant-process__detail">{{ action.detail }}</p>
+              </li>
+            </ul>
+          </div>
+          <div
             v-if="isAssistantThinking(message)"
             class="assistant-thinking"
             aria-label="AI 正在思考"
@@ -217,6 +246,28 @@ const toggleAssistantDiagnostics = (message: ChatMessage) => {
     nextIds.add(message.id)
   }
   collapsedDiagnosticsMessageIds.value = nextIds
+}
+
+// 执行过程面板默认折叠，展开状态按消息 id 记录。
+const expandedProcessMessageIds = ref<Set<number>>(new Set())
+
+const isProcessCollapsed = (message: ChatMessage) => (
+  !expandedProcessMessageIds.value.has(message.id)
+)
+
+const toggleProcess = (message: ChatMessage) => {
+  const nextIds = new Set(expandedProcessMessageIds.value)
+  if (nextIds.has(message.id)) {
+    nextIds.delete(message.id)
+  } else {
+    nextIds.add(message.id)
+  }
+  expandedProcessMessageIds.value = nextIds
+}
+
+const latestActionMessage = (message: ChatMessage) => {
+  const actions = message.actions ?? []
+  return actions[actions.length - 1]?.message ?? '执行过程'
 }
 
 const isServerTimingStage = (
@@ -828,5 +879,104 @@ defineExpose({
     transform: translateY(-4px);
     opacity: 1;
   }
+}
+
+.assistant-process {
+  margin-bottom: 8px;
+  border: 1px solid rgba(96, 165, 250, 0.18);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.55);
+  overflow: hidden;
+}
+
+.assistant-process__toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: none;
+  background: transparent;
+  color: #9fb3c8;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.assistant-process__toggle:hover {
+  color: #dbeafe;
+  background: rgba(37, 99, 235, 0.1);
+}
+
+.assistant-process__toggle-icon {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: #60a5fa;
+  transition: transform 0.18s ease;
+}
+
+.assistant-process.is-collapsed .assistant-process__toggle-icon {
+  transform: rotate(-90deg);
+}
+
+.assistant-process__latest {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #c3d4e6;
+}
+
+.assistant-process__count {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(96, 165, 250, 0.24);
+  color: #93c5fd;
+  font-size: 11px;
+}
+
+.assistant-process__list {
+  margin: 0;
+  padding: 4px 10px 8px;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+  border-top: 1px solid rgba(148, 163, 184, 0.1);
+}
+
+.assistant-process__row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.assistant-process__row code {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: rgba(37, 99, 235, 0.14);
+  color: #93c5fd;
+  font-size: 11px;
+}
+
+.assistant-process__row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #cbd5e1;
+  font-size: 12px;
+}
+
+.assistant-process__detail {
+  margin: 2px 0 0;
+  padding-left: 2px;
+  color: #8b949e;
+  font-size: 11px;
+  line-height: 1.5;
+  word-break: break-word;
 }
 </style>

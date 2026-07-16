@@ -79,8 +79,13 @@ class ProviderModelGateway:
             stream = getattr(provider, "generate_stream", None)
             if callable(stream):
                 if self.timeout > 0:
-                    async with asyncio.timeout(self.timeout):
+                    # 流式调用采用"块间空闲超时"：每收到一个增量就重置计时。
+                    # 只要模型持续产出就不会被总时长掐断——长剧本单集生成
+                    # （上下文随已成集增长）整体耗时可远超单次超时阈值。
+                    loop = asyncio.get_running_loop()
+                    async with asyncio.timeout(self.timeout) as stream_timeout:
                         async for chunk in stream(model_id=model_id, messages=messages, **kwargs):
+                            stream_timeout.reschedule(loop.time() + self.timeout)
                             text = str(chunk or "")
                             if text:
                                 yield text
@@ -100,7 +105,9 @@ class ProviderModelGateway:
             )
             yield self._extract_text(raw_output)
         except TimeoutError as exc:
-            raise ProviderModelGatewayError(f"模型调用超时：{self.timeout}秒") from exc
+            raise ProviderModelGatewayError(
+                f"模型流式响应空闲超时：连续 {self.timeout} 秒未收到增量"
+            ) from exc
         except ProviderModelGatewayError:
             raise
         except Exception as exc:

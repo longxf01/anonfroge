@@ -144,6 +144,7 @@ class Settings(object):
     visual_style_root: str = field(default_factory=lambda: os.getenv("VISUAL_STYLE_ROOT", "./data/skills/art_list"))  # 视觉风格资源根目录
     director_manual_root: str = field(default_factory=lambda: os.getenv("DIRECTOR_MANUAL_ROOT", "./data/skills/director_manual"))  # 导演手册资源根目录
     skills_root: str = field(default_factory=lambda: os.getenv("SKILLS_ROOT", "./data/skills"))  # 技能文档根目录
+    script_prompts_root: str = field(default_factory=lambda: os.getenv("SCRIPT_PROMPTS_ROOT", "./data/script"))  # 剧本创作工具提示词根目录（供 web 端可视化编辑）
     chapter_event_extraction_prompt_name: str = field( default_factory=lambda: os.getenv("CHAPTER_EVENT_EXTRACTION_PROMPT_NAME", "chapter_event_extraction") )  # 章节事件提取提示词名称
     novel_crawl_http_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("NOVEL_CRAWL_HTTP_TIMEOUT_SECONDS", "20.0")))  # 小说爬虫 HTTP 总超时秒数
     novel_crawl_http_connect_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("NOVEL_CRAWL_HTTP_CONNECT_TIMEOUT_SECONDS", "10.0")))  # 小说爬虫 HTTP 连接超时秒数
@@ -206,3 +207,9 @@ def skills_root_path(config: Settings | None = None) -> Path:
     """返回技能文档根目录。"""
     current = config or settings
     return project_path(current.skills_root)
+
+
+def script_prompts_root_path(config: Settings | None = None) -> Path:
+    """返回剧本创作工具提示词根目录。"""
+    current = config or settings
+    return project_path(current.script_prompts_root)

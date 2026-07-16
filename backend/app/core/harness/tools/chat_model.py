@@ -86,6 +86,7 @@ class ProviderGatewayChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
         request_kwargs = self._request_kwargs(stop=stop, kwargs=kwargs)
+        produced = False
         async for chunk in self.adapter.generate_stream(
             messages=self._convert_messages(messages),
             model_id=self.model_id,
@@ -93,7 +94,20 @@ class ProviderGatewayChatModel(BaseChatModel):
             input_values=self.input_values,
             **request_kwargs,
         ):
+            produced = True
             yield ChatGenerationChunk(message=AIMessageChunk(content=chunk))
+        if not produced:
+            # 流式通道零产出（如模型整轮只输出工具调用增量、网关只透传文本）时，
+            # 回退非流式调用，避免 LangChain 抛 "No generations found in stream"。
+            result = await self._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
+            message = result.generations[0].message
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content=message.content,
+                    additional_kwargs=dict(message.additional_kwargs),
+                    response_metadata=dict(message.response_metadata),
+                )
+            )
 
     def _generate(
         self,

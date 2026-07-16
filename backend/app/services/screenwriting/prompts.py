@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from app.schemas.screenwriting import ScreenwritingActiveTab
 from app.services.prompt_registry import PromptRegistry, PromptRegistryError
+from app.services.screenwriting.tool_prompts import (
+    GUIDE_RUNTIME_CONTRACT_PROMPT,
+    load_script_prompt,
+)
 
 
 GUIDE_ASSISTANT_PROMPT_NAME = "screenwriting_guide_assistant"
@@ -27,15 +31,21 @@ def load_guide_assistant_prompt(registry: PromptRegistry | None = None) -> str:
         return FALLBACK_GUIDE_ASSISTANT_PROMPT
 
 
-def build_guide_system_prompt(active_tab: ScreenwritingActiveTab) -> str:
-    """构建单次 Harness 对话的系统提示词。"""
+def build_guide_system_prompt(
+    active_tab: ScreenwritingActiveTab,
+    *,
+    project_config_block: str = "",
+    workspace_overview: str = "",
+) -> str:
+    """构建单次 Harness 对话的系统提示词，附带创作配置与工作区运行时上下文。"""
     active_label = ACTIVE_TAB_LABELS.get(active_tab, "故事骨架")
-    return (
-        f"{load_guide_assistant_prompt()}\n\n"
-        f"当前右侧活动阶段：{active_label}（{active_tab}）。\n"
-        "当前能力边界：本轮支持多轮对话、上下文延续和系统提供的项目资料检索上下文；"
-        "阶段工作流切换、CrewAI 角色团队和右侧工作区写入会在后续阶段接入。\n"
-        "回答要求：使用简体中文，直接回应用户问题；如果本轮提供了项目资料检索上下文，"
-        "必须优先依据其中的章节资料、人物信息或技能资料作答；资料不足时说明缺口，"
-        "不要编造小说章节事件。"
-    )
+    sections = [
+        load_guide_assistant_prompt(),
+        f"当前右侧活动阶段：{active_label}（{active_tab}）。",
+    ]
+    if project_config_block.strip():
+        sections.append(f"## 当前创作配置\n{project_config_block.strip()}")
+    if workspace_overview.strip():
+        sections.append(f"## 工作区概览\n{workspace_overview.strip()}")
+    sections.append(load_script_prompt(GUIDE_RUNTIME_CONTRACT_PROMPT))
+    return "\n\n".join(sections)

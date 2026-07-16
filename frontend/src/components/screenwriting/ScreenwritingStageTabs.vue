@@ -39,6 +39,24 @@
                   <el-icon><EditPen /></el-icon>
                   &nbsp;{{ workspaceContent(tab.name) ? '编辑' : '手动撰写' }}
                 </el-button>
+                <el-button
+                  class="tab-action tab-action--ghost"
+                  :loading="assessingTab === tab.name"
+                  :disabled="!workspaceContent(tab.name) || (!!assessingTab && assessingTab !== tab.name)"
+                  @click="emit('assess', tab.name)"
+                >
+                  <el-icon v-if="assessingTab !== tab.name"><DataAnalysis /></el-icon>
+                  &nbsp;{{ assessmentReadyTab === tab.name ? '查看评估' : '评估' }}
+                </el-button>
+                <el-button
+                  v-if="tab.name === 'script' && scriptEpisodeCards.length"
+                  class="tab-action tab-action--ghost"
+                  :loading="syncing"
+                  @click="emit('sync-script')"
+                >
+                  <el-icon v-if="!syncing"><FolderChecked /></el-icon>
+                  &nbsp;同步到剧本管理
+                </el-button>
                 <el-button class="tab-action" type="primary" @click="emit('start', tab)">
                   <el-icon><MagicStick /></el-icon>
                   &nbsp;{{ tab.action }}
@@ -47,7 +65,11 @@
             </div>
           </div>
 
-          <div class="tab-panel__body" :class="{ 'tab-panel__body--filled': editingTab === tab.name || workspaceContent(tab.name) }">
+          <div
+            :ref="(el) => setBodyRef(tab.name, el)"
+            class="tab-panel__body"
+            :class="{ 'tab-panel__body--filled': editingTab === tab.name || workspaceContent(tab.name) }"
+          >
             <el-input
               v-if="editingTab === tab.name"
               v-model="draftContent"
@@ -55,8 +77,95 @@
               type="textarea"
               :autosize="false"
               resize="none"
-              :placeholder="`在此撰写${tab.label}内容，支持 Markdown 格式`"
+              :placeholder="editingEpisode ? `编辑 EP${formatEpisodeNo(editingEpisode.episodeNo)} 剧本正文，支持 Markdown 格式` : `在此撰写${tab.label}内容，支持 Markdown 格式`"
             />
+            <div
+              v-else-if="tab.name === 'script' && scriptEpisodeCards.length"
+              class="script-episode-board"
+            >
+              <article
+                v-for="episode in scriptEpisodeCards"
+                :key="episode.key"
+                class="script-episode-card"
+                :class="{ 'is-expanded': expandedEpisodeKey === episode.key }"
+              >
+                <header class="script-episode-card__header">
+                  <button
+                    type="button"
+                    class="script-episode-card__summary"
+                    @click="toggleEpisode(episode.key)"
+                  >
+                    <span class="script-episode-badge">EP{{ formatEpisodeNo(episode.episodeNo) }}</span>
+                    <strong class="script-episode-card__title">{{ episode.title }}</strong>
+                  </button>
+                  <div class="script-episode-card__actions">
+                    <button
+                      type="button"
+                      class="script-episode-icon-btn"
+                      :title="`编辑 EP${formatEpisodeNo(episode.episodeNo)}`"
+                      :disabled="saving"
+                      @click.stop="startEditEpisode(episode)"
+                    >
+                      <el-icon><EditPen /></el-icon>
+                    </button>
+                    <button
+                      type="button"
+                      class="script-episode-icon-btn is-danger"
+                      :title="`删除 EP${formatEpisodeNo(episode.episodeNo)}`"
+                      :disabled="saving"
+                      @click.stop="deleteEpisode(episode)"
+                    >
+                      <el-icon><Delete /></el-icon>
+                    </button>
+                    <button
+                      type="button"
+                      class="script-episode-expand"
+                      :aria-expanded="expandedEpisodeKey === episode.key"
+                      @click.stop="toggleEpisode(episode.key)"
+                    >
+                      <span>{{ expandedEpisodeKey === episode.key ? '收起' : '展开' }}</span>
+                      <el-icon><CaretBottom /></el-icon>
+                    </button>
+                  </div>
+                </header>
+
+                <p
+                  v-if="expandedEpisodeKey !== episode.key && episode.summary"
+                  class="script-episode-card__summary-copy"
+                  @click="toggleEpisode(episode.key)"
+                >
+                  {{ episode.summary }}
+                </p>
+
+                <div v-if="episode.meta.length" class="script-episode-card__meta">
+                  <span v-for="item in episode.meta" :key="item">{{ item }}</span>
+                </div>
+
+                <div v-if="expandedEpisodeKey === episode.key" class="script-episode-card__body">
+                  <p v-if="episode.synopsis" class="script-episode-synopsis">{{ episode.synopsis }}</p>
+                  <div class="script-scene-list">
+                    <section
+                      v-for="scene in episode.scenes"
+                      :key="scene.key"
+                      class="script-scene"
+                    >
+                      <div class="script-scene__head">
+                        <span>{{ scene.number }}</span>
+                        <strong>{{ scene.title }}</strong>
+                        <em v-if="scene.duration" class="script-scene__duration">{{ scene.duration }}</em>
+                      </div>
+                      <p v-if="scene.people" class="script-scene__people">人物：{{ scene.people }}</p>
+                      <template v-for="(line, lineIndex) in scene.lines">
+                        <p v-if="line.type === 'action'" :key="`action-${lineIndex}`" class="script-scene__action">{{ line.text }}</p>
+                        <p v-else-if="line.type === 'dialogue'" :key="`dialogue-${lineIndex}`" class="script-scene__dialogue">{{ line.text }}</p>
+                        <span v-else-if="line.type === 'transition'" :key="`transition-${lineIndex}`" class="script-scene__transition">{{ line.text }}</span>
+                        <p v-else :key="`text-${lineIndex}`" class="script-scene__text">{{ line.text }}</p>
+                      </template>
+                    </section>
+                  </div>
+                </div>
+              </article>
+            </div>
             <MdPreview
               v-else-if="workspaceContent(tab.name)"
               :id="`screenwriting-workspace-${tab.name}`"
@@ -79,27 +188,41 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { EditPen, MagicStick } from '@element-plus/icons-vue'
+import { computed, nextTick, ref, watch } from 'vue'
+import type { ComponentPublicInstance } from 'vue'
+import { ElMessageBox } from 'element-plus'
+import { CaretBottom, DataAnalysis, Delete, EditPen, FolderChecked, MagicStick } from '@element-plus/icons-vue'
 import { MdPreview } from 'md-editor-v3'
 import type { ScreenwritingActiveTab, ScreenwritingWorkspace } from '@/api/screenwriting'
-import type { ScreenwritingTab } from './types'
+import type { ScreenwritingTab, ScriptEpisodeCard } from './types'
+import {
+  parseScriptEpisodes,
+  removeScriptEpisode,
+  replaceScriptEpisode,
+} from '@/utils/screenwritingScript'
 
 const props = defineProps<{
   activeTab: ScreenwritingActiveTab
   tabs: ScreenwritingTab[]
   workspace: ScreenwritingWorkspace
   saving?: boolean
+  assessingTab?: ScreenwritingActiveTab | ''
+  assessmentReadyTab?: ScreenwritingActiveTab | ''
+  syncing?: boolean
 }>()
 
 const emit = defineEmits<{
   'update:activeTab': [value: ScreenwritingActiveTab]
   start: [tab: ScreenwritingTab]
   save: [tab: ScreenwritingActiveTab, content: string]
+  assess: [tab: ScreenwritingActiveTab]
+  'sync-script': []
 }>()
 
 const editingTab = ref<ScreenwritingActiveTab | null>(null)
 const draftContent = ref('')
+const editingEpisode = ref<ScriptEpisodeCard | null>(null)
+const expandedEpisodeKey = ref('')
 
 const tabValue = computed({
   get: () => props.activeTab,
@@ -108,23 +231,91 @@ const tabValue = computed({
 
 const workspaceContent = (tab: ScreenwritingActiveTab) => props.workspace[tab] ?? ''
 
+const scriptEpisodeCards = computed<ScriptEpisodeCard[]>(() => parseScriptEpisodes(props.workspace.script))
+
+// 全文变化（含流式追加）后清理失效的展开 key（key 含字符偏移）。
+watch(scriptEpisodeCards, (episodes) => {
+  if (expandedEpisodeKey.value && !episodes.some((episode) => episode.key === expandedEpisodeKey.value)) {
+    expandedEpisodeKey.value = ''
+  }
+})
+
+const formatEpisodeNo = (episodeNo: number) => String(episodeNo).padStart(2, '0')
+
+const toggleEpisode = (episodeKey: string) => {
+  expandedEpisodeKey.value = expandedEpisodeKey.value === episodeKey ? '' : episodeKey
+}
+
 const startEdit = (tab: ScreenwritingActiveTab) => {
   editingTab.value = tab
+  editingEpisode.value = null
   draftContent.value = workspaceContent(tab)
+}
+
+const startEditEpisode = (episode: ScriptEpisodeCard) => {
+  editingTab.value = 'script'
+  editingEpisode.value = episode
+  expandedEpisodeKey.value = episode.key
+  draftContent.value = props.workspace.script.replace(/\r\n/g, '\n').trim().slice(episode.start, episode.end).trim()
 }
 
 const cancelEdit = () => {
   editingTab.value = null
+  editingEpisode.value = null
   draftContent.value = ''
 }
 
 const saveEdit = (tab: ScreenwritingActiveTab) => {
+  if (tab === 'script' && editingEpisode.value) {
+    emit('save', 'script', replaceScriptEpisode(props.workspace.script, editingEpisode.value, draftContent.value))
+    return
+  }
   emit('save', tab, draftContent.value)
+}
+
+const deleteEpisode = async (episode: ScriptEpisodeCard) => {
+  try {
+    await ElMessageBox.confirm(
+      `确定删除 EP${formatEpisodeNo(episode.episodeNo)}「${episode.title}」吗？删除后会同步保存到剧本工作区。`,
+      '删除分集剧本',
+      {
+        confirmButtonText: '删除',
+        cancelButtonText: '取消',
+        type: 'warning',
+        customClass: 'settings-dark-messagebox',
+        confirmButtonClass: 'el-button--danger',
+      },
+    )
+  } catch {
+    return
+  }
+  emit('save', 'script', removeScriptEpisode(props.workspace.script, episode))
+}
+
+const bodyRefs = new Map<string, HTMLElement>()
+
+const setBodyRef = (tab: ScreenwritingActiveTab, el: Element | ComponentPublicInstance | null) => {
+  if (el instanceof HTMLElement) {
+    bodyRefs.set(tab, el)
+  } else {
+    bodyRefs.delete(tab)
+  }
+}
+
+const scrollTabToBottom = (tab: ScreenwritingActiveTab) => {
+  nextTick(() => {
+    const el = bodyRefs.get(tab)
+    if (el) {
+      el.scrollTop = el.scrollHeight
+    }
+  })
 }
 
 defineExpose({
   /** 保存成功后由父组件调用以退出编辑态。 */
   finishEdit: cancelEdit,
+  /** 流式写入工作区时由父组件调用以跟随滚动。 */
+  scrollTabToBottom,
 })
 </script>
 
@@ -364,5 +555,262 @@ defineExpose({
     overflow: visible;
     min-height: 520px;
   }
+}
+</style>
+
+<style scoped>
+/* 剧本分集折叠列表：单列堆叠，每集一个折叠框，与前两阶段的整页 Markdown 预览区分。 */
+.script-episode-board {
+  display: grid;
+  grid-template-columns: 1fr;
+  align-items: start;
+  align-content: start;
+  gap: 12px;
+  padding: 2px;
+}
+
+.script-episode-card {
+  min-width: 0;
+  align-self: start;
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  background: rgba(8, 12, 18, 0.46);
+}
+
+.script-episode-card.is-expanded {
+  border-color: rgba(96, 165, 250, 0.26);
+  background: rgba(12, 18, 28, 0.72);
+}
+
+.script-episode-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.script-episode-card__summary {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.script-episode-badge {
+  flex: 0 0 auto;
+  min-width: 54px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  color: #dbeafe;
+  background: rgba(37, 99, 235, 0.16);
+  font-weight: 800;
+  font-size: 12px;
+  font-family: "JetBrains Mono", Consolas, monospace;
+}
+
+.script-episode-card__title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #e6edf3;
+  font-size: 13px;
+}
+
+.script-episode-card__actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.script-episode-icon-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  color: #9fb3c8;
+  background: rgba(255, 255, 255, 0.03);
+  cursor: pointer;
+}
+
+.script-episode-icon-btn:hover:not(:disabled) {
+  color: #dbeafe;
+  border-color: rgba(96, 165, 250, 0.38);
+  background: rgba(37, 99, 235, 0.14);
+}
+
+.script-episode-icon-btn:disabled {
+  color: #4d5560;
+  cursor: not-allowed;
+}
+
+.script-episode-icon-btn.is-danger {
+  color: #fca5a5;
+  border-color: rgba(248, 113, 113, 0.2);
+  background: rgba(127, 29, 29, 0.12);
+}
+
+.script-episode-icon-btn.is-danger:hover:not(:disabled) {
+  color: #fecaca;
+  border-color: rgba(248, 113, 113, 0.38);
+  background: rgba(153, 27, 27, 0.28);
+}
+
+.script-episode-expand {
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  color: #9fb3c8;
+  background: transparent;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.script-episode-expand:hover {
+  color: #dbeafe;
+  border-color: rgba(96, 165, 250, 0.38);
+}
+
+.script-episode-card.is-expanded .script-episode-expand .el-icon {
+  transform: rotate(180deg);
+}
+
+.script-episode-card__summary-copy {
+  margin: 0;
+  color: #8b949e;
+  font-size: 12px;
+  line-height: 1.65;
+  cursor: pointer;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.script-episode-card__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.script-episode-card__meta span {
+  padding: 2px 10px;
+  border-radius: 999px;
+  color: #93c5fd;
+  background: rgba(37, 99, 235, 0.12);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.script-episode-card__body {
+  display: grid;
+  gap: 10px;
+}
+
+.script-episode-synopsis {
+  margin: 0;
+  color: #dbeafe;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.script-scene-list {
+  display: grid;
+  gap: 8px;
+}
+
+.script-scene {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.script-scene__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.script-scene__head span {
+  flex: 0 0 auto;
+  color: #60a5fa;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.script-scene__head strong {
+  min-width: 0;
+  color: #e6edf3;
+  font-size: 12px;
+}
+
+.script-scene__people {
+  margin: 0;
+  color: #8b949e;
+  font-size: 11px;
+}
+
+.script-scene__action {
+  margin: 0;
+  color: #cbd5e1;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.script-scene__dialogue {
+  margin: 0;
+  color: #e5e7eb;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.script-scene__text {
+  margin: 0;
+  color: #9fb3c8;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.script-scene__duration {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: #93c5fd;
+  font-style: normal;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.script-scene__transition {
+  justify-self: start;
+  color: #fbbf24;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 11px;
+  font-weight: 800;
 }
 </style>

@@ -418,6 +418,32 @@ async def commit_chat_turns(
     return state
 
 
+async def commit_stage_output(
+    session: AsyncSession,
+    project: Any,
+    state: ScreenwritingSessionState,
+    *,
+    stage: str,
+    content: str,
+    user_content: str,
+    assistant_content: str,
+) -> ScreenwritingSessionState:
+    """把阶段生成产出写入工作区，连同本轮对话一并持久化。
+
+    调用方必须已持有会话锁；活动选项卡切换为产出阶段。
+    """
+    tab = normalize_active_tab(stage)
+    state.workspace = replace(state.workspace, **{tab: str(content or "").strip()})
+    return await commit_chat_turns(
+        session,
+        project,
+        state,
+        user_content=user_content,
+        assistant_content=assistant_content,
+        active_tab=tab,
+    )
+
+
 # ---------------------------------------------------------------------------
 # 持久化与序列化
 # ---------------------------------------------------------------------------
