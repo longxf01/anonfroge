@@ -25,11 +25,42 @@ export interface ScreenwritingChatTurn {
 
 export interface ScreenwritingChatPayload {
   message: string
-  conversationId: string
   activeTab: ScreenwritingActiveTab
-  messages: ScreenwritingChatTurn[]
   reset?: boolean
   clientRequestStartedAtMs?: number
+}
+
+export interface ScreenwritingWorkspace {
+  skeleton: string
+  strategy: string
+  script: string
+}
+
+export interface ScreenwritingHistoryEntry {
+  id: string
+  title: string
+  createdAt: string
+  activeTab: ScreenwritingActiveTab
+  workspace: ScreenwritingWorkspace
+  messages: ScreenwritingChatTurn[]
+}
+
+export interface ScreenwritingState {
+  projectPublicId: string
+  isolationKey: string
+  conversationId: string
+  modelId: string
+  activeTab: ScreenwritingActiveTab
+  workspace: ScreenwritingWorkspace
+  messages: ScreenwritingChatTurn[]
+  history: ScreenwritingHistoryEntry[]
+  workflow: Record<string, unknown>
+  updatedAt: string
+}
+
+export interface ScreenwritingWorkspaceUpdatePayload {
+  activeTab: ScreenwritingActiveTab
+  content: string
 }
 
 export type ScreenwritingRagWarmupApiStatus = 'started' | 'running' | 'ready'
@@ -131,6 +162,51 @@ export const warmupScreenwritingRagIndexApi = (
 ) => (
   request.post<ScreenwritingRagWarmupResponse>(
     `${projectScreenwritingPath(projectPublicId)}/rag/warmup`,
+  )
+)
+
+export const getScreenwritingStateApi = (
+  projectPublicId: string,
+) => (
+  request.get<ScreenwritingState>(
+    `${projectScreenwritingPath(projectPublicId)}/state`,
+  )
+)
+
+export const resetScreenwritingStateApi = (
+  projectPublicId: string,
+) => (
+  request.post<ScreenwritingState>(
+    `${projectScreenwritingPath(projectPublicId)}/state/reset`,
+  )
+)
+
+export const restoreScreenwritingHistoryApi = (
+  projectPublicId: string,
+  historyId: string,
+) => (
+  request.post<ScreenwritingState>(
+    `${projectScreenwritingPath(projectPublicId)}/history/restore`,
+    { historyId },
+  )
+)
+
+export const deleteScreenwritingHistoryApi = (
+  projectPublicId: string,
+  historyId: string,
+) => (
+  request.delete<ScreenwritingState>(
+    `${projectScreenwritingPath(projectPublicId)}/history/${encodeURIComponent(historyId)}`,
+  )
+)
+
+export const updateScreenwritingWorkspaceApi = (
+  projectPublicId: string,
+  payload: ScreenwritingWorkspaceUpdatePayload,
+) => (
+  request.put<ScreenwritingState>(
+    `${projectScreenwritingPath(projectPublicId)}/workspace`,
+    payload,
   )
 )
 

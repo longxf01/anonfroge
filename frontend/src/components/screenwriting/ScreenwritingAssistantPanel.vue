@@ -49,6 +49,7 @@
         @update:model-value="emit('update:modelValue', $event)"
         @send="emit('send')"
         @new-conversation="emit('new-conversation')"
+        @open-history="emit('open-history')"
         @insert-stage-prompt="emit('insert-stage-prompt')"
         @quote-events="emit('quote-events')"
         @clear-composer="emit('clear-composer')"
@@ -91,6 +92,7 @@ const emit = defineEmits<{
   'update:modelValue': [value: string]
   send: []
   'new-conversation': []
+  'open-history': []
   'insert-stage-prompt': []
   'quote-events': []
   'clear-composer': []

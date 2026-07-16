@@ -2,15 +2,11 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from datetime import datetime
 from time import perf_counter, time
 from typing import Any
-from uuid import uuid4
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.core.config import settings
 from app.core.harness import HarnessAgent, ScriptAgentEvent, ScriptAgentInput
 from app.core.harness.runtime.deepagents import DeepAgentsRuntime
 from app.core.harness.tools.adapter import ModelGatewayAdapter
@@ -18,11 +14,14 @@ from app.schemas.screenwriting import (
     ScreenwritingActiveTab,
     ScreenwritingChatPayload,
     ScreenwritingChatResponse,
-    ScreenwritingChatTurn,
     ScreenwritingRagWarmupResponse,
     ScreenwritingStreamEvent,
 )
 from app.services import project as project_service
+from app.services.screenwriting.errors import (
+    ScreenwritingServiceError,
+    ScreenwritingValidationError,
+)
 from app.services.screenwriting.prompts import build_guide_system_prompt
 from app.services.screenwriting.query_intent import normalize_lookup_text
 from app.services.screenwriting.rag_index import ScreenwritingRagContext
@@ -33,17 +32,23 @@ from app.services.screenwriting.rag_runtime import (
     rag_runtime_payload,
     schedule_rag_index_warmup,
 )
+from app.services.screenwriting.state import (
+    ScreenwritingSessionState,
+    acquire_session_lock,
+    commit_chat_turns,
+    load_chat_session_state,
+)
 
 
 MAX_HISTORY_MESSAGES = 40
 
-
-class ScreenwritingServiceError(Exception):
-    """剧本创作服务层基础异常。"""
-
-
-class ScreenwritingValidationError(ScreenwritingServiceError):
-    """剧本创作请求不合法。"""
+__all__ = [
+    "ScreenwritingServiceError",
+    "ScreenwritingValidationError",
+    "chat_screenwriting",
+    "build_screenwriting_chat_stream",
+    "warmup_screenwriting_rag_index",
+]
 
 
 ScreenwritingAgentFactory = Callable[..., HarnessAgent]
@@ -105,6 +110,9 @@ class ScreenwritingChatContext:
     thinking_started_at: float
     server_timings: ScreenwritingServerTimings
     agent: HarnessAgent
+    db_session: AsyncSession
+    project: Any
+    session_state: ScreenwritingSessionState
 
     def agent_input(self) -> ScriptAgentInput:
         """转换为 Harness Agent 单次调用输入。"""
@@ -134,67 +142,85 @@ async def chat_screenwriting(
     """执行一次剧本创作多轮对话，并返回聚合响应。"""
     context: ScreenwritingChatContext | None = None
     status = "error"
-    try:
-        context = await _prepare_chat_context(
-            session,
-            project_public_id,
-            current_user_public_id,
-            payload,
-            agent_factory=agent_factory,
-        )
-        direct_answer_started_at = perf_counter()
-        direct_answer = _metadata_direct_answer(context)
-        if direct_answer:
-            context.server_timings.mark("directAnswer", direct_answer_started_at)
+    lock = await acquire_session_lock(project_public_id, current_user_public_id)
+    async with lock:
+        try:
+            context = await _prepare_chat_context(
+                session,
+                project_public_id,
+                current_user_public_id,
+                payload,
+                agent_factory=agent_factory,
+            )
+            direct_answer_started_at = perf_counter()
+            direct_answer = _metadata_direct_answer(context)
+            if direct_answer:
+                context.server_timings.mark("directAnswer", direct_answer_started_at)
+                state = await commit_chat_turns(
+                    session,
+                    context.project,
+                    context.session_state,
+                    user_content=payload.message,
+                    assistant_content=direct_answer,
+                    active_tab=payload.active_tab,
+                )
+                response = ScreenwritingChatResponse(
+                    conversation_id=context.conversation_id,
+                    isolation_key=context.isolation_key,
+                    model_id=context.model_id,
+                    active_tab=context.active_tab,
+                    content=direct_answer,
+                    messages=list(state.messages),
+                    runtime={
+                        "agent": "metadata_direct",
+                        "conversation": "multi_turn",
+                        "rag": rag_runtime_payload(context.rag_context, document_count=context.rag_document_count),
+                        "directAnswer": True,
+                        "thinkingElapsedMs": _thinking_elapsed_ms(context),
+                        "serverTimings": context.server_timings.payload(),
+                    },
+                )
+                status = "completed"
+                return response
+
+            agent_run_started_at = perf_counter()
+            try:
+                result = await context.agent.run_chat(context.agent_input())
+            finally:
+                context.server_timings.mark("agentRun", agent_run_started_at)
+            content = result.content.strip()
+            if not content:
+                status = "empty_response"
+                raise ScreenwritingServiceError("模型未返回可用对话内容")
+
+            state = await commit_chat_turns(
+                session,
+                context.project,
+                context.session_state,
+                user_content=payload.message,
+                assistant_content=content,
+                active_tab=payload.active_tab,
+            )
             response = ScreenwritingChatResponse(
                 conversation_id=context.conversation_id,
                 isolation_key=context.isolation_key,
                 model_id=context.model_id,
                 active_tab=context.active_tab,
-                content=direct_answer,
-                messages=_response_messages(payload, direct_answer),
+                content=content,
+                messages=list(state.messages),
                 runtime={
-                    "agent": "metadata_direct",
+                    "agent": "harness",
                     "conversation": "multi_turn",
                     "rag": rag_runtime_payload(context.rag_context, document_count=context.rag_document_count),
-                    "directAnswer": True,
                     "thinkingElapsedMs": _thinking_elapsed_ms(context),
                     "serverTimings": context.server_timings.payload(),
                 },
             )
             status = "completed"
             return response
-
-        agent_run_started_at = perf_counter()
-        try:
-            result = await context.agent.run_chat(context.agent_input())
         finally:
-            context.server_timings.mark("agentRun", agent_run_started_at)
-        content = result.content.strip()
-        if not content:
-            status = "empty_response"
-            raise ScreenwritingServiceError("模型未返回可用对话内容")
-
-        response = ScreenwritingChatResponse(
-            conversation_id=context.conversation_id,
-            isolation_key=context.isolation_key,
-            model_id=context.model_id,
-            active_tab=context.active_tab,
-            content=content,
-            messages=_response_messages(payload, content),
-            runtime={
-                "agent": "harness",
-                "conversation": "multi_turn",
-                "rag": rag_runtime_payload(context.rag_context, document_count=context.rag_document_count),
-                "thinkingElapsedMs": _thinking_elapsed_ms(context),
-                "serverTimings": context.server_timings.payload(),
-            },
-        )
-        status = "completed"
-        return response
-    finally:
-        if context is not None:
-            _print_server_timing_log(context, operation="chat", status=status)
+            if context is not None:
+                _print_server_timing_log(context, operation="chat", status=status)
 
 
 async def build_screenwriting_chat_stream(
@@ -209,16 +235,15 @@ async def build_screenwriting_chat_stream(
 
     本函数是异步生成器：首个 start(preparing) 事件在项目加载与 RAG 准备
     开始前即发出，保证客户端立即获得服务端反馈；准备阶段的任何异常都
-    转换为 error 事件而不是 HTTP 异常。
+    转换为 error 事件而不是 HTTP 异常。整个生成期间持有会话锁，使同一
+    会话的流式对话串行执行。
     """
     server_timings = ScreenwritingServerTimings.start(payload.client_request_started_at_ms)
-    conversation_id = _resolve_conversation_id(payload)
-    isolation_key = _build_isolation_key(project_public_id, current_user_public_id, conversation_id)
     yield ScreenwritingStreamEvent(
         type="start",
         content="",
-        conversation_id=conversation_id,
-        isolation_key=isolation_key,
+        conversation_id="",
+        isolation_key="",
         model_id="",
         active_tab=payload.active_tab,
         data={
@@ -227,43 +252,51 @@ async def build_screenwriting_chat_stream(
             "serverTimings": server_timings.payload(),
         },
     )
-    try:
-        project, model_id = await _load_chat_project(
-            session,
-            project_public_id,
-            current_user_public_id,
-            server_timings,
-        )
-        context = await _build_chat_context(
-            session,
-            project,
-            project_public_id,
-            current_user_public_id,
-            payload,
-            model_id=model_id,
-            conversation_id=conversation_id,
-            isolation_key=isolation_key,
-            server_timings=server_timings,
-            agent_factory=agent_factory,
-        )
-    except Exception as exc:
-        yield ScreenwritingStreamEvent(
-            type="error",
-            content="",
-            conversation_id=conversation_id,
-            isolation_key=isolation_key,
-            model_id="",
-            active_tab=payload.active_tab,
-            data={
-                "detail": _exception_detail(exc),
-                "errorType": exc.__class__.__name__,
-                "thinkingElapsedMs": _elapsed_ms_since(server_timings.started_at),
-                "serverTimings": server_timings.payload(),
-            },
-        )
-        return
-    async for event in _stream_prepared_chat(context):
-        yield event
+    lock = await acquire_session_lock(project_public_id, current_user_public_id)
+    async with lock:
+        try:
+            project, model_id = await _load_chat_project(
+                session,
+                project_public_id,
+                current_user_public_id,
+                server_timings,
+            )
+            state = await load_chat_session_state(
+                session,
+                project,
+                project_public_id,
+                current_user_public_id,
+                reset=payload.reset,
+            )
+            context = await _build_chat_context(
+                session,
+                project,
+                project_public_id,
+                current_user_public_id,
+                payload,
+                model_id=model_id,
+                state=state,
+                server_timings=server_timings,
+                agent_factory=agent_factory,
+            )
+        except Exception as exc:
+            yield ScreenwritingStreamEvent(
+                type="error",
+                content="",
+                conversation_id="",
+                isolation_key="",
+                model_id="",
+                active_tab=payload.active_tab,
+                data={
+                    "detail": _exception_detail(exc),
+                    "errorType": exc.__class__.__name__,
+                    "thinkingElapsedMs": _elapsed_ms_since(server_timings.started_at),
+                    "serverTimings": server_timings.payload(),
+                },
+            )
+            return
+        async for event in _stream_prepared_chat(context):
+            yield event
 
 
 async def warmup_screenwriting_rag_index(
@@ -299,6 +332,14 @@ async def _stream_prepared_chat(context: ScreenwritingChatContext) -> AsyncItera
         if direct_answer:
             context.server_timings.mark("directAnswer", direct_answer_started_at)
             status = "completed"
+            state = await commit_chat_turns(
+                context.db_session,
+                context.project,
+                context.session_state,
+                user_content=context.payload.message,
+                assistant_content=direct_answer,
+                active_tab=context.payload.active_tab,
+            )
             yield _stream_event(
                 context,
                 "done",
@@ -306,10 +347,7 @@ async def _stream_prepared_chat(context: ScreenwritingChatContext) -> AsyncItera
                 data={
                     "directAnswer": True,
                     "assistantMessage": direct_answer,
-                    "messages": [
-                        message.model_dump(by_alias=True, mode="json")
-                        for message in _response_messages(context.payload, direct_answer)
-                    ],
+                    "messages": _state_message_payload(state),
                 },
             )
             return
@@ -357,16 +395,21 @@ async def _stream_prepared_chat(context: ScreenwritingChatContext) -> AsyncItera
             return
 
         status = "completed"
+        state = await commit_chat_turns(
+            context.db_session,
+            context.project,
+            context.session_state,
+            user_content=context.payload.message,
+            assistant_content=final_content,
+            active_tab=context.payload.active_tab,
+        )
         yield _stream_event(
             context,
             "done",
             content=final_content,
             data={
                 "assistantMessage": final_content,
-                "messages": [
-                    message.model_dump(by_alias=True, mode="json")
-                    for message in _response_messages(context.payload, final_content)
-                ],
+                "messages": _state_message_payload(state),
             },
         )
     finally:
@@ -382,6 +425,7 @@ async def _prepare_chat_context(
     *,
     agent_factory: ScreenwritingAgentFactory | None,
 ) -> ScreenwritingChatContext:
+    """准备聚合对话上下文；调用方必须已持有会话锁。"""
     server_timings = ScreenwritingServerTimings.start(payload.client_request_started_at_ms)
     project, model_id = await _load_chat_project(
         session,
@@ -389,8 +433,13 @@ async def _prepare_chat_context(
         current_user_public_id,
         server_timings,
     )
-    conversation_id = _resolve_conversation_id(payload)
-    isolation_key = _build_isolation_key(project_public_id, current_user_public_id, conversation_id)
+    state = await load_chat_session_state(
+        session,
+        project,
+        project_public_id,
+        current_user_public_id,
+        reset=payload.reset,
+    )
     return await _build_chat_context(
         session,
         project,
@@ -398,8 +447,7 @@ async def _prepare_chat_context(
         current_user_public_id,
         payload,
         model_id=model_id,
-        conversation_id=conversation_id,
-        isolation_key=isolation_key,
+        state=state,
         server_timings=server_timings,
         agent_factory=agent_factory,
     )
@@ -429,12 +477,13 @@ async def _build_chat_context(
     payload: ScreenwritingChatPayload,
     *,
     model_id: str,
-    conversation_id: str,
-    isolation_key: str,
+    state: ScreenwritingSessionState,
     server_timings: ScreenwritingServerTimings,
     agent_factory: ScreenwritingAgentFactory | None,
 ) -> ScreenwritingChatContext:
     active_tab = payload.active_tab
+    conversation_id = state.conversation_id
+    isolation_key = _build_isolation_key(project_public_id, current_user_public_id, conversation_id)
     rag_started_at = perf_counter()
     rag_preparation = await prepare_rag_context(
         session,
@@ -460,13 +509,16 @@ async def _build_chat_context(
         isolation_key=isolation_key,
         model_id=model_id,
         active_tab=active_tab,
-        messages=_agent_messages(payload),
+        messages=_agent_messages(state, payload),
         payload=payload,
         rag_context=rag_preparation.context,
         rag_document_count=rag_preparation.document_count,
         thinking_started_at=server_timings.started_at,
         server_timings=server_timings,
         agent=agent,
+        db_session=session,
+        project=project,
+        session_state=state,
     )
 
 
@@ -485,22 +537,19 @@ def _default_agent_factory(
     return HarnessAgent(runtime=runtime)
 
 
-def _agent_messages(payload: ScreenwritingChatPayload) -> list[dict[str, str]]:
+def _agent_messages(state: ScreenwritingSessionState, payload: ScreenwritingChatPayload) -> list[dict[str, str]]:
+    """从服务端会话状态构造 Agent 输入消息（截取最近若干轮 + 本轮输入）。"""
     messages = [
-        {"role": message.role, "content": message.content}
-        for message in payload.messages[-MAX_HISTORY_MESSAGES:]
-        if message.content.strip()
+        {"role": turn.role, "content": turn.content}
+        for turn in state.messages[-MAX_HISTORY_MESSAGES:]
+        if turn.content.strip()
     ]
     messages.append({"role": "user", "content": payload.message.strip()})
     return messages
 
 
-def _response_messages(payload: ScreenwritingChatPayload, assistant_content: str) -> list[ScreenwritingChatTurn]:
-    return [
-        *payload.messages[-MAX_HISTORY_MESSAGES:],
-        ScreenwritingChatTurn(role="user", content=payload.message, time=_format_chat_time()),
-        ScreenwritingChatTurn(role="assistant", content=assistant_content, time=_format_chat_time()),
-    ]
+def _state_message_payload(state: ScreenwritingSessionState) -> list[dict[str, str]]:
+    return [message.model_dump(by_alias=True, mode="json") for message in state.messages]
 
 
 def _metadata_direct_answer(context: ScreenwritingChatContext) -> str:
@@ -718,20 +767,5 @@ def _duration_ms(started_at: float, ended_at: float) -> int:
     return max(0, int((ended_at - started_at) * 1000))
 
 
-def _resolve_conversation_id(payload: ScreenwritingChatPayload) -> str:
-    if payload.reset or not payload.conversation_id:
-        return uuid4().hex
-    return payload.conversation_id
-
-
 def _build_isolation_key(project_public_id: str, user_public_id: str, conversation_id: str) -> str:
     return f"screenwriting:{project_public_id}:{user_public_id}:{conversation_id}"
-
-
-def _format_chat_time(now: datetime | None = None) -> str:
-    try:
-        tz = ZoneInfo(settings.tz)
-    except ZoneInfoNotFoundError:
-        tz = None
-    current = now or datetime.now(tz)
-    return current.strftime("%H:%M")

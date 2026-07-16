@@ -13,14 +13,60 @@
               <h3>{{ tab.label }}</h3>
               <p>{{ tab.desc }}</p>
             </div>
-            <el-button class="tab-action" type="primary" @click="emit('start', tab)">
-              <el-icon><MagicStick /></el-icon>
-              &nbsp;{{ tab.action }}
-            </el-button>
+            <div class="tab-panel__actions">
+              <template v-if="editingTab === tab.name">
+                <el-button
+                  class="tab-action tab-action--ghost"
+                  :disabled="saving"
+                  @click="cancelEdit"
+                >
+                  取消
+                </el-button>
+                <el-button
+                  class="tab-action"
+                  type="primary"
+                  :loading="saving"
+                  @click="saveEdit(tab.name)"
+                >
+                  保存
+                </el-button>
+              </template>
+              <template v-else>
+                <el-button
+                  class="tab-action tab-action--ghost"
+                  @click="startEdit(tab.name)"
+                >
+                  <el-icon><EditPen /></el-icon>
+                  &nbsp;{{ workspaceContent(tab.name) ? '编辑' : '手动撰写' }}
+                </el-button>
+                <el-button class="tab-action" type="primary" @click="emit('start', tab)">
+                  <el-icon><MagicStick /></el-icon>
+                  &nbsp;{{ tab.action }}
+                </el-button>
+              </template>
+            </div>
           </div>
 
-          <div class="tab-panel__body">
-            <div class="tab-empty">
+          <div class="tab-panel__body" :class="{ 'tab-panel__body--filled': editingTab === tab.name || workspaceContent(tab.name) }">
+            <el-input
+              v-if="editingTab === tab.name"
+              v-model="draftContent"
+              class="tab-editor"
+              type="textarea"
+              :autosize="false"
+              resize="none"
+              :placeholder="`在此撰写${tab.label}内容，支持 Markdown 格式`"
+            />
+            <MdPreview
+              v-else-if="workspaceContent(tab.name)"
+              :id="`screenwriting-workspace-${tab.name}`"
+              class="workspace-markdown-preview"
+              :model-value="workspaceContent(tab.name)"
+              theme="dark"
+              preview-theme="github"
+              code-theme="github"
+            />
+            <div v-else class="tab-empty">
               <el-icon class="tab-empty__icon"><component :is="tab.icon" /></el-icon>
               <strong>{{ tab.title }}</strong>
               <p>{{ tab.hint }}</p>
@@ -33,24 +79,52 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
-import { MagicStick } from '@element-plus/icons-vue'
-import type { ScreenwritingActiveTab } from '@/api/screenwriting'
+import { computed, ref } from 'vue'
+import { EditPen, MagicStick } from '@element-plus/icons-vue'
+import { MdPreview } from 'md-editor-v3'
+import type { ScreenwritingActiveTab, ScreenwritingWorkspace } from '@/api/screenwriting'
 import type { ScreenwritingTab } from './types'
 
 const props = defineProps<{
   activeTab: ScreenwritingActiveTab
   tabs: ScreenwritingTab[]
+  workspace: ScreenwritingWorkspace
+  saving?: boolean
 }>()
 
 const emit = defineEmits<{
   'update:activeTab': [value: ScreenwritingActiveTab]
   start: [tab: ScreenwritingTab]
+  save: [tab: ScreenwritingActiveTab, content: string]
 }>()
+
+const editingTab = ref<ScreenwritingActiveTab | null>(null)
+const draftContent = ref('')
 
 const tabValue = computed({
   get: () => props.activeTab,
   set: (value) => emit('update:activeTab', value as ScreenwritingActiveTab),
+})
+
+const workspaceContent = (tab: ScreenwritingActiveTab) => props.workspace[tab] ?? ''
+
+const startEdit = (tab: ScreenwritingActiveTab) => {
+  editingTab.value = tab
+  draftContent.value = workspaceContent(tab)
+}
+
+const cancelEdit = () => {
+  editingTab.value = null
+  draftContent.value = ''
+}
+
+const saveEdit = (tab: ScreenwritingActiveTab) => {
+  emit('save', tab, draftContent.value)
+}
+
+defineExpose({
+  /** 保存成功后由父组件调用以退出编辑态。 */
+  finishEdit: cancelEdit,
 })
 </script>
 
@@ -144,6 +218,13 @@ const tabValue = computed({
   line-height: 1.6;
 }
 
+.tab-panel__actions {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 0;
+}
+
 .tab-action {
   flex-shrink: 0;
   height: 36px;
@@ -167,6 +248,18 @@ const tabValue = computed({
   transform: translateY(-1px);
 }
 
+.tab-action--ghost {
+  color: #c9d1d9;
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: none;
+}
+
+.tab-action--ghost:hover,
+.tab-action--ghost:focus {
+  color: #f2f4f8;
+  background: rgba(255, 255, 255, 0.12);
+}
+
 .tab-panel__body {
   flex: 1;
   min-height: 0;
@@ -179,6 +272,11 @@ const tabValue = computed({
   scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
 }
 
+.tab-panel__body--filled {
+  border-style: solid;
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
 .tab-panel__body::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -187,6 +285,43 @@ const tabValue = computed({
 .tab-panel__body::-webkit-scrollbar-thumb {
   background-color: rgba(255, 255, 255, 0.12);
   border-radius: 999px;
+}
+
+.tab-editor {
+  flex: 1;
+  display: flex;
+}
+
+.tab-editor :deep(.el-textarea__inner) {
+  height: 100%;
+  min-height: 100%;
+  padding: 16px 18px;
+  color: #e6edf3;
+  font-size: 13.5px;
+  line-height: 1.8;
+  font-family: "JetBrains Mono", Consolas, "PingFang SC", monospace;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.workspace-markdown-preview {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+}
+
+.workspace-markdown-preview :deep(.md-editor-preview-wrapper),
+.workspace-markdown-preview :deep(.md-editor-preview) {
+  padding: 16px 18px;
+  background: transparent;
+  color: #dbe4ec;
+}
+
+.workspace-markdown-preview :deep(.md-editor-preview) {
+  font-size: 13.5px;
+  line-height: 1.85;
+  word-break: break-word;
 }
 
 .tab-empty {

@@ -12,10 +12,14 @@ from app.routers.base import BaseView, route
 from app.schemas.screenwriting import (
     ScreenwritingChatPayload,
     ScreenwritingChatResponse,
+    ScreenwritingHistoryRestorePayload,
     ScreenwritingRagWarmupResponse,
+    ScreenwritingStateResponse,
+    ScreenwritingWorkspaceUpdate,
 )
 from app.services import project as project_service
 from app.services.screenwriting import chat as screenwriting_service
+from app.services.screenwriting import state as screenwriting_state_service
 from app.services.screenwriting.stream import format_ndjson_event
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
@@ -54,6 +58,133 @@ class ScreenwritingView(BaseView):
         if isinstance(exc, screenwriting_service.ScreenwritingServiceError):
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
         raise exc
+
+    @route(
+        "/state",
+        methods=["GET"],
+        response_model=ScreenwritingStateResponse,
+        middlewares=SCREENWRITING_ROUTE_MIDDLEWARES,
+        summary="获取剧本创作会话状态",
+        description="返回当前项目与用户的剧本创作会话（对话消息、工作区与历史快照）。",
+    )
+    async def get_screenwriting_state(
+        self,
+        project_public_id: str,
+        request: Request,
+        session: SessionDep,
+    ) -> ScreenwritingStateResponse:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            return await screenwriting_state_service.get_screenwriting_state(
+                session,
+                project_public_id,
+                current_user_public_id,
+            )
+        except (project_service.ProjectServiceError, screenwriting_service.ScreenwritingServiceError) as exc:
+            self._raise_as_http(exc)
+
+    @route(
+        "/state/reset",
+        methods=["POST"],
+        response_model=ScreenwritingStateResponse,
+        middlewares=SCREENWRITING_ROUTE_MIDDLEWARES,
+        summary="重置剧本创作会话",
+        description="把当前会话归档进历史快照后开启全新对话。",
+    )
+    async def reset_screenwriting_state(
+        self,
+        project_public_id: str,
+        request: Request,
+        session: SessionDep,
+    ) -> ScreenwritingStateResponse:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            return await screenwriting_state_service.reset_screenwriting_state(
+                session,
+                project_public_id,
+                current_user_public_id,
+            )
+        except (project_service.ProjectServiceError, screenwriting_service.ScreenwritingServiceError) as exc:
+            self._raise_as_http(exc)
+
+    @route(
+        "/history/restore",
+        methods=["POST"],
+        response_model=ScreenwritingStateResponse,
+        middlewares=SCREENWRITING_ROUTE_MIDDLEWARES,
+        summary="恢复剧本创作历史快照",
+        description="把指定历史快照恢复为当前会话状态，恢复前自动归档当前状态。",
+    )
+    async def restore_screenwriting_history(
+        self,
+        project_public_id: str,
+        payload: ScreenwritingHistoryRestorePayload,
+        request: Request,
+        session: SessionDep,
+    ) -> ScreenwritingStateResponse:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            return await screenwriting_state_service.restore_screenwriting_history(
+                session,
+                project_public_id,
+                current_user_public_id,
+                payload.history_id,
+            )
+        except (project_service.ProjectServiceError, screenwriting_service.ScreenwritingServiceError) as exc:
+            self._raise_as_http(exc)
+
+    @route(
+        "/history/{history_id}",
+        methods=["DELETE"],
+        response_model=ScreenwritingStateResponse,
+        middlewares=SCREENWRITING_ROUTE_MIDDLEWARES,
+        summary="删除剧本创作历史快照",
+        description="从会话历史中删除指定快照。",
+    )
+    async def delete_screenwriting_history(
+        self,
+        project_public_id: str,
+        history_id: str,
+        request: Request,
+        session: SessionDep,
+    ) -> ScreenwritingStateResponse:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            return await screenwriting_state_service.delete_screenwriting_history(
+                session,
+                project_public_id,
+                current_user_public_id,
+                history_id,
+            )
+        except (project_service.ProjectServiceError, screenwriting_service.ScreenwritingServiceError) as exc:
+            self._raise_as_http(exc)
+
+    @route(
+        "/workspace",
+        methods=["PUT"],
+        response_model=ScreenwritingStateResponse,
+        middlewares=SCREENWRITING_ROUTE_MIDDLEWARES,
+        summary="保存剧本创作工作区内容",
+        description="手动编辑保存指定创作阶段的工作区 Markdown 内容。",
+    )
+    async def update_screenwriting_workspace(
+        self,
+        project_public_id: str,
+        payload: ScreenwritingWorkspaceUpdate,
+        request: Request,
+        session: SessionDep,
+    ) -> ScreenwritingStateResponse:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            return await screenwriting_state_service.update_screenwriting_workspace(
+                session,
+                project_public_id,
+                current_user_public_id,
+                active_tab=payload.active_tab,
+                content=payload.content,
+            )
+        except (project_service.ProjectServiceError, screenwriting_service.ScreenwritingServiceError) as exc:
+            self._raise_as_http(exc)
 
     @route(
         "/chat",

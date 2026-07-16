@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -34,21 +35,79 @@ class ScreenwritingChatTurn(BaseModel):
 
 
 class ScreenwritingChatPayload(BaseModel):
-    """剧本创作 Agent 多轮对话请求。"""
+    """剧本创作 Agent 多轮对话请求。
+
+    对话历史由服务端会话持久化承载，客户端只提交本轮输入。
+    """
 
     model_config = SCHEMA_CONFIG
 
     message: str = Field(min_length=1, max_length=4000)
-    conversation_id: str = Field(default="", max_length=120)
     active_tab: ScreenwritingActiveTab = "skeleton"
-    messages: list[ScreenwritingChatTurn] = Field(default_factory=list)
     reset: bool = False
     client_request_started_at_ms: int | None = Field(default=None, ge=0)
 
-    @field_validator("message", "conversation_id")
+    @field_validator("message")
     @classmethod
     def strip_text(cls, value: str) -> str:
         return value.strip()
+
+
+class ScreenwritingWorkspaceRead(BaseModel):
+    """剧本创作工作区快照。"""
+
+    model_config = READ_SCHEMA_CONFIG
+
+    skeleton: str = ""
+    strategy: str = ""
+    script: str = ""
+
+
+class ScreenwritingHistoryEntryRead(BaseModel):
+    """可恢复的剧本创作历史快照。"""
+
+    model_config = READ_SCHEMA_CONFIG
+
+    id: str
+    title: str
+    created_at: datetime
+    active_tab: ScreenwritingActiveTab = "skeleton"
+    workspace: ScreenwritingWorkspaceRead
+    messages: list[ScreenwritingChatTurn] = Field(default_factory=list)
+
+
+class ScreenwritingStateResponse(BaseModel):
+    """剧本创作会话状态。"""
+
+    model_config = READ_SCHEMA_CONFIG
+
+    project_public_id: str
+    isolation_key: str
+    conversation_id: str
+    model_id: str
+    active_tab: ScreenwritingActiveTab = "skeleton"
+    workspace: ScreenwritingWorkspaceRead
+    messages: list[ScreenwritingChatTurn] = Field(default_factory=list)
+    history: list[ScreenwritingHistoryEntryRead] = Field(default_factory=list)
+    workflow: dict[str, Any] = Field(default_factory=dict)
+    updated_at: datetime
+
+
+class ScreenwritingWorkspaceUpdate(BaseModel):
+    """剧本创作工作区手动编辑保存请求。"""
+
+    model_config = SCHEMA_CONFIG
+
+    active_tab: ScreenwritingActiveTab = "skeleton"
+    content: str = Field(default="", max_length=2_000_000)
+
+
+class ScreenwritingHistoryRestorePayload(BaseModel):
+    """恢复剧本创作历史快照请求。"""
+
+    model_config = SCHEMA_CONFIG
+
+    history_id: str = Field(min_length=1, max_length=80)
 
 
 class ScreenwritingChatResponse(BaseModel):

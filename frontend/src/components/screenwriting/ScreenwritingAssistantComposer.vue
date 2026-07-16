@@ -6,6 +6,11 @@
           <el-icon><Plus /></el-icon>
         </button>
       </el-tooltip>
+      <el-tooltip content="创作历史" placement="top">
+        <button type="button" class="composer-tool" aria-label="创作历史" @click="emit('open-history')">
+          <el-icon><Clock /></el-icon>
+        </button>
+      </el-tooltip>
       <el-tooltip content="插入当前阶段提示" placement="top">
         <button type="button" class="composer-tool" aria-label="插入当前阶段提示" @click="emit('insert-stage-prompt')">
           <el-icon><MagicStick /></el-icon>
@@ -66,6 +71,7 @@
 import { computed, nextTick, ref } from 'vue'
 import type { InputInstance } from 'element-plus'
 import {
+  Clock,
   Connection,
   Delete,
   MagicStick,
@@ -84,6 +90,7 @@ const emit = defineEmits<{
   'update:modelValue': [value: string]
   send: []
   'new-conversation': []
+  'open-history': []
   'insert-stage-prompt': []
   'quote-events': []
   'clear-composer': []

@@ -27,19 +27,35 @@
             :rag-warmup="ragWarmup"
             @send="sendChatMessage"
             @new-conversation="startNewConversation"
+            @open-history="historyDialogVisible = true"
             @insert-stage-prompt="insertStagePrompt"
             @quote-events="showComingSoon"
             @clear-composer="clearComposer"
           />
 
           <ScreenwritingStageTabs
+            ref="stageTabsRef"
             v-model:active-tab="activeTab"
             :tabs="screenwritingTabs"
+            :workspace="workspace"
+            :saving="isSavingWorkspace"
             @start="startWithPrompt"
+            @save="saveWorkspace"
           />
         </section>
       </section>
     </div>
+
+    <ScreenwritingHistoryDialog
+      v-model="historyDialogVisible"
+      :history-entries="historyEntries"
+      :tab-label="screenwritingTabLabel"
+      :restoring="isRestoringHistory"
+      :deleting-history-id="deletingHistoryId"
+      :busy="isSendingChat || isResettingConversation"
+      @restore="restoreHistory"
+      @delete-history="deleteHistory"
+    />
 
     <Settings v-model="settingsVisible" />
   </main>
@@ -57,18 +73,26 @@ import {
 } from '@element-plus/icons-vue'
 import {
   chatScreenwritingStreamUrl,
+  deleteScreenwritingHistoryApi,
+  getScreenwritingStateApi,
+  resetScreenwritingStateApi,
+  restoreScreenwritingHistoryApi,
+  updateScreenwritingWorkspaceApi,
   warmupScreenwritingRagIndexApi,
   type ScreenwritingActiveTab,
-  type ScreenwritingChatTurn,
+  type ScreenwritingHistoryEntry,
+  type ScreenwritingState,
   type ScreenwritingStreamEvent,
+  type ScreenwritingWorkspace,
 } from '@/api/screenwriting'
 import { fetchWithAuthRetry } from '@/request'
 import { readNdjsonStream } from '@/utils/ndjsonStream'
 import ScreenwritingAssistantPanel from '@/components/screenwriting/ScreenwritingAssistantPanel.vue'
+import ScreenwritingHistoryDialog from '@/components/screenwriting/ScreenwritingHistoryDialog.vue'
 import ScreenwritingPageHeader from '@/components/screenwriting/ScreenwritingPageHeader.vue'
 import ScreenwritingSidebar from '@/components/screenwriting/ScreenwritingSidebar.vue'
 import ScreenwritingStageTabs from '@/components/screenwriting/ScreenwritingStageTabs.vue'
-import type { ChatMessage, ScreenwritingRagWarmupViewState, ScreenwritingTab } from '@/components/screenwriting/types'
+import type { AgentActionEntry, ChatMessage, ScreenwritingRagWarmupViewState, ScreenwritingTab } from '@/components/screenwriting/types'
 import Settings from '../components/Settings.vue'
 
 interface AssistantPanelExpose {
@@ -76,6 +100,11 @@ interface AssistantPanelExpose {
   followOutput: () => Promise<void>
   resetAutoScroll: () => void
   scrollToBottom: (behavior?: ScrollBehavior) => void
+}
+
+interface StageTabsExpose {
+  finishEdit: () => void
+  scrollTabToBottom: (tab: ScreenwritingActiveTab) => void
 }
 
 const router = useRouter()
@@ -87,11 +116,19 @@ const activeTab = ref<ScreenwritingActiveTab>('skeleton')
 
 const chatInput = ref('')
 const assistantPanelRef = ref<AssistantPanelExpose | null>(null)
+const stageTabsRef = ref<StageTabsExpose | null>(null)
 const isSendingChat = ref(false)
+const isSavingWorkspace = ref(false)
+const isResettingConversation = ref(false)
 const conversationId = ref('')
 const connectedModelId = ref('')
 const streamingAssistantMessageId = ref<number | null>(null)
 const ragWarmup = ref<ScreenwritingRagWarmupViewState>({ status: 'idle', label: '' })
+const workspace = ref<ScreenwritingWorkspace>({ skeleton: '', strategy: '', script: '' })
+const historyEntries = ref<ScreenwritingHistoryEntry[]>([])
+const historyDialogVisible = ref(false)
+const isRestoringHistory = ref(false)
+const deletingHistoryId = ref('')
 let chatSeq = 2
 let chatStreamController: AbortController | null = null
 let ragWarmupPollTimer: number | null = null
@@ -158,10 +195,6 @@ const formatChatTime = (date = new Date()) =>
     hour12: false,
   })
 
-const createConversationId = () => (
-  `conv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
-)
-
 const startWithPrompt = (tab: ScreenwritingTab) => {
   chatInput.value = tab.starter
   nextTick(() => assistantPanelRef.value?.focusComposer())
@@ -177,29 +210,122 @@ const clearComposer = () => {
   nextTick(() => assistantPanelRef.value?.focusComposer())
 }
 
-const startNewConversation = () => {
-  stopChatStream()
-  assistantPanelRef.value?.resetAutoScroll()
-  chatMessages.value = [
-    {
-      id: 1,
-      role: 'assistant',
-      content: ASSISTANT_GREETING,
-      time: formatChatTime(),
-    },
-  ]
-  chatSeq = 2
-  conversationId.value = createConversationId()
-  chatInput.value = ''
-  nextTick(() => assistantPanelRef.value?.scrollToBottom('auto'))
-  ElMessage.success('已开始新的对话')
+const applyServerState = (state: ScreenwritingState) => {
+  conversationId.value = state.conversationId
+  if (state.modelId) {
+    connectedModelId.value = state.modelId
+  }
+  activeTab.value = state.activeTab
+  workspace.value = { ...state.workspace }
+  historyEntries.value = [...state.history]
+  const messages = state.messages.filter((turn) => turn.content.trim())
+  chatSeq = 1
+  chatMessages.value = messages.length
+    ? messages.map((turn) => ({
+        id: chatSeq++,
+        role: turn.role,
+        content: turn.content,
+        time: turn.time,
+      }))
+    : [
+        {
+          id: chatSeq++,
+          role: 'assistant',
+          content: ASSISTANT_GREETING,
+          time: formatChatTime(),
+        },
+      ]
 }
 
-const toChatTurn = (message: ChatMessage): ScreenwritingChatTurn => ({
-  role: message.role,
-  content: message.content,
-  time: message.time,
-})
+const loadScreenwritingState = async () => {
+  if (!projectPublicId.value) return
+  try {
+    const { data: state } = await getScreenwritingStateApi(projectPublicId.value)
+    applyServerState(state)
+    nextTick(() => assistantPanelRef.value?.scrollToBottom('auto'))
+  } catch (error) {
+    ElMessage.error(`加载创作会话失败：${getErrorMessage(error)}`)
+  }
+}
+
+const startNewConversation = async () => {
+  if (!projectPublicId.value) {
+    ElMessage.warning('项目信息尚未加载完成，请稍候再试')
+    return
+  }
+  if (isResettingConversation.value) return
+  stopChatStream()
+  isResettingConversation.value = true
+  try {
+    const { data: state } = await resetScreenwritingStateApi(projectPublicId.value)
+    assistantPanelRef.value?.resetAutoScroll()
+    applyServerState(state)
+    chatInput.value = ''
+    nextTick(() => assistantPanelRef.value?.scrollToBottom('auto'))
+    ElMessage.success('已开始新的对话')
+  } catch (error) {
+    ElMessage.error(`开始新对话失败：${getErrorMessage(error)}`)
+  } finally {
+    isResettingConversation.value = false
+  }
+}
+
+const screenwritingTabLabel = (tab: ScreenwritingActiveTab) =>
+  screenwritingTabs.find((item) => item.name === tab)?.label ?? '故事骨架'
+
+const restoreHistory = async (historyId: string) => {
+  if (!projectPublicId.value || isRestoringHistory.value) return
+  isRestoringHistory.value = true
+  try {
+    const { data: state } = await restoreScreenwritingHistoryApi(projectPublicId.value, historyId)
+    assistantPanelRef.value?.resetAutoScroll()
+    applyServerState(state)
+    historyDialogVisible.value = false
+    nextTick(() => assistantPanelRef.value?.scrollToBottom('auto'))
+    ElMessage.success('已恢复创作历史')
+  } catch (error) {
+    ElMessage.error(`恢复创作历史失败：${getErrorMessage(error)}`)
+  } finally {
+    isRestoringHistory.value = false
+  }
+}
+
+const deleteHistory = async (historyId: string) => {
+  if (!projectPublicId.value || deletingHistoryId.value) return
+  deletingHistoryId.value = historyId
+  try {
+    const { data: state } = await deleteScreenwritingHistoryApi(projectPublicId.value, historyId)
+    historyEntries.value = [...state.history]
+    ElMessage.success('已删除创作历史')
+  } catch (error) {
+    ElMessage.error(`删除创作历史失败：${getErrorMessage(error)}`)
+  } finally {
+    deletingHistoryId.value = ''
+  }
+}
+
+const saveWorkspace = async (tab: ScreenwritingActiveTab, content: string) => {
+  if (!projectPublicId.value) {
+    ElMessage.warning('项目信息尚未加载完成，请稍候再试')
+    return
+  }
+  if (isSavingWorkspace.value) return
+  isSavingWorkspace.value = true
+  try {
+    const { data: state } = await updateScreenwritingWorkspaceApi(projectPublicId.value, {
+      activeTab: tab,
+      content,
+    })
+    workspace.value = { ...state.workspace }
+    activeTab.value = state.activeTab
+    stageTabsRef.value?.finishEdit()
+    ElMessage.success('工作区内容已保存')
+  } catch (error) {
+    ElMessage.error(`保存工作区失败：${getErrorMessage(error)}`)
+  } finally {
+    isSavingWorkspace.value = false
+  }
+}
 
 const waitForAssistantRevealFrame = () => (
   new Promise<void>((resolve) => {
@@ -235,6 +361,22 @@ const readAssistantFinalContent = (event: ScreenwritingStreamEvent) => {
   return ''
 }
 
+const normalizeWorkspaceTab = (value: unknown): ScreenwritingActiveTab | null => {
+  const tab = String(value ?? '').trim()
+  return tab === 'skeleton' || tab === 'strategy' || tab === 'script'
+    ? (tab as ScreenwritingActiveTab)
+    : null
+}
+
+const readWorkspacePayload = (value: unknown): ScreenwritingWorkspace | null => {
+  if (!isRecord(value)) return null
+  return {
+    skeleton: String(value.skeleton ?? ''),
+    strategy: String(value.strategy ?? ''),
+    script: String(value.script ?? ''),
+  }
+}
+
 const sendChatMessage = async () => {
   const content = chatInput.value.trim()
   if (!content) {
@@ -253,9 +395,6 @@ const sendChatMessage = async () => {
   const thinkingStartedAt = performance.now()
   const clientRequestStartedAtMs = Date.now()
   assistantPanelRef.value?.resetAutoScroll()
-  const history = chatMessages.value
-    .map(toChatTurn)
-    .filter((message) => message.content.trim())
   chatMessages.value.push({
     id: chatSeq++,
     role: 'user',
@@ -358,10 +497,8 @@ const sendChatMessage = async () => {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        conversationId: conversationId.value,
         activeTab: activeTab.value,
         message: content,
-        messages: history,
         clientRequestStartedAtMs,
       }),
       signal: controller.signal,
@@ -395,10 +532,52 @@ const sendChatMessage = async () => {
       if (event.type === 'error') {
         throw new Error(readStreamError(event))
       }
+      if (event.type === 'agent.action') {
+        const entry: AgentActionEntry = {
+          phase: String(event.data?.phase ?? ''),
+          message: String(event.data?.message ?? ''),
+          detail: typeof event.data?.detail === 'string' ? event.data.detail : undefined,
+          targetTab: typeof event.data?.targetTab === 'string' ? event.data.targetTab : undefined,
+        }
+        if (entry.message) {
+          updateAssistantMessage((message) => {
+            message.actions = [...(message.actions ?? []), entry]
+          })
+          await assistantPanelRef.value?.followOutput()
+        }
+        return
+      }
+      if (event.type === 'workspace.delta') {
+        const targetTab = normalizeWorkspaceTab(event.data?.targetTab)
+        if (targetTab) {
+          const fullWorkspace = readWorkspacePayload(event.data?.workspace)
+          if (fullWorkspace) {
+            workspace.value = fullWorkspace
+          } else {
+            workspace.value = {
+              ...workspace.value,
+              [targetTab]: String(event.data?.workspaceContent ?? ''),
+            }
+          }
+          if (activeTab.value !== targetTab) {
+            activeTab.value = targetTab
+          }
+          stageTabsRef.value?.scrollTabToBottom(targetTab)
+        }
+        return
+      }
       if (event.type === 'message.delta' && event.content) {
         enqueueAssistantContent(event.content, 'delta')
       }
       if (event.type === 'done') {
+        const doneWorkspace = readWorkspacePayload(event.data?.workspace)
+        if (doneWorkspace) {
+          workspace.value = doneWorkspace
+        }
+        const doneStage = normalizeWorkspaceTab(event.data?.stage)
+        if (doneStage) {
+          activeTab.value = doneStage
+        }
         const finalContent = readAssistantFinalContent(event)
         if (finalContent) {
           enqueueAssistantContent(finalContent, 'final')
@@ -603,7 +782,7 @@ const warmupRagIndex = async (options: { silent?: boolean } = {}) => {
 
 onMounted(() => {
   projectPublicId.value = resolveProjectPublicId()
-  conversationId.value = createConversationId()
+  void loadScreenwritingState()
   void warmupRagIndex()
   nextTick(() => assistantPanelRef.value?.scrollToBottom('auto'))
 })
