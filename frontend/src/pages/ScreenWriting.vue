@@ -30,6 +30,12 @@
             @open-history="historyDialogVisible = true"
             @insert-stage-prompt="insertStagePrompt"
             @quote-events="showComingSoon"
+            :config-drawer-visible="configDrawerVisible"
+            :config-initial="configInitial"
+            :config-submitting="isSubmittingConfig"
+            @open-config="configDrawerVisible = true"
+            @submit-config="submitConfigDraft"
+            @update:config-drawer-visible="configDrawerVisible = $event"
             @clear-composer="clearComposer"
           />
 
@@ -39,8 +45,11 @@
             :tabs="screenwritingTabs"
             :workspace="workspace"
             :saving="isSavingWorkspace"
+            :assessing-tab="assessingTab"
+            :assessment-ready-tab="assessmentReadyTab"
             @start="startWithPrompt"
             @save="saveWorkspace"
+            @assess="assessStage"
           />
         </section>
       </section>
@@ -57,12 +66,24 @@
       @delete-history="deleteHistory"
     />
 
+    <ScreenwritingAssessmentDialog
+      v-model="assessmentDialogVisible"
+      :stage-label="screenwritingTabLabel(assessmentStage)"
+      :report="assessmentReport"
+      :scores="assessmentScores"
+      :improvement-prompt="assessmentImprovementPrompt"
+      :streaming="!!assessingTab"
+      :error="assessmentError"
+      :regenerating="isSendingChat"
+      @confirm-improve="confirmAssessmentImprove"
+    />
+
     <Settings v-model="settingsVisible" />
   </main>
 </template>
 
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import type { AxiosError } from 'axios'
@@ -72,14 +93,18 @@ import {
   Tickets,
 } from '@element-plus/icons-vue'
 import {
+  assessScreenwritingStreamUrl,
   chatScreenwritingStreamUrl,
   deleteScreenwritingHistoryApi,
   getScreenwritingStateApi,
   resetScreenwritingStateApi,
   restoreScreenwritingHistoryApi,
+  setScreenwritingConfigDraftApi,
   updateScreenwritingWorkspaceApi,
   warmupScreenwritingRagIndexApi,
   type ScreenwritingActiveTab,
+  type ScreenwritingAssessmentScores,
+  type ScreenwritingConfigDraft,
   type ScreenwritingHistoryEntry,
   type ScreenwritingState,
   type ScreenwritingStreamEvent,
@@ -87,6 +112,7 @@ import {
 } from '@/api/screenwriting'
 import { fetchWithAuthRetry } from '@/request'
 import { readNdjsonStream } from '@/utils/ndjsonStream'
+import ScreenwritingAssessmentDialog from '@/components/screenwriting/ScreenwritingAssessmentDialog.vue'
 import ScreenwritingAssistantPanel from '@/components/screenwriting/ScreenwritingAssistantPanel.vue'
 import ScreenwritingHistoryDialog from '@/components/screenwriting/ScreenwritingHistoryDialog.vue'
 import ScreenwritingPageHeader from '@/components/screenwriting/ScreenwritingPageHeader.vue'
@@ -125,6 +151,9 @@ const connectedModelId = ref('')
 const streamingAssistantMessageId = ref<number | null>(null)
 const ragWarmup = ref<ScreenwritingRagWarmupViewState>({ status: 'idle', label: '' })
 const workspace = ref<ScreenwritingWorkspace>({ skeleton: '', strategy: '', script: '' })
+const workflow = ref<Record<string, unknown>>({})
+const configDrawerVisible = ref(false)
+const isSubmittingConfig = ref(false)
 const historyEntries = ref<ScreenwritingHistoryEntry[]>([])
 const historyDialogVisible = ref(false)
 const isRestoringHistory = ref(false)
@@ -217,6 +246,7 @@ const applyServerState = (state: ScreenwritingState) => {
   }
   activeTab.value = state.activeTab
   workspace.value = { ...state.workspace }
+  workflow.value = (state.workflow ?? {}) as Record<string, unknown>
   historyEntries.value = [...state.history]
   const messages = state.messages.filter((turn) => turn.content.trim())
   chatSeq = 1
@@ -235,6 +265,69 @@ const applyServerState = (state: ScreenwritingState) => {
           time: formatChatTime(),
         },
       ]
+}
+
+const KNOWN_CONFIG_PLACEHOLDER = ['可指定', '故事骨架']
+
+// 从已存配置（草案或已锁定）解析出抽屉初值；草案占位文案不回填，避免误导。
+const parseConfigInitial = (): ScreenwritingConfigDraft => {
+  const config = (workflow.value?.projectConfig ?? {}) as Record<string, string>
+  const matchNumber = (text: string | undefined, pattern: RegExp): number | null => {
+    const matched = (text ?? '').match(pattern)
+    return matched ? Number(matched[1]) : null
+  }
+  const rangeMatch = (config.sourceRange ?? '').match(/第?\s*(\d+)\s*[-—到至]\s*(\d+)\s*章/)
+  const platform = config.platformSpec ?? ''
+  const resolvePlatform = (): string | null => {
+    if (platform.includes('可改')) return null
+    if (platform.includes('9:16') || platform.includes('竖屏')) return '9:16竖屏短剧优先'
+    if (platform.includes('16:9') || platform.includes('横屏')) return '16:9横屏'
+    return null
+  }
+  // 从项目当前配置提取风格；草案占位文案不回填，让用户自定义。
+  const styleText = config.style ?? ''
+  const style = KNOWN_CONFIG_PLACEHOLDER.some((token) => styleText.includes(token))
+    ? null
+    : (styleText || null)
+  const paywall = config.paywall ?? ''
+  return {
+    totalEpisodes: matchNumber(config.totalEpisodes, /(\d+)\s*集/),
+    episodeDuration: matchNumber(config.episodeDuration, /(\d+)\s*分钟/),
+    sourceStart: rangeMatch ? Number(rangeMatch[1]) : null,
+    sourceEnd: rangeMatch ? Number(rangeMatch[2]) : null,
+    platformSpec: resolvePlatform(),
+    style,
+    paywall: paywall && !paywall.includes('可按') ? paywall : null,
+  }
+}
+
+const configInitial = computed<ScreenwritingConfigDraft>(() => parseConfigInitial())
+
+// 仅在新建对话且配置尚未锁定时自动上拉一次，引导用户结构化设置。
+const maybeAutoOpenConfigDrawer = () => {
+  if (workflow.value?.basicInfoConfirmed === true) return
+  nextTick(() => {
+    configDrawerVisible.value = true
+  })
+}
+
+const submitConfigDraft = async (draft: ScreenwritingConfigDraft) => {
+  if (!projectPublicId.value) {
+    ElMessage.warning('项目信息尚未加载完成，请稍候再试')
+    return
+  }
+  if (isSubmittingConfig.value) return
+  isSubmittingConfig.value = true
+  try {
+    const { data: state } = await setScreenwritingConfigDraftApi(projectPublicId.value, draft)
+    applyServerState(state)
+    configDrawerVisible.value = false
+    ElMessage.success('创作配置已保存并锁定，AI 将严格遵循该配置')
+  } catch (error) {
+    ElMessage.error(`保存创作配置失败：${getErrorMessage(error)}`)
+  } finally {
+    isSubmittingConfig.value = false
+  }
 }
 
 const loadScreenwritingState = async () => {
@@ -261,6 +354,7 @@ const startNewConversation = async () => {
     assistantPanelRef.value?.resetAutoScroll()
     applyServerState(state)
     chatInput.value = ''
+    maybeAutoOpenConfigDrawer()
     nextTick(() => assistantPanelRef.value?.scrollToBottom('auto'))
     ElMessage.success('已开始新的对话')
   } catch (error) {
@@ -302,6 +396,101 @@ const deleteHistory = async (historyId: string) => {
   } finally {
     deletingHistoryId.value = ''
   }
+}
+
+const assessingTab = ref<ScreenwritingActiveTab | ''>('')
+const assessmentReadyTab = ref<ScreenwritingActiveTab | ''>('')
+const assessmentDialogVisible = ref(false)
+const assessmentStage = ref<ScreenwritingActiveTab>('skeleton')
+const assessmentReport = ref('')
+const assessmentScores = ref<ScreenwritingAssessmentScores>({})
+const assessmentImprovementPrompt = ref('')
+const assessmentError = ref('')
+let assessmentController: AbortController | null = null
+
+const assessStage = async (tab: ScreenwritingActiveTab) => {
+  if (!assessingTab.value && assessmentReadyTab.value === tab && (assessmentReport.value || assessmentError.value)) {
+    assessmentDialogVisible.value = true
+    return
+  }
+  if (assessingTab.value || !projectPublicId.value) return
+  assessmentStage.value = tab
+  assessmentReadyTab.value = ''
+  assessmentReport.value = ''
+  assessmentScores.value = {}
+  assessmentImprovementPrompt.value = ''
+  assessmentError.value = ''
+  assessingTab.value = tab
+  const controller = new AbortController()
+  assessmentController = controller
+  try {
+    const response = await fetchWithAuthRetry(assessScreenwritingStreamUrl(projectPublicId.value), {
+      method: 'POST',
+      headers: {
+        Accept: 'application/x-ndjson',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ activeTab: tab }),
+      signal: controller.signal,
+    })
+    if (!response.ok) {
+      throw new Error(await readFetchError(response))
+    }
+    if (!response.body) {
+      throw new Error('当前浏览器不支持读取评估流')
+    }
+    await readNdjsonStream<ScreenwritingStreamEvent>(response.body, async (event) => {
+      if (event.type === 'error') {
+        throw new Error(readStreamError(event))
+      }
+      if (event.type === 'message.delta' && event.content) {
+        assessmentReport.value += event.content
+      }
+      if (event.type === 'done') {
+        const report = event.data?.report
+        if (typeof report === 'string' && report.trim()) {
+          assessmentReport.value = report
+        }
+        assessmentScores.value = isRecord(event.data?.scores)
+          ? (event.data?.scores as ScreenwritingAssessmentScores)
+          : {}
+        const improvementPrompt = event.data?.improvementPrompt
+        assessmentImprovementPrompt.value = typeof improvementPrompt === 'string' ? improvementPrompt : ''
+        assessmentReadyTab.value = tab
+      }
+    })
+    if (assessmentReport.value) {
+      ElMessage.success('评估完成，可点击「查看评估」查看报告')
+    }
+  } catch (error) {
+    if (!isAbortError(error)) {
+      assessmentError.value = getErrorMessage(error)
+      assessmentReadyTab.value = tab
+      ElMessage.error(`评估失败：${assessmentError.value}`)
+    }
+  } finally {
+    if (assessmentController === controller) {
+      assessmentController = null
+    }
+    assessingTab.value = ''
+  }
+}
+
+// 关闭评估弹窗即中断评估流，避免后台继续消耗模型输出。
+watch(assessmentDialogVisible, (visible) => {
+  if (!visible) {
+    assessmentController?.abort()
+  }
+})
+
+const confirmAssessmentImprove = async (prompt: string) => {
+  if (isSendingChat.value) {
+    ElMessage.warning('当前正在生成中，请等待完成后再重新生成')
+    return
+  }
+  assessmentDialogVisible.value = false
+  chatInput.value = prompt
+  await sendChatMessage()
 }
 
 const saveWorkspace = async (tab: ScreenwritingActiveTab, content: string) => {
@@ -783,7 +972,6 @@ const warmupRagIndex = async (options: { silent?: boolean } = {}) => {
 onMounted(() => {
   projectPublicId.value = resolveProjectPublicId()
   void loadScreenwritingState()
-  void warmupRagIndex()
   nextTick(() => assistantPanelRef.value?.scrollToBottom('auto'))
 })
 

@@ -36,15 +36,25 @@ def build_guide_system_prompt(
     *,
     project_config_block: str = "",
     workspace_overview: str = "",
+    config_confirmed: bool = True,
 ) -> str:
-    """构建单次 Harness 对话的系统提示词，附带创作配置与工作区运行时上下文。"""
+    """构建单次 Harness 对话的系统提示词，附带创作配置与工作区运行时上下文。
+
+    config_confirmed 为假时创作配置仍是待确认草案，标题明确标注，避免模型把
+    草案默认值（如默认集数）当作既定配置向用户复述。
+    """
     active_label = ACTIVE_TAB_LABELS.get(active_tab, "故事骨架")
     sections = [
         load_guide_assistant_prompt(),
         f"当前右侧活动阶段：{active_label}（{active_tab}）。",
     ]
     if project_config_block.strip():
-        sections.append(f"## 当前创作配置\n{project_config_block.strip()}")
+        config_heading = (
+            "## 当前创作配置"
+            if config_confirmed
+            else "## 当前创作配置（待确认草案，最终以用户确认为准）"
+        )
+        sections.append(f"{config_heading}\n{project_config_block.strip()}")
     if workspace_overview.strip():
         sections.append(f"## 工作区概览\n{workspace_overview.strip()}")
     sections.append(load_script_prompt(GUIDE_RUNTIME_CONTRACT_PROMPT))

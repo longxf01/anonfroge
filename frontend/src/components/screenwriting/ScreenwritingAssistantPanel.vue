@@ -52,7 +52,16 @@
         @open-history="emit('open-history')"
         @insert-stage-prompt="emit('insert-stage-prompt')"
         @quote-events="emit('quote-events')"
+        @open-config="emit('open-config')"
         @clear-composer="emit('clear-composer')"
+      />
+
+      <ScreenwritingConfigDrawer
+        :model-value="configDrawerVisible"
+        :initial="configInitial"
+        :submitting="configSubmitting"
+        @update:model-value="emit('update:configDrawerVisible', $event)"
+        @submit="emit('submit-config', $event)"
       />
     </section>
   </aside>
@@ -63,7 +72,9 @@ import { ref } from 'vue'
 import ScreenwritingAssistantComposer from './ScreenwritingAssistantComposer.vue'
 import ScreenwritingAssistantHeader from './ScreenwritingAssistantHeader.vue'
 import ScreenwritingAssistantThread from './ScreenwritingAssistantThread.vue'
+import ScreenwritingConfigDrawer from './ScreenwritingConfigDrawer.vue'
 import type { ChatMessage, ScreenwritingRagWarmupViewState } from './types'
+import type { ScreenwritingConfigDraft } from '@/api/screenwriting'
 
 interface AssistantThreadExpose {
   followOutput: () => Promise<void>
@@ -83,9 +94,15 @@ withDefaults(defineProps<{
   streamingMessageId: number | null
   ragWarmup?: ScreenwritingRagWarmupViewState
   inputLimit?: number
+  configDrawerVisible?: boolean
+  configInitial?: ScreenwritingConfigDraft
+  configSubmitting?: boolean
 }>(), {
   ragWarmup: () => ({ status: 'idle', label: '' }),
   inputLimit: 2000,
+  configDrawerVisible: false,
+  configInitial: undefined,
+  configSubmitting: false,
 })
 
 const emit = defineEmits<{
@@ -95,6 +112,9 @@ const emit = defineEmits<{
   'open-history': []
   'insert-stage-prompt': []
   'quote-events': []
+  'open-config': []
+  'submit-config': [draft: ScreenwritingConfigDraft]
+  'update:configDrawerVisible': [value: boolean]
   'clear-composer': []
 }>()
 
@@ -134,6 +154,7 @@ defineExpose({
 .assistant-shell {
   min-height: 0;
   height: 100%;
+  position: relative;
   display: flex;
   flex-direction: column;
   border: 1px solid rgba(255, 255, 255, 0.08);

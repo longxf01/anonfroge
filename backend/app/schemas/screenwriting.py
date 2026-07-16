@@ -102,6 +102,24 @@ class ScreenwritingWorkspaceUpdate(BaseModel):
     content: str = Field(default="", max_length=2_000_000)
 
 
+class ScreenwritingConfigDraftPayload(BaseModel):
+    """剧本创作初始化配置草案（结构化表单提交）。
+
+    抽屉表单提交后写入草案配置但不锁定，用户仍需在对话中回复「确认」才生效。
+    所有字段可选，仅提交用户填写的项。
+    """
+
+    model_config = SCHEMA_CONFIG
+
+    total_episodes: int | None = Field(default=None, ge=1, le=999)
+    episode_duration: int | None = Field(default=None, ge=1, le=180)
+    source_start: int | None = Field(default=None, ge=1)
+    source_end: int | None = Field(default=None, ge=1)
+    platform_spec: str | None = Field(default=None, max_length=40)
+    style: str | None = Field(default=None, max_length=120)
+    paywall: str | None = Field(default=None, max_length=200)
+
+
 class ScreenwritingHistoryRestorePayload(BaseModel):
     """恢复剧本创作历史快照请求。"""
 
@@ -131,6 +149,14 @@ class ScreenwritingRagWarmupResponse(BaseModel):
 
     status: str
     rag_isolation_key: str
+
+
+class ScreenwritingAssessPayload(BaseModel):
+    """剧本创作阶段质量评估请求。"""
+
+    model_config = SCHEMA_CONFIG
+
+    active_tab: ScreenwritingActiveTab = "skeleton"
 
 
 class ScreenwritingStreamEvent(BaseModel):

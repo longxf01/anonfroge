@@ -21,6 +21,11 @@
           <el-icon><Connection /></el-icon>
         </button>
       </el-tooltip>
+      <el-tooltip content="创作配置" placement="top">
+        <button type="button" class="composer-tool" aria-label="创作配置" @click="emit('open-config')">
+          <el-icon><Setting /></el-icon>
+        </button>
+      </el-tooltip>
       <el-tooltip content="清空输入" placement="top">
         <button
           type="button"
@@ -76,6 +81,7 @@ import {
   Delete,
   MagicStick,
   Plus,
+  Setting,
 } from '@element-plus/icons-vue'
 
 const props = withDefaults(defineProps<{
@@ -93,6 +99,7 @@ const emit = defineEmits<{
   'open-history': []
   'insert-stage-prompt': []
   'quote-events': []
+  'open-config': []
   'clear-composer': []
 }>()
 

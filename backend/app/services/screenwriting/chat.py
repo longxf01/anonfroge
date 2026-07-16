@@ -16,6 +16,7 @@ from app.core.harness.tools.adapter import ModelGatewayAdapter
 from app.models.novel import NovelChapter
 from app.schemas.screenwriting import (
     ScreenwritingActiveTab,
+    ScreenwritingAssessPayload,
     ScreenwritingChatPayload,
     ScreenwritingChatResponse,
     ScreenwritingRagWarmupResponse,
@@ -23,6 +24,13 @@ from app.schemas.screenwriting import (
 )
 from app.services import project as project_service
 from app.services.screenwriting.agent_tools import build_screenwriting_agent_tools
+from app.services.screenwriting.assessment import (
+    StageAssessment,
+    load_cached_assessment,
+    save_assessment_cache,
+    stage_content_fingerprint,
+    stream_stage_assessment,
+)
 from app.services.screenwriting.errors import (
     ScreenwritingServiceError,
     ScreenwritingValidationError,
@@ -30,13 +38,16 @@ from app.services.screenwriting.errors import (
 from app.services.screenwriting.project_config import (
     ensure_project_config,
     format_project_config,
+    message_contains_project_config_hint,
     resolve_project_config_dialog,
 )
 from app.services.screenwriting.prompts import build_guide_system_prompt
-from app.services.screenwriting.query_intent import normalize_lookup_text
+from app.services.screenwriting.query_intent import normalize_lookup_text, parse_screenwriting_query_intent
 from app.services.screenwriting.rag_index import ScreenwritingRagContext
 from app.services.screenwriting.rag_runtime import (
+    ScreenwritingRagPreparation,
     build_system_prompt_with_rag,
+    empty_rag_context,
     prepare_rag_context,
     rag_runtime_payload,
     schedule_rag_index_warmup,
@@ -59,13 +70,17 @@ from app.services.screenwriting.stage_generation import (
     script_repair_confirmation_prompt,
     stage_completion_reply,
 )
-from app.services.screenwriting.constants import STAGE_SELF_REPAIR_MAX_ATTEMPTS
+from app.services.screenwriting.constants import (
+    STAGE_SELF_REPAIR_MAX_ATTEMPTS,
+    WORKFLOW_BASIC_INFO_CONFIRMED,
+)
 from app.services.screenwriting.state import (
     ScreenwritingSessionState,
     acquire_session_lock,
     commit_chat_turns,
     commit_stage_output,
     load_chat_session_state,
+    persist_session_state,
     stage_label,
 )
 
@@ -435,6 +450,124 @@ async def warmup_screenwriting_rag_index(
         status=schedule.status,
         rag_isolation_key=schedule.rag_isolation_key,
     )
+
+
+async def build_screenwriting_assessment_stream(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    payload: ScreenwritingAssessPayload,
+) -> AsyncIterator[ScreenwritingStreamEvent]:
+    """构建阶段质量评估流式事件。
+
+    评估为只读操作：不写会话状态、不持会话锁，不阻塞聊天与工作区功能；
+    准备阶段异常转换为 error 事件。
+    """
+    stage = payload.active_tab
+    conversation_id = ""
+    model_id = ""
+    try:
+        project, model_id = await _load_chat_project(
+            session,
+            project_public_id,
+            current_user_public_id,
+            ScreenwritingServerTimings.start(None),
+        )
+        state = await load_chat_session_state(
+            session,
+            project,
+            project_public_id,
+            current_user_public_id,
+        )
+        conversation_id = state.conversation_id
+        chapter_events = await _load_chapter_events(session, project)
+    except Exception as exc:
+        yield ScreenwritingStreamEvent(
+            type="error",
+            content="",
+            conversation_id=conversation_id,
+            isolation_key="",
+            model_id=model_id,
+            active_tab=stage,
+            data={"detail": _exception_detail(exc), "errorType": exc.__class__.__name__},
+        )
+        return
+
+    yield ScreenwritingStreamEvent(
+        type="start",
+        content="",
+        conversation_id=conversation_id,
+        isolation_key="",
+        model_id=model_id,
+        active_tab=stage,
+        data={"phase": "assessing", "stage": stage},
+    )
+
+    cached = load_cached_assessment(state, stage)
+    if cached is not None:
+        # 内容未变化：直接复用缓存报告，零模型调用。
+        yield ScreenwritingStreamEvent(
+            type="done",
+            content=cached.report,
+            conversation_id=conversation_id,
+            isolation_key="",
+            model_id=model_id,
+            active_tab=stage,
+            data={
+                "stage": stage,
+                "scores": dict(cached.scores),
+                "report": cached.report,
+                "improvementPrompt": cached.improvement_prompt,
+                "cached": True,
+            },
+        )
+        return
+
+    # 指纹取评估开始时刻的内容：评估期间内容被修改时，缓存自然失效。
+    assessed_fingerprint = stage_content_fingerprint(str(getattr(state.workspace, stage, "") or ""))
+    async for event in stream_stage_assessment(
+        state,
+        stage,
+        chapter_events,
+        model_id=model_id,
+    ):
+        if str(event.get("type") or "") == "done":
+            data = dict(event.get("data") or {})
+            data["cached"] = False
+            assessment = StageAssessment(
+                stage=stage,
+                report=str(data.get("report") or ""),
+                scores=dict(data.get("scores") or {}),
+                improvement_prompt=str(data.get("improvementPrompt") or ""),
+            )
+            save_assessment_cache(state, assessment, fingerprint=assessed_fingerprint)
+            # 写缓存需短暂持锁持久化；评估过程本身不持锁，不阻塞其他功能。
+            lock = await acquire_session_lock(project_public_id, current_user_public_id)
+            async with lock:
+                await persist_session_state(
+                    session,
+                    project_id=int(getattr(project, "id", 0) or 0),
+                    state=state,
+                )
+            yield ScreenwritingStreamEvent(
+                type="done",
+                content=str(event.get("content") or ""),
+                conversation_id=conversation_id,
+                isolation_key="",
+                model_id=model_id,
+                active_tab=stage,
+                data=data,
+            )
+            continue
+        yield ScreenwritingStreamEvent(
+            type=str(event.get("type") or "message.delta"),
+            content=str(event.get("content") or ""),
+            conversation_id=conversation_id,
+            isolation_key="",
+            model_id=model_id,
+            active_tab=stage,
+            data=dict(event.get("data") or ({"detail": event.get("detail")} if event.get("detail") else {})),
+        )
 
 
 async def _stream_prepared_chat(context: ScreenwritingChatContext) -> AsyncIterator[ScreenwritingStreamEvent]:
@@ -1228,6 +1361,22 @@ async def _prepare_chat_turn(
 
     agent_message = dialog.proceed_message if dialog is not None and dialog.proceed_message else payload.message
     stage_plan = resolve_stage_generation(state, agent_message)
+    if (
+        stage_plan is not None
+        and stage_plan.stage == "script"
+        and not stage_plan.repair
+        and not stage_plan.episode_numbers
+    ):
+        # 已有集绝不静默覆盖：配置范围内无缺失集时引导用户显式指定目标集。
+        return _PreparedChatTurn(
+            project=project,
+            state=state,
+            model_id=model_id,
+            config_reply=(
+                "创作配置范围内的剧本集已全部生成，本次未执行生成——已有集不会被静默覆盖。"
+                "如需重写某集，请明确指定集数，例如「重写EP2」或「重新生成第2-3集剧本」。"
+            ),
+        )
     context = await _build_chat_context(
         session,
         project,
@@ -1301,6 +1450,69 @@ async def _load_chat_project(
     return project, model_id
 
 
+_CHAPTER_RETRIEVAL_KEYWORDS: tuple[str, ...] = (
+    "章", "回", "卷", "人物", "角色", "主角", "主人公", "反派", "配角", "boss",
+    "剧情", "情节", "故事", "事件", "场景", "设定", "世界观", "背景", "关系",
+    "结局", "原著", "小说", "为什么", "为何", "怎么", "如何", "发生", "谁",
+    "经历", "冲突", "线索", "伏笔", "细节",
+)
+_BASIC_CONFIG_LOOKUP_KEYWORDS: tuple[str, ...] = (
+    "基本配置",
+    "创作配置",
+    "项目配置",
+    "剧本基本信息",
+    "配置是否完整",
+    "检查配置",
+    "确认配置",
+    "当前配置",
+    "已确认配置",
+    "集数",
+    "单集时长",
+    "原著范围",
+    "章节范围",
+    "平台规格",
+    "风格定位",
+    "付费策略",
+)
+_CONTENT_RETRIEVAL_STRONG_KEYWORDS: tuple[str, ...] = (
+    "章", "回", "卷", "人物", "角色", "主角", "主人公", "反派", "配角", "boss",
+    "剧情", "情节", "事件", "场景", "设定", "世界观", "背景", "关系",
+    "结局", "原著", "小说", "发生", "经历", "冲突", "线索", "伏笔", "细节",
+)
+_QUESTION_RETRIEVAL_KEYWORDS: tuple[str, ...] = ("为什么", "为何", "怎么", "如何", "谁")
+
+
+def _should_retrieve_chapters(stage_plan: StageGenerationPlan | None, message: str) -> bool:
+    """判断本轮是否需要章节向量检索。
+
+    阶段生成（骨架/策略/剧本）依赖原著内容，必须检索；普通对话中，设置创作配置
+    与不涉及原著内容的基本问答无需检索，仅当消息问及章节、人物、剧情等内容时才检索。
+    """
+    if stage_plan is not None:
+        return True
+    text = (message or "").strip()
+    if not text:
+        return False
+    if message_contains_project_config_hint(text):
+        return False
+    if _is_basic_config_lookup_message(text):
+        return False
+    if parse_screenwriting_query_intent(text).field_lookups:
+        return True
+    return any(keyword in text for keyword in _CONTENT_RETRIEVAL_STRONG_KEYWORDS) or (
+        any(keyword in text for keyword in _QUESTION_RETRIEVAL_KEYWORDS)
+        and any(keyword in text for keyword in _CONTENT_RETRIEVAL_STRONG_KEYWORDS)
+    )
+
+
+def _is_basic_config_lookup_message(message: str) -> bool:
+    """识别只检查项目创作配置的普通问答，不触发章节内容检索。"""
+    text = (message or "").strip()
+    if not text:
+        return False
+    return any(keyword in text for keyword in _BASIC_CONFIG_LOOKUP_KEYWORDS)
+
+
 async def _build_chat_context(
     session: AsyncSession,
     project: Any,
@@ -1313,21 +1525,25 @@ async def _build_chat_context(
     agent_message: str,
     chapter_events: list[dict[str, Any]],
     chapter_index_range: tuple[int, int] | None,
-    stage_plan: StageGenerationPlan | None = None,
     server_timings: ScreenwritingServerTimings,
     agent_factory: ScreenwritingAgentFactory | None,
+    stage_plan: StageGenerationPlan | None = None,
 ) -> ScreenwritingChatContext:
     active_tab = payload.active_tab
     conversation_id = state.conversation_id
     isolation_key = _build_isolation_key(project_public_id, current_user_public_id, conversation_id)
     rag_started_at = perf_counter()
-    rag_preparation = await prepare_rag_context(
-        session,
-        project,
-        project_public_id,
-        current_user_public_id,
-        agent_message,
-    )
+    if _should_retrieve_chapters(stage_plan, agent_message):
+        rag_preparation = await prepare_rag_context(
+            session,
+            project,
+            project_public_id,
+            current_user_public_id,
+            agent_message,
+        )
+    else:
+        # 基本问答、设置创作配置等不依赖原著内容的轮次跳过章节向量检索。
+        rag_preparation = ScreenwritingRagPreparation(context=empty_rag_context(), document_count=0)
     server_timings.mark("rag", rag_started_at)
     agent_setup_started_at = perf_counter()
     tools = build_screenwriting_agent_tools(
@@ -1372,6 +1588,7 @@ async def _build_chat_context(
             active_tab,
             project_config_block=format_project_config(ensure_project_config(state, chapter_index_range)),
             workspace_overview=_workspace_overview(state),
+            config_confirmed=state.workflow.get(WORKFLOW_BASIC_INFO_CONFIRMED) is True,
         )
         system_prompt = build_system_prompt_with_rag(base_prompt, rag_preparation.context)
         agent_messages = _agent_messages(state, agent_message)

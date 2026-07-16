@@ -63,6 +63,16 @@ export interface ScreenwritingWorkspaceUpdatePayload {
   content: string
 }
 
+export interface ScreenwritingConfigDraft {
+  totalEpisodes?: number | null
+  episodeDuration?: number | null
+  sourceStart?: number | null
+  sourceEnd?: number | null
+  platformSpec?: string | null
+  style?: string | null
+  paywall?: string | null
+}
+
 export type ScreenwritingRagWarmupApiStatus = 'started' | 'running' | 'ready'
 
 export interface ScreenwritingRagWarmupResponse {
@@ -210,6 +220,16 @@ export const updateScreenwritingWorkspaceApi = (
   )
 )
 
+export const setScreenwritingConfigDraftApi = (
+  projectPublicId: string,
+  payload: ScreenwritingConfigDraft,
+) => (
+  request.post<ScreenwritingState>(
+    `${projectScreenwritingPath(projectPublicId)}/config/draft`,
+    payload,
+  )
+)
+
 export const chatScreenwritingApi = (
   projectPublicId: string,
   payload: ScreenwritingChatPayload,
@@ -224,6 +244,14 @@ export const chatScreenwritingApi = (
 export const chatScreenwritingStreamUrl = (projectPublicId: string) => (
   `/api${projectScreenwritingPath(projectPublicId)}/chat/stream`
 )
+
+export const assessScreenwritingStreamUrl = (projectPublicId: string) => (
+  `/api${projectScreenwritingPath(projectPublicId)}/assess/stream`
+)
+
+export interface ScreenwritingAssessmentScores {
+  [dimension: string]: number
+}
 
 const projectScreenwritingPath = (projectPublicId: string) => (
   `/projects/${encodeURIComponent(projectPublicId.trim())}/novels/screenwriting`

@@ -7,22 +7,18 @@ CrewAI 是可选运行时依赖：导入失败时 ProviderGatewayCrewLLM 为 Non
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
-
-from pydantic import ConfigDict, Field as PydanticField
 
 from app.core.harness.runtime.agent import HarnessAgentError
 from app.core.harness.tools.adapter import ModelGatewayAdapter
 from app.core.harness.tools.chat_model import ProviderGatewayChatModel
 
 try:  # CrewAI 为剧本创作阶段团队的可选运行时依赖。
-    from crewai.llms.base_llm import BaseLLM as CrewAIBaseLLM, llm_call_context as crewai_llm_call_context
+    from crewai import BaseLLM as CrewAIBaseLLM
 except ImportError:  # pragma: no cover - 运行环境导入守卫。
     CrewAIBaseLLM = None  # type: ignore[assignment,misc]
-    crewai_llm_call_context = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -48,11 +44,23 @@ if CrewAIBaseLLM is not None:
         （CrewAI 任务链需要完整结果）。
         """
 
-        model_config = ConfigDict(arbitrary_types_allowed=True)
-
-        adapter: ModelGatewayAdapter = PydanticField(exclude=True)
-        stream: bool = False
-        request_options: dict[str, Any] = PydanticField(default_factory=dict)
+        def __init__(
+            self,
+            *,
+            adapter: ModelGatewayAdapter,
+            model: str,
+            stream: bool = False,
+            request_options: dict[str, Any] | None = None,
+        ) -> None:
+            options = dict(request_options or {})
+            temperature = options.get("temperature")
+            super().__init__(
+                model=model,
+                temperature=float(temperature) if temperature is not None else None,
+            )
+            self.adapter = adapter
+            self.stream = stream
+            self.request_options = options
 
         async def acall(
             self,
@@ -70,36 +78,34 @@ if CrewAIBaseLLM is not None:
                     "模型调用已失败，本轮阶段生成已停止，请确认后重新发送。"
                 ) from abort_context.error
             try:
-                call_context = crewai_llm_call_context if crewai_llm_call_context is not None else contextlib.nullcontext
-                with call_context():
-                    request_options = dict(self.request_options or {})
-                    if getattr(self, "stream", False):
-                        content_parts: list[str] = []
-                        async for chunk in self.adapter.generate_stream(
-                            model_id=self.model,
-                            messages=self._normalize_messages(messages),
-                            **request_options,
-                        ):
-                            text = str(chunk or "")
-                            if not text:
-                                continue
-                            content_parts.append(text)
-                            self._emit_stream_chunk_event(
-                                text,
-                                from_task=from_task,
-                                from_agent=from_agent,
-                            )
-                        return "".join(content_parts)
-                    raw_response = await self.adapter.generate_response(
+                request_options = dict(self.request_options)
+                if self.stream:
+                    content_parts: list[str] = []
+                    async for chunk in self.adapter.generate_stream(
                         model_id=self.model,
                         messages=self._normalize_messages(messages),
                         **request_options,
-                    )
-                    if isinstance(raw_response, str):
-                        return raw_response
-                    if isinstance(raw_response, dict):
-                        return ProviderGatewayChatModel._extract_response_content(raw_response)
-                    return str(raw_response or "")
+                    ):
+                        text = str(chunk or "")
+                        if not text:
+                            continue
+                        content_parts.append(text)
+                        self._emit_stream_chunk_event(
+                            text,
+                            from_task=from_task,
+                            from_agent=from_agent,
+                        )
+                    return "".join(content_parts)
+                raw_response = await self.adapter.generate_response(
+                    model_id=self.model,
+                    messages=self._normalize_messages(messages),
+                    **request_options,
+                )
+                if isinstance(raw_response, str):
+                    return raw_response
+                if isinstance(raw_response, dict):
+                    return ProviderGatewayChatModel._extract_response_content(raw_response)
+                return str(raw_response or "")
             except Exception as exc:
                 if abort_context is not None and abort_context.error is None:
                     abort_context.error = exc

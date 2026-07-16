@@ -17,22 +17,54 @@ from app.services.prompt_registry import PromptRegistry, PromptRegistryError
 GUIDE_RUNTIME_CONTRACT_PROMPT = "guide_runtime_contract"
 STAGE_RUNTIME_CONTRACT_PROMPT = "stage_runtime_contract"
 
+
+def _assessor_fallback(stage_label: str, dimensions: str, prompt_prefix: str) -> str:
+    return (
+        f"你是商业短剧行业的资深制片人与评估专家，负责以付费竖屏短剧标准评估{stage_label}质量。\n"
+        f"评估维度（每项 0-10 分）：{dimensions}。\n"
+        "必须基于运行时上下文提供的创作配置、配置章节事件与工作区内容评估，"
+        "每个问题给出具体证据与可执行改法。\n"
+        "输出格式：直接输出 Markdown 评估报告（不要代码栅栏、不要 JSON）——"
+        "开篇总评；`## 评分` 小节每行一个维度，格式严格为 `**维度名：X/10**`，"
+        "最后一行 `**最终综合：X/10**`；随后是优点分析、主要问题、可执行改进清单。\n"
+        "报告结束后输出单独一行 `<!--IMPROVEMENT_PROMPT-->`，其后输出改进提示词：\n"
+        f"以「{prompt_prefix}」开头，把改进清单浓缩为 200-400 字的明确执行指令；"
+        "改进提示词必须继续使用运行时上下文中的已确认创作配置，"
+        "不得自行改写集数、单集时长、原著范围、平台规格、风格定位或付费策略。"
+    )
+
+
 # 内置兜底：与 data/script/ 下同名文件保持同义，文件缺失时使用。
 SCRIPT_PROMPT_FALLBACKS: dict[str, str] = {
+    "stage_quality_assessor_skeleton": _assessor_fallback(
+        "故事骨架",
+        "原著改编忠实度、短剧商业性、用户付费驱动力、节奏效率",
+        "请重新生成故事骨架：",
+    ),
+    "stage_quality_assessor_strategy": _assessor_fallback(
+        "改编策略",
+        "骨架承接度、可执行性、商业取舍质量、风险控制",
+        "请重新生成改编策略：",
+    ),
+    "stage_quality_assessor_script": _assessor_fallback(
+        "剧本草案",
+        "场面执行力、对白质量、节奏与时长、钩子强度",
+        "请重新生成剧本草案：",
+    ),
     "get_rag_context": "读取本轮剧本创作 RAG 检索上下文。",
     "get_project_config": "读取当前创作配置（集数、单集时长、原著范围、平台规格、风格定位、付费策略）。",
-    "update_project_config": "根据用户的自然语言说明更新创作配置，返回更新后的完整配置。",
     "get_workspace": "读取三个创作阶段工作区（故事骨架、改编策略、剧本草案）的当前完整内容。",
     "get_novel_events": "按章节范围读取小说章节事件；不传范围时默认使用创作配置的原著范围。",
     GUIDE_RUNTIME_CONTRACT_PROMPT: (
-        "可用工具：get_rag_context（检索项目资料）、get_project_config / update_project_config"
-        "（读取与更新创作配置）、get_workspace（读取三阶段工作区全文）、"
-        "get_novel_events（按章节范围读取小说章节事件）。\n"
-        "当前能力边界：本轮支持多轮对话、上下文延续、项目资料检索与创作配置读写；"
+        "可用工具：get_rag_context（检索项目资料）、get_project_config（只读创作配置）、"
+        "get_workspace（读取三阶段工作区全文）、get_novel_events（按章节范围读取小说章节事件）。\n"
+        "当前能力边界：本轮支持多轮对话、上下文延续、项目资料检索与创作配置读取；"
+        "创作配置由用户确认锁定，助理只读不写，不得自行修改集数等配置；"
+        "用户要调整配置时引导其用明确句式直接说明（例如「集数调整为8集」）。"
         "阶段生成请求（故事骨架/改编策略/剧本草案）会由阶段助理直写右侧工作区。\n"
         "回答要求：使用简体中文，直接回应用户问题；如果本轮提供了项目资料检索上下文，"
-        "必须优先依据其中的章节资料、人物信息或技能资料作答；资料不足时说明缺口，"
-        "不要编造小说章节事件。"
+        "必须优先依据其中的章节资料、人物信息或技能资料作答；引用创作配置严格按 get_project_config "
+        "返回值，不要复述记忆旧值或自行更改；资料不足时说明缺口，不要编造小说章节事件。"
     ),
     STAGE_RUNTIME_CONTRACT_PROMPT: (
         "数据来源：\"已确认创作配置\"是规格参数的唯一来源；\"配置章节事件\"是原著事实的"

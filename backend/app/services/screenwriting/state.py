@@ -342,6 +342,44 @@ async def update_screenwriting_workspace(
         return to_state_response(state)
 
 
+async def set_screenwriting_config_draft(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    *,
+    fields: dict[str, Any],
+    store: ScreenwritingStateStore | None = None,
+) -> ScreenwritingStateResponse:
+    """保存结构化创作配置并立即锁定，随会话持久化。"""
+    from app.services.screenwriting.project_config import apply_config_settings
+
+    current_store = store or _STATE_STORE
+    project = await project_service.get_project_or_raise(session, project_public_id, current_user_public_id)
+    isolation_key = build_session_isolation_key(project_public_id, current_user_public_id)
+    lock = await current_store.session_lock(isolation_key)
+    async with lock:
+        state = await _load_hydrated_state(
+            session,
+            current_store,
+            project=project,
+            project_public_id=project_public_id,
+            user_public_id=current_user_public_id,
+            isolation_key=isolation_key,
+        )
+        apply_config_settings(
+            state,
+            total_episodes=fields.get("total_episodes"),
+            episode_duration=fields.get("episode_duration"),
+            source_start=fields.get("source_start"),
+            source_end=fields.get("source_end"),
+            platform_spec=fields.get("platform_spec"),
+            style=fields.get("style"),
+            paywall=fields.get("paywall"),
+        )
+        await persist_session_state(session, project_id=int(project.id or 0), state=state)
+        return to_state_response(state)
+
+
 # ---------------------------------------------------------------------------
 # chat 集成接口：在持有会话锁的前提下读取/写回对话消息
 # ---------------------------------------------------------------------------

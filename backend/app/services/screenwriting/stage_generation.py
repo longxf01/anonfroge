@@ -290,19 +290,16 @@ def _load_stage_skill_prompt(stage: str, registry: PromptRegistry | None) -> str
     skill_name = STAGE_SKILL_PROMPTS.get(stage, "")
     if skill_name:
         try:
-            skills_prompt = prompt_registry.skill(skill_name)
-            print(f"skill_name={skill_name}\n----------------------\nskills_prompt={skills_prompt}\n\n\n---------------------------------------------")
-            return skills_prompt
+            return prompt_registry.skill(skill_name)
         except PromptRegistryError:
             pass
     label = stage_label(stage)
-    default_prompt = (
+    return (
         f"你是剧本创作流程中的「{label}助理」，只负责基于已确认创作配置和小说章节事件，"
         f"生成可写入「{label}」工作区的 Markdown 正文。"
         "必须依据创作配置与章节事件创作，不得虚构原著事实。"
     )
-    print(f"当前阶段：{stage}\n-------------------\n{default_prompt}\n\n---------------------------------------------------------")
-    return default_prompt
+
 
 def format_stage_workspace_context(workspace: ScreenwritingWorkspace, stage: str) -> str:
     if stage == "skeleton":

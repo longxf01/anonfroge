@@ -10,8 +10,10 @@ from app.core.database import get_session
 from app.middlewares import common
 from app.routers.base import BaseView, route
 from app.schemas.screenwriting import (
+    ScreenwritingAssessPayload,
     ScreenwritingChatPayload,
     ScreenwritingChatResponse,
+    ScreenwritingConfigDraftPayload,
     ScreenwritingHistoryRestorePayload,
     ScreenwritingRagWarmupResponse,
     ScreenwritingStateResponse,
@@ -187,6 +189,32 @@ class ScreenwritingView(BaseView):
             self._raise_as_http(exc)
 
     @route(
+        "/config/draft",
+        methods=["POST"],
+        response_model=ScreenwritingStateResponse,
+        middlewares=SCREENWRITING_ROUTE_MIDDLEWARES,
+        summary="保存剧本创作初始化配置草案",
+        description="把结构化初始化配置写入草案（不锁定），用户仍需在对话中确认后生效。",
+    )
+    async def set_screenwriting_config_draft(
+        self,
+        project_public_id: str,
+        payload: ScreenwritingConfigDraftPayload,
+        request: Request,
+        session: SessionDep,
+    ) -> ScreenwritingStateResponse:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            return await screenwriting_state_service.set_screenwriting_config_draft(
+                session,
+                project_public_id,
+                current_user_public_id,
+                fields=payload.model_dump(),
+            )
+        except (project_service.ProjectServiceError, screenwriting_service.ScreenwritingServiceError) as exc:
+            self._raise_as_http(exc)
+
+    @route(
         "/chat",
         methods=["POST"],
         response_model=ScreenwritingChatResponse,
@@ -229,6 +257,45 @@ class ScreenwritingView(BaseView):
         current_user_public_id = self._current_user_public_id(request)
         # 异步生成器在迭代时才执行；准备阶段异常由流内 error 事件承载。
         events = screenwriting_service.build_screenwriting_chat_stream(
+            session,
+            project_public_id,
+            current_user_public_id,
+            payload,
+        )
+
+        async def render_events():
+            async for event in events:
+                if await request.is_disconnected():
+                    break
+                yield format_ndjson_event(event)
+
+        return StreamingResponse(
+            render_events(),
+            media_type="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    @route(
+        "/assess/stream",
+        methods=["POST"],
+        middlewares=SCREENWRITING_ROUTE_MIDDLEWARES,
+        summary="剧本创作阶段质量评估流",
+        description="对指定阶段工作区内容做多维质量评估与打分，以 NDJSON 流式返回评估报告。",
+    )
+    async def stream_assess_screenwriting_stage(
+        self,
+        project_public_id: str,
+        payload: ScreenwritingAssessPayload,
+        request: Request,
+        session: SessionDep,
+    ) -> StreamingResponse:
+        current_user_public_id = self._current_user_public_id(request)
+        # 评估为只读操作，不持会话锁；准备阶段异常由流内 error 事件承载。
+        events = screenwriting_service.build_screenwriting_assessment_stream(
             session,
             project_public_id,
             current_user_public_id,
