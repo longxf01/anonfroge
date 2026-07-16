@@ -8,7 +8,9 @@ from typing import Any
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from app.core.config import settings
 from app.core.harness import HarnessAgent, ScriptAgentEvent, ScriptAgentInput
+from app.core.harness.runtime.crewai import CrewAIStageRuntime
 from app.core.harness.runtime.deepagents import DeepAgentsRuntime
 from app.core.harness.tools.adapter import ModelGatewayAdapter
 from app.models.novel import NovelChapter
@@ -143,12 +145,16 @@ class ScreenwritingChatContext:
     session_state: ScreenwritingSessionState
     stage_plan: StageGenerationPlan | None = None
     chapter_events: list[dict[str, Any]] = field(default_factory=list)
-    stage_agent_builder: Callable[[str], HarnessAgent] | None = None
+    stage_agent_builder: Callable[..., HarnessAgent] | None = None
 
-    def build_stage_agent(self, stage_message: str) -> HarnessAgent:
-        """为阶段生成/修复轮构建子 Agent（系统提示词随消息重建）。"""
+    def build_stage_agent(self, stage_message: str, *, repair: bool = False) -> HarnessAgent:
+        """为阶段生成/修复轮构建子 Agent（系统提示词随消息重建）。
+
+        repair=True 表示质量校验失败后的修复轮：CrewAI 团队路径换用单员
+        修复团队，不重跑完整团队链路。
+        """
         assert self.stage_agent_builder is not None
-        return self.stage_agent_builder(stage_message)
+        return self.stage_agent_builder(stage_message, repair=repair)
 
     def stage_agent_input(self, agent: HarnessAgent, stage_message: str) -> ScriptAgentInput:
         """阶段子 Agent 的单次调用输入（不携带对话历史）。"""
@@ -611,12 +617,12 @@ async def _run_single_stage_aggregate(
     stage_message = plan.stage_message
     last_error: ScreenwritingServiceError | None = None
     for attempt in range(STAGE_SELF_REPAIR_MAX_ATTEMPTS + 1):
-        agent = context.build_stage_agent(stage_message)
+        agent = context.build_stage_agent(stage_message, repair=attempt > 0)
         try:
             result = await agent.run_chat(context.stage_agent_input(agent, stage_message))
         except Exception as exc:
             raise ScreenwritingServiceError(f"阶段生成失败：{exc}") from exc
-        content = clean_stage_output(str(result.content or ""))
+        content = clean_stage_output(_agent_result_text(result))
         try:
             warnings = ensure_stage_output_quality(
                 plan.stage,
@@ -663,12 +669,15 @@ async def _run_script_episodes_aggregate(
         last_failure = ""
         last_output = ""
         for attempt in range(STAGE_SELF_REPAIR_MAX_ATTEMPTS + 1):
-            agent = context.build_stage_agent(current_message)
+            agent = context.build_stage_agent(
+                current_message,
+                repair=plan.repair or attempt > 0,
+            )
             try:
                 result = await agent.run_chat(context.stage_agent_input(agent, current_message))
             except Exception as exc:
                 raise ScreenwritingServiceError(f"剧本生成失败：{exc}") from exc
-            content = clean_stage_output(str(result.content or ""))
+            content = clean_stage_output(_agent_result_text(result))
             last_output = content
             try:
                 _ensure_script_episode_output(content, episode_no, context, duration_minutes, quality_warnings)
@@ -824,7 +833,10 @@ async def _stream_stage_generation(context: ScreenwritingChatContext) -> AsyncIt
                 last_failure = ""
                 last_output = ""
                 for attempt in range(STAGE_SELF_REPAIR_MAX_ATTEMPTS + 1):
-                    agent = context.build_stage_agent(current_message)
+                    agent = context.build_stage_agent(
+                        current_message,
+                        repair=plan.repair or attempt > 0,
+                    )
                     attempt_content = ""
                     try:
                         async for event in agent.stream_chat(
@@ -846,6 +858,12 @@ async def _stream_stage_generation(context: ScreenwritingChatContext) -> AsyncIt
                                     content=delta,
                                     data={"targetTab": "script", "workspaceContent": preview},
                                 )
+                                continue
+                            if event.type == "structured_response":
+                                # 团队运行时在流末补发整稿；以整稿为准，避免流式过滤缺漏。
+                                final_text = str(event.content or "").strip()
+                                if final_text:
+                                    attempt_content = final_text
                                 continue
                             if event.type == "done":
                                 final_content = _agent_final_content(event)
@@ -968,7 +986,7 @@ async def _stream_stage_generation(context: ScreenwritingChatContext) -> AsyncIt
             stage_message = plan.stage_message
             stage_content = ""
             for attempt in range(STAGE_SELF_REPAIR_MAX_ATTEMPTS + 1):
-                agent = context.build_stage_agent(stage_message)
+                agent = context.build_stage_agent(stage_message, repair=attempt > 0)
                 attempt_content = ""
                 try:
                     async for event in agent.stream_chat(
@@ -985,6 +1003,12 @@ async def _stream_stage_generation(context: ScreenwritingChatContext) -> AsyncIt
                                 content=delta,
                                 data={"targetTab": plan.stage, "workspaceContent": attempt_content},
                             )
+                            continue
+                        if event.type == "structured_response":
+                            # 团队运行时在流末补发整稿；以整稿为准，避免流式过滤缺漏。
+                            final_text = str(event.content or "").strip()
+                            if final_text:
+                                attempt_content = final_text
                             continue
                         if event.type == "done":
                             final_content = _agent_final_content(event)
@@ -1123,6 +1147,14 @@ def _workspace_payload(state: ScreenwritingSessionState) -> dict[str, str]:
         "strategy": state.workspace.strategy,
         "script": state.workspace.script,
     }
+
+
+def _agent_result_text(result: Any) -> str:
+    """取聚合结果文本：团队运行时的整稿（structured_response）优先于流式拼接。"""
+    structured = getattr(result, "structured_response", None)
+    if isinstance(structured, str) and structured.strip():
+        return structured
+    return str(getattr(result, "content", "") or "")
 
 
 async def _prepare_chat_turn(
@@ -1309,18 +1341,26 @@ async def _build_chat_context(
     if stage_plan is not None:
         rag_text = rag_preparation.context.text
 
-        def _build_stage_agent(stage_message: str) -> HarnessAgent:
+        def _build_stage_agent(stage_message: str, *, repair: bool = False) -> HarnessAgent:
             # 阶段子 Agent 为纯文本生成：数据已注入提示词，不绑定工具，
             # 避免模型发起工具调用导致流式通道零文本产出。
+            system_prompt = build_stage_system_prompt(
+                stage_plan.stage,
+                state,
+                stage_message=stage_message,
+                rag_text=rag_text,
+                chapter_events=chapter_events,
+            )
+            if agent_factory is None and settings.screenwriting_stage_team_enabled:
+                return _build_stage_team_agent(
+                    model_id=model_id,
+                    system_prompt=system_prompt,
+                    stage=stage_plan.stage,
+                    repair=repair,
+                )
             return resolved_factory(
                 model_id=model_id,
-                system_prompt=build_stage_system_prompt(
-                    stage_plan.stage,
-                    state,
-                    stage_message=stage_message,
-                    rag_text=rag_text,
-                    chapter_events=chapter_events,
-                ),
+                system_prompt=system_prompt,
                 tools=[],
             )
 
@@ -1393,6 +1433,31 @@ def _default_agent_factory(
         model_id=model_id,
         tools=tools,
         system_prompt=system_prompt,
+    )
+    return HarnessAgent(runtime=runtime)
+
+
+def _build_stage_team_agent(
+    *,
+    model_id: str,
+    system_prompt: str,
+    stage: str,
+    repair: bool,
+) -> HarnessAgent:
+    """构建 CrewAI 阶段团队 Agent；修复轮换用单员修复团队，不重跑完整链路。"""
+    from app.services.screenwriting.team import (
+        screenwriting_stage_team_members,
+        stage_repair_team_members,
+    )
+
+    team_members = stage_repair_team_members(stage) if repair else screenwriting_stage_team_members(stage)
+    runtime = CrewAIStageRuntime(
+        adapter=ModelGatewayAdapter(default_model_id=model_id),
+        model_id=model_id,
+        system_prompt=system_prompt,
+        stage=stage,
+        team_members=team_members,
+        name=f"screenwriting-{stage}-agent",
     )
     return HarnessAgent(runtime=runtime)
 
@@ -1503,7 +1568,42 @@ def _normalize_agent_delta(current_content: str, incoming_content: str) -> str:
     return incoming_content
 
 
+_RUNTIME_AGENT_ACTION_EVENTS = frozenset(
+    {
+        "tool.start",
+        "tool.result",
+        "tool.end",
+        "tool.error",
+        "stage.team.plan",
+        "stage.member.progress",
+        "stage.member.complete",
+        "stage.team.complete",
+    }
+)
+
+
 def _event_from_agent_event(context: ScreenwritingChatContext, event: ScriptAgentEvent) -> ScreenwritingStreamEvent:
+    """把运行时事件转换为流式协议事件。
+
+    团队/工具类进度事件归一为 agent.action（前端执行过程面板），
+    其余事件原样透传。
+    """
+    if event.type in _RUNTIME_AGENT_ACTION_EVENTS:
+        data = event.data or {}
+        message = str(data.get("summary") or data.get("message") or event.content or "正在处理工作流").strip()
+        action_data: dict[str, Any] = {
+            "phase": event.type,
+            "message": message,
+        }
+        detail = str(data.get("goal") or data.get("detail") or "").strip()
+        if detail:
+            action_data["detail"] = detail
+        if context.stage_plan is not None:
+            action_data["targetTab"] = context.stage_plan.stage
+        agent_name = str(data.get("name") or "").strip()
+        if agent_name:
+            action_data["agentName"] = agent_name
+        return _stream_event(context, "agent.action", data=action_data)
     return _stream_event(
         context,
         event.type,

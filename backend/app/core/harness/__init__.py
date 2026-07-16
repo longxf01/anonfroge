@@ -17,8 +17,11 @@ from app.core.harness.runtime.agent import (
     ScriptAgentResult,
     ScriptAgentRuntime,
 )
+from app.core.harness.runtime.crewai import CrewAIStageRuntime, CrewAIStageTeamMember
 
 __all__ = [
+    "CrewAIStageRuntime",
+    "CrewAIStageTeamMember",
     "HarnessAgent",
     "HarnessAgentError",
     "HarnessMemoryScope",
