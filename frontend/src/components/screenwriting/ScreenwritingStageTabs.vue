@@ -48,6 +48,15 @@
                   <el-icon v-if="assessingTab !== tab.name"><DataAnalysis /></el-icon>
                   &nbsp;{{ assessmentReadyTab === tab.name ? '查看评估' : '评估' }}
                 </el-button>
+                <el-button
+                  v-if="tab.name === 'script' && scriptEpisodeCards.length"
+                  class="tab-action tab-action--ghost"
+                  :loading="syncing"
+                  @click="emit('sync-script')"
+                >
+                  <el-icon v-if="!syncing"><FolderChecked /></el-icon>
+                  &nbsp;同步到剧本管理
+                </el-button>
                 <el-button class="tab-action" type="primary" @click="emit('start', tab)">
                   <el-icon><MagicStick /></el-icon>
                   &nbsp;{{ tab.action }}
@@ -182,7 +191,7 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import type { ComponentPublicInstance } from 'vue'
 import { ElMessageBox } from 'element-plus'
-import { CaretBottom, DataAnalysis, Delete, EditPen, MagicStick } from '@element-plus/icons-vue'
+import { CaretBottom, DataAnalysis, Delete, EditPen, FolderChecked, MagicStick } from '@element-plus/icons-vue'
 import { MdPreview } from 'md-editor-v3'
 import type { ScreenwritingActiveTab, ScreenwritingWorkspace } from '@/api/screenwriting'
 import type { ScreenwritingTab, ScriptEpisodeCard } from './types'
@@ -199,6 +208,7 @@ const props = defineProps<{
   saving?: boolean
   assessingTab?: ScreenwritingActiveTab | ''
   assessmentReadyTab?: ScreenwritingActiveTab | ''
+  syncing?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -206,6 +216,7 @@ const emit = defineEmits<{
   start: [tab: ScreenwritingTab]
   save: [tab: ScreenwritingActiveTab, content: string]
   assess: [tab: ScreenwritingActiveTab]
+  'sync-script': []
 }>()
 
 const editingTab = ref<ScreenwritingActiveTab | null>(null)

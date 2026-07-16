@@ -47,9 +47,11 @@
             :saving="isSavingWorkspace"
             :assessing-tab="assessingTab"
             :assessment-ready-tab="assessmentReadyTab"
+            :syncing="isSyncingScript"
             @start="startWithPrompt"
             @save="saveWorkspace"
             @assess="assessStage"
+            @sync-script="syncToScriptManage"
           />
         </section>
       </section>
@@ -110,6 +112,7 @@ import {
   type ScreenwritingStreamEvent,
   type ScreenwritingWorkspace,
 } from '@/api/screenwriting'
+import { syncScriptPlanApi } from '@/api/script'
 import { fetchWithAuthRetry } from '@/request'
 import { readNdjsonStream } from '@/utils/ndjsonStream'
 import ScreenwritingAssessmentDialog from '@/components/screenwriting/ScreenwritingAssessmentDialog.vue'
@@ -407,6 +410,26 @@ const assessmentScores = ref<ScreenwritingAssessmentScores>({})
 const assessmentImprovementPrompt = ref('')
 const assessmentError = ref('')
 let assessmentController: AbortController | null = null
+
+const isSyncingScript = ref(false)
+
+const syncToScriptManage = async () => {
+  if (isSyncingScript.value || !projectPublicId.value) return
+  if (!workspace.value.script.trim()) {
+    ElMessage.warning('当前还没有剧本草案可同步')
+    return
+  }
+  isSyncingScript.value = true
+  try {
+    const { data } = await syncScriptPlanApi(projectPublicId.value)
+    ElMessage.success(`已同步到剧本管理：${data.episodes.length} 集`)
+    router.push({ path: '/script', query: { projectId: projectPublicId.value, planId: data.publicId } })
+  } catch (error) {
+    ElMessage.error(`同步到剧本管理失败：${getErrorMessage(error)}`)
+  } finally {
+    isSyncingScript.value = false
+  }
+}
 
 const assessStage = async (tab: ScreenwritingActiveTab) => {
   if (!assessingTab.value && assessmentReadyTab.value === tab && (assessmentReport.value || assessmentError.value)) {

@@ -168,7 +168,7 @@
                 :model-value="selectedIds.includes(script.id)"
                 class="card-checkbox"
                 @click.stop
-                @change="(value) => toggleSelect(script.id, !!value)"
+                @change="(value: unknown) => toggleSelect(script.id, !!value)"
               />
             </header>
 
@@ -222,6 +222,41 @@
     </div>
 
     <Settings v-model="settingsVisible" />
+
+    <el-dialog
+      v-model="syncedPlanDialogVisible"
+      :title="syncedPlan ? `已同步剧本 · ${syncedPlan.title}` : '已同步剧本'"
+      width="min(1100px, calc(100vw - 24px))"
+      append-to-body
+      class="settings-dark-dialog synced-plan-dialog"
+    >
+      <div v-if="syncedPlanLoading" class="synced-plan-empty">正在加载已同步剧本…</div>
+      <div v-else-if="syncedPlanError" class="synced-plan-empty">{{ syncedPlanError }}</div>
+      <div v-else-if="syncedPlan" class="synced-plan">
+        <div class="synced-plan__meta">
+          <span v-if="syncedPlan.totalEpisodes">集数：{{ syncedPlan.totalEpisodes }}</span>
+          <span v-if="syncedPlan.episodeDuration">单集时长：{{ syncedPlan.episodeDuration }}</span>
+          <span v-if="syncedPlan.platformSpec">平台：{{ syncedPlan.platformSpec }}</span>
+          <span>共 {{ syncedPlan.episodes.length }} 集</span>
+        </div>
+        <div class="synced-plan__list">
+          <article v-for="episode in syncedPlan.episodes" :key="episode.publicId" class="synced-plan__episode">
+            <header>
+              <span class="synced-plan__badge">EP{{ String(episode.episodeIndex).padStart(2, '0') }}</span>
+              <strong>{{ episode.title }}</strong>
+              <span v-if="episode.isLocked" class="synced-plan__locked">已锁定</span>
+            </header>
+            <p v-if="episode.summary" class="synced-plan__summary">{{ episode.summary }}</p>
+            <p v-if="episode.scenes.length" class="synced-plan__scenes">
+              {{ episode.scenes.length }} 个场次：{{ episode.scenes.map((scene) => scene.number).join('、') }}
+            </p>
+          </article>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="syncedPlanDialogVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog
       v-model="formDialogVisible"
@@ -576,10 +611,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, nextTick, onMounted, reactive, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
+import { getScriptPlanApi, type ScriptPlanDetail } from '@/api/script'
 import {
   CaretBottom,
   CaretTop,
@@ -627,6 +663,36 @@ interface ScriptRecord {
 }
 
 const router = useRouter()
+const route = useRoute()
+
+// 从剧本创作工作台同步跳转而来时，按 planId 加载已同步剧本只读视图。
+const syncedPlanDialogVisible = ref(false)
+const syncedPlanLoading = ref(false)
+const syncedPlanError = ref('')
+const syncedPlan = ref<ScriptPlanDetail | null>(null)
+
+const loadSyncedPlan = async (projectId: string, planId: string) => {
+  syncedPlanDialogVisible.value = true
+  syncedPlanLoading.value = true
+  syncedPlanError.value = ''
+  syncedPlan.value = null
+  try {
+    const { data } = await getScriptPlanApi(projectId, planId)
+    syncedPlan.value = data
+  } catch (error) {
+    syncedPlanError.value = error instanceof Error ? error.message : '加载已同步剧本失败'
+  } finally {
+    syncedPlanLoading.value = false
+  }
+}
+
+onMounted(() => {
+  const projectId = String(route.query.projectId ?? '').trim()
+  const planId = String(route.query.planId ?? '').trim()
+  if (projectId && planId) {
+    void loadSyncedPlan(projectId, planId)
+  }
+})
 
 const scripts = ref<ScriptRecord[]>([
   {
@@ -1563,6 +1629,82 @@ const showComingSoon = () => {
 </script>
 
 <style scoped>
+.synced-plan-empty {
+  min-height: 200px;
+  display: grid;
+  place-items: center;
+  color: #8b949e;
+  font-size: 13px;
+}
+
+.synced-plan__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.synced-plan__meta span {
+  padding: 3px 12px;
+  border-radius: 999px;
+  color: #93c5fd;
+  background: rgba(37, 99, 235, 0.12);
+  font-size: 12px;
+}
+
+.synced-plan__list {
+  max-height: min(64vh, 720px);
+  overflow: auto;
+  display: grid;
+  gap: 10px;
+}
+
+.synced-plan__episode {
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  background: rgba(8, 12, 18, 0.46);
+}
+
+.synced-plan__episode header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.synced-plan__badge {
+  padding: 2px 10px;
+  border-radius: 999px;
+  color: #dbeafe;
+  background: rgba(37, 99, 235, 0.2);
+  font-size: 12px;
+  font-weight: 800;
+  font-family: "JetBrains Mono", Consolas, monospace;
+}
+
+.synced-plan__episode header strong {
+  color: #e6edf3;
+  font-size: 14px;
+}
+
+.synced-plan__locked {
+  color: #fbbf24;
+  font-size: 11px;
+}
+
+.synced-plan__summary {
+  margin: 8px 0 4px;
+  color: #cbd5e1;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.synced-plan__scenes {
+  margin: 0;
+  color: #8b949e;
+  font-size: 12px;
+}
+
 .script-page {
   height: 100vh;
   height: 100dvh;
