@@ -242,15 +242,11 @@ class AssetImageGenerateRequest(BaseModel):
     prompt: str = Field(default="", description="可选自定义提示词；留空则由资产字段自动拼装。")
     aspect_ratio: str = Field(default="", max_length=20, description="图像比例，如 1:1 / 16:9；留空用模型默认。")
     image_size: str = Field(default="", max_length=10, description="分辨率档位 1K/2K/4K；留空用模型默认。")
+    reference_media_public_ids: list[str] = Field(
+        default_factory=list,
+        description="用于衍生资产图像编辑的参考媒体公开 ID；非空时走图片编辑接口。",
+    )
     count: int = Field(default=1, ge=1, le=4, description="每个资产生成张数。")
-
-
-class AssetImagePromptRead(BaseModel):
-    """资产生图专业提示词响应。"""
-
-    model_config = READ_SCHEMA_CONFIG
-
-    prompt: str = Field(description="可直接提交给图像模型的专业提示词。")
 
 
 AssetManageItem.model_rebuild()

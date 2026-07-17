@@ -60,10 +60,23 @@ export interface TaskItemDiagnostics {
   workerConsumerName?: string | null
   claimToCallMs?: number | null
   durationMs?: number | null
+  stageTimings?: TaskStageTimings | null
   attemptCount: number
   composedPromptLength?: number | null
   startedAt?: string | null
   finishedAt?: string | null
+}
+
+export interface TaskStageTiming {
+  name: string
+  durationMs: number
+  startedAtMs?: number
+  endedAtMs?: number
+}
+
+export interface TaskStageTimings {
+  totalMs: number
+  stages: TaskStageTiming[]
 }
 
 export interface TaskItemResponse {
@@ -74,6 +87,8 @@ export interface TaskItemResponse {
   composedPrompt?: string | null
   finalPrompt?: string | null
   outputText?: string | null
+  mediaUrl?: string | null
+  mediaPublicId?: string | null
   errorMessage?: string | null
   retryOfPublicId?: string | null
   diagnostics?: TaskItemDiagnostics | null
@@ -104,6 +119,7 @@ export interface TaskJobResponse {
   updatedAt: string
   startedAt?: string | null
   finishedAt?: string | null
+  items?: TaskItemResponse[]
 }
 
 export interface TaskJobListResponse {
@@ -388,9 +404,9 @@ const itemSeq = (item: BackendTaskItemRead) => {
   return Number.isFinite(parsed) ? parsed : item.id
 }
 
-const durationMs = (startedAt: string | null, finishedAt: string | null) => {
-  if (!startedAt || !finishedAt) return null
-  const started = new Date(startedAt).getTime()
+const durationMs = (createdAt: string | null, finishedAt: string | null) => {
+  if (!createdAt || !finishedAt) return null
+  const started = new Date(createdAt).getTime()
   const finished = new Date(finishedAt).getTime()
   if (!Number.isFinite(started) || !Number.isFinite(finished) || finished < started) return null
   return finished - started
@@ -399,6 +415,40 @@ const durationMs = (startedAt: string | null, finishedAt: string | null) => {
 const isRecord = (value: unknown): value is Record<string, unknown> => (
   Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 )
+
+const numericValue = (value: unknown) => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value !== 'string' || !value.trim()) return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+const taskStageTimings = (value: unknown): TaskStageTimings | null => {
+  if (!isRecord(value)) return null
+  const totalMs = numericValue(value.totalMs) ?? numericValue(value.total_ms)
+  const rawStages = Array.isArray(value.stages) ? value.stages : []
+  const stages = rawStages
+    .filter(isRecord)
+    .map((stage) => {
+      const duration = numericValue(stage.durationMs) ?? numericValue(stage.duration_ms)
+      const name = firstText(stage.name)
+      if (!name || duration === null) return null
+      const startedAtMs = numericValue(stage.startedAtMs) ?? numericValue(stage.started_at_ms)
+      const endedAtMs = numericValue(stage.endedAtMs) ?? numericValue(stage.ended_at_ms)
+      return {
+        name,
+        durationMs: Math.max(0, Math.round(duration)),
+        ...(startedAtMs === null ? {} : { startedAtMs: Math.max(0, Math.round(startedAtMs)) }),
+        ...(endedAtMs === null ? {} : { endedAtMs: Math.max(0, Math.round(endedAtMs)) }),
+      }
+    })
+    .filter((stage): stage is TaskStageTiming => stage !== null)
+  if (totalMs === null && stages.length === 0) return null
+  return {
+    totalMs: Math.max(0, Math.round(totalMs ?? stages.reduce((sum, stage) => sum + stage.durationMs, 0))),
+    stages,
+  }
+}
 
 const firstText = (...values: unknown[]) => {
   for (const value of values) {
@@ -424,20 +474,32 @@ const formatMessagePrompt = (messages: unknown) => {
   return parts.join('\n\n')
 }
 
-const taskItemPrompt = (item: BackendTaskItemRead) => {
+const taskItemFinalPrompt = (item: BackendTaskItemRead) => {
+  const payload = item.payload ?? {}
+  const result = item.result ?? {}
+  const explicitPrompt = firstText(
+    result.prompt,
+    result.final_prompt,
+    result.finalPrompt,
+    result.input_prompt,
+    result.inputPrompt,
+    payload.prompt,
+    payload.final_prompt,
+    payload.finalPrompt,
+    payload.input_prompt,
+    payload.inputPrompt,
+  )
+  return explicitPrompt
+}
+
+const taskItemComposedPrompt = (item: BackendTaskItemRead) => {
   const payload = item.payload ?? {}
   const result = item.result ?? {}
   const explicitPrompt = firstText(
     result.composed_prompt,
     result.composedPrompt,
-    result.prompt,
-    result.input_prompt,
-    result.inputPrompt,
     payload.composed_prompt,
     payload.composedPrompt,
-    payload.prompt,
-    payload.input_prompt,
-    payload.inputPrompt,
   )
   if (explicitPrompt) return explicitPrompt
 
@@ -471,10 +533,60 @@ const taskItemOutputText = (item: BackendTaskItemRead) => {
   return null
 }
 
+const taskItemMediaUrl = (item: BackendTaskItemRead) => {
+  const result = item.result ?? {}
+  const directUrl = firstText(
+    result.url,
+    result.media_url,
+    result.mediaUrl,
+    result.image_url,
+    result.imageUrl,
+    result.output_url,
+    result.outputUrl,
+  )
+  if (directUrl) return directUrl
+
+  if (isRecord(result.media)) {
+    const mediaUrl = firstText(result.media.url, result.media.media_url, result.media.mediaUrl)
+    if (mediaUrl) return mediaUrl
+  }
+
+  if (isRecord(result.image)) {
+    const imageUrl = firstText(result.image.url, result.image.image_url, result.image.imageUrl)
+    if (imageUrl) return imageUrl
+  }
+
+  if (Array.isArray(result.images)) {
+    for (const image of result.images) {
+      if (typeof image === 'string') {
+        const imageUrl = firstText(image)
+        if (imageUrl) return imageUrl
+      }
+      if (!isRecord(image)) continue
+      const imageUrl = firstText(image.url, image.image_url, image.imageUrl)
+      if (imageUrl) return imageUrl
+    }
+  }
+
+  return ''
+}
+
+const taskItemMediaPublicId = (item: BackendTaskItemRead) => {
+  const result = item.result ?? {}
+  return firstText(
+    result.media_public_id,
+    result.mediaPublicId,
+    result.media_id,
+    result.mediaId,
+  )
+}
+
 const toTaskItem = (item: BackendTaskItemRead, job?: BackendTaskJobRead): TaskItemResponse => {
   const status = normalizeItemStatus(item.status)
   const terminal = status === 'succeeded' || status === 'failed' || status === 'canceled'
-  const prompt = taskItemPrompt(item)
+  const finalPrompt = taskItemFinalPrompt(item)
+  const composedPrompt = taskItemComposedPrompt(item)
+  const promptLength = finalPrompt || composedPrompt
   const modelId = firstText(
     item.result?.model_id,
     item.result?.modelId,
@@ -483,14 +595,18 @@ const toTaskItem = (item: BackendTaskItemRead, job?: BackendTaskJobRead): TaskIt
     job?.payload?.model_id,
     job?.payload?.modelId,
   )
+  const stageTimings = taskStageTimings(item.result?.asset_timing ?? item.result?.assetTiming)
+  const itemDurationMs = durationMs(item.created_at, item.completed_at)
   return {
     publicId: item.public_id,
     seq: itemSeq(item),
     status,
     inputPayload: item.payload,
-    composedPrompt: prompt || null,
-    finalPrompt: prompt || null,
+    composedPrompt: composedPrompt || null,
+    finalPrompt: finalPrompt || composedPrompt || null,
     outputText: taskItemOutputText(item),
+    mediaUrl: taskItemMediaUrl(item) || null,
+    mediaPublicId: taskItemMediaPublicId(item) || null,
     errorMessage: item.error_message || null,
     retryOfPublicId: null,
     diagnostics: terminal
@@ -499,9 +615,10 @@ const toTaskItem = (item: BackendTaskItemRead, job?: BackendTaskJobRead): TaskIt
           providerKey: job?.queue_name ?? '',
           workerConsumerName: item.worker_id || null,
           claimToCallMs: null,
-          durationMs: durationMs(item.started_at, item.completed_at),
+          durationMs: itemDurationMs,
+          stageTimings,
           attemptCount: item.attempt_count,
-          composedPromptLength: prompt ? prompt.length : null,
+          composedPromptLength: promptLength ? promptLength.length : null,
           startedAt: item.started_at,
           finishedAt: item.completed_at,
         }
@@ -588,6 +705,7 @@ export const toTaskJob = (
     updatedAt: job.updated_at,
     startedAt: job.started_at,
     finishedAt: job.completed_at,
+    ...(items ? { items: items.map((item) => toTaskItem(item, job)) } : {}),
   }
 }
 

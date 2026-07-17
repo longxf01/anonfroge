@@ -1949,8 +1949,9 @@ async def set_asset_parent(
             child=asset,
             label=asset.variant_label or asset.name,
         )
-
-    asset.main_asset = parent is None
+        asset.main_asset = False
+    else:
+        asset.main_asset = True
     asset.updated_at = utc_now()
     session.add(asset)
     await session.flush()

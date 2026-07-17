@@ -45,6 +45,7 @@ export interface AssetAssociationResult {
 const projectAssetPath = (projectPublicId: string) => (
   `/projects/${encodeURIComponent(projectPublicId.trim())}/assets`
 )
+const ASSET_TASK_SUBMIT_TIMEOUT_MS = 60000
 
 // 资产抽取只提交异步任务，真正的模型调用由 Worker 执行。
 export const extractAssetsApi = (
@@ -52,7 +53,11 @@ export const extractAssetsApi = (
   payload: AssetExtractPayload,
 ) => (
   request
-    .post<BackendTaskJobDetail>(`${projectAssetPath(projectPublicId)}/extract`, payload)
+    .post<BackendTaskJobDetail>(
+      `${projectAssetPath(projectPublicId)}/extract`,
+      payload,
+      { timeout: ASSET_TASK_SUBMIT_TIMEOUT_MS },
+    )
     .then((response) => ({
       ...response,
       data: toTaskJob(response.data, projectPublicId, response.data.items),
@@ -65,7 +70,11 @@ export const autocompleteAssetsApi = (
   payload: AssetAutocompletePayload,
 ) => (
   request
-    .post<BackendTaskJobDetail>(`${projectAssetPath(projectPublicId)}/autocomplete`, payload)
+    .post<BackendTaskJobDetail>(
+      `${projectAssetPath(projectPublicId)}/autocomplete`,
+      payload,
+      { timeout: ASSET_TASK_SUBMIT_TIMEOUT_MS },
+    )
     .then((response) => ({
       ...response,
       data: toTaskJob(response.data, projectPublicId, response.data.items),
@@ -219,11 +228,8 @@ export interface AssetImageGeneratePayload {
   prompt?: string
   aspectRatio?: string
   imageSize?: string
+  referenceMediaPublicIds?: string[]
   count?: number
-}
-
-export interface AssetImagePromptResult {
-  prompt: string
 }
 
 // 配图生成只提交异步任务，真正的模型调用由 Worker 执行。
@@ -232,24 +238,51 @@ export const generateAssetImagesApi = (
   payload: AssetImageGeneratePayload,
 ) => (
   request
-    .post<BackendTaskJobDetail>(`${projectAssetPath(projectPublicId)}/media/generate`, payload)
+    .post<BackendTaskJobDetail>(
+      `${projectAssetPath(projectPublicId)}/media/generate`,
+      payload,
+      { timeout: ASSET_TASK_SUBMIT_TIMEOUT_MS },
+    )
     .then((response) => ({
       ...response,
       data: toTaskJob(response.data, projectPublicId, response.data.items),
     } as typeof response & { data: TaskJobResponse }))
 )
 
-export const synthesizeAssetImagePromptApi = (projectPublicId: string, assetPublicId: string) =>
-  request.post<AssetImagePromptResult>(
-    `${projectAssetPath(projectPublicId)}/${encodeURIComponent(assetPublicId)}/media/prompt`,
-    undefined,
-    { timeout: 300000 },
-  )
+export const synthesizeAssetImagePromptApi = (
+  projectPublicId: string,
+  assetPublicId: string,
+) => (
+  request
+    .post<BackendTaskJobDetail>(
+      `${projectAssetPath(projectPublicId)}/${encodeURIComponent(assetPublicId)}/media/prompt`,
+      undefined,
+      { timeout: ASSET_TASK_SUBMIT_TIMEOUT_MS },
+    )
+    .then((response) => ({
+      ...response,
+      data: toTaskJob(response.data, projectPublicId, response.data.items),
+    } as typeof response & { data: TaskJobResponse }))
+)
 
 export const listAssetMediaApi = (projectPublicId: string, assetPublicId: string) =>
   request.get<AssetMediaItem[]>(
     `${projectAssetPath(projectPublicId)}/${encodeURIComponent(assetPublicId)}/media`,
   )
+
+export const uploadAssetReferenceImageApi = (
+  projectPublicId: string,
+  assetPublicId: string,
+  file: File,
+) => {
+  const form = new FormData()
+  form.append('file', file)
+  return request.post<AssetMediaItem>(
+    `${projectAssetPath(projectPublicId)}/${encodeURIComponent(assetPublicId)}/media/reference`,
+    form,
+    { headers: { 'Content-Type': 'multipart/form-data' }, timeout: ASSET_TASK_SUBMIT_TIMEOUT_MS },
+  )
+}
 
 export const setAssetMediaCoverApi = (projectPublicId: string, mediaPublicId: string) =>
   request.post<AssetMediaItem>(

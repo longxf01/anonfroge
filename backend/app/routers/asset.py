@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, Query, Request, Response, status
+from fastapi import Depends, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -20,7 +20,6 @@ from app.schemas.asset import (
     AssetEpisodeBrief,
     AssetExtractRequest,
     AssetImageGenerateRequest,
-    AssetImagePromptRead,
     AssetManageListResult,
     AssetMediaRead,
     AssetParentUpdateRequest,
@@ -323,6 +322,7 @@ class AssetView(BaseView):
                 prompt=payload.prompt,
                 aspect_ratio=payload.aspect_ratio,
                 image_size=payload.image_size,
+                reference_media_public_ids=payload.reference_media_public_ids,
                 count=payload.count,
             )
         except (project_service.ProjectServiceError, asset_service.AssetServiceError, task_service.TaskServiceError) as exc:
@@ -333,7 +333,8 @@ class AssetView(BaseView):
     @route(
         "/{asset_public_id}/media/prompt",
         methods=["POST"],
-        response_model=AssetImagePromptRead,
+        response_model=TaskJobDetail,
+        status_code=status.HTTP_202_ACCEPTED,
         middlewares=ASSET_ROUTE_MIDDLEWARES,
         summary="生成资产生图专业提示词",
     )
@@ -343,18 +344,53 @@ class AssetView(BaseView):
         asset_public_id: str,
         request: Request,
         session: SessionDep,
-    ) -> AssetImagePromptRead:
+    ) -> TaskJobDetail:
         current_user_public_id = self._current_user_public_id(request)
         try:
-            prompt = await asset_media_service.synthesize_asset_image_prompt(
+            return await asset_media_service.submit_asset_image_prompt_task(
                 session,
                 project_public_id,
                 current_user_public_id,
                 asset_public_id=asset_public_id,
             )
-        except (project_service.ProjectServiceError, asset_service.AssetServiceError) as exc:
+        except (project_service.ProjectServiceError, asset_service.AssetServiceError, task_service.TaskServiceError) as exc:
+            await session.rollback()
             self._raise_as_http(exc)
-        return AssetImagePromptRead(prompt=prompt)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="资产生图提示词任务提交失败")
+
+    @route(
+        "/{asset_public_id}/media/reference",
+        methods=["POST"],
+        response_model=AssetMediaRead,
+        status_code=status.HTTP_201_CREATED,
+        middlewares=ASSET_ROUTE_MIDDLEWARES,
+        summary="上传资产参考图",
+    )
+    async def upload_asset_reference_image(
+        self,
+        project_public_id: str,
+        asset_public_id: str,
+        request: Request,
+        session: SessionDep,
+        file: UploadFile = File(..., description="参考图文件，支持 PNG/JPEG/WebP。"),
+    ) -> AssetMediaRead:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            data = await file.read()
+            media = await asset_media_service.upload_asset_reference_image(
+                session,
+                project_public_id,
+                current_user_public_id,
+                asset_public_id=asset_public_id,
+                filename=file.filename or "",
+                content_type=file.content_type or "",
+                data=data,
+            )
+            await session.commit()
+        except (project_service.ProjectServiceError, asset_service.AssetServiceError) as exc:
+            await session.rollback()
+            self._raise_as_http(exc)
+        return AssetMediaRead.model_validate(media)
 
     @route(
         "/media/{media_public_id}/cover",

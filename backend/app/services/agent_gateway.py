@@ -236,6 +236,38 @@ class ProviderModelGateway:
             raise ProviderModelGatewayError(str(exc)) from exc
         return MediaGenerationOutput.from_raw(raw)
 
+    async def edit_image(
+        self,
+        *,
+        model_id: str,
+        prompt: str = "",
+        images: list[Any],
+        provider_key: str | None = None,
+        input_values: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> MediaGenerationOutput:
+        """调用图像模型基于参考图编辑图像，返回归一化媒体结果。"""
+
+        try:
+            provider = provider_runtime.create_provider_for_model(
+                model_id,
+                provider_key=provider_key,
+                input_values=input_values,
+                timeout=self.timeout,
+            )
+            method = getattr(provider, "edit_image", None)
+            if not callable(method):
+                raise ProviderModelGatewayError(f"模型 {model_id} 不支持图像编辑")
+            request = method(model_id=model_id, prompt=prompt, images=images, **kwargs)
+            raw = await asyncio.wait_for(request, timeout=self.timeout) if self.timeout > 0 else await request
+        except TimeoutError as exc:
+            raise ProviderModelGatewayError(f"图像编辑超时：{self.timeout}秒") from exc
+        except ProviderModelGatewayError:
+            raise
+        except Exception as exc:
+            raise ProviderModelGatewayError(str(exc)) from exc
+        return MediaGenerationOutput.from_raw(raw)
+
     def _extract_text(self, raw_output: Any) -> str:
         if isinstance(raw_output, str):
             return self._ensure_text(raw_output)

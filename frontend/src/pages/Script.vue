@@ -263,13 +263,14 @@ const toRecord = (item: ScriptEpisodeListItem): ScriptRecord => {
   }
 }
 
-const loadEpisodes = async () => {
+const loadEpisodes = async (options: { showLoading?: boolean } = {}) => {
   if (!projectPublicId.value) {
     scripts.value = []
     ElMessage.warning('未指定项目，请从项目列表进入剧本管理')
     return
   }
-  loading.value = true
+  const showLoading = options.showLoading !== false
+  if (showLoading) loading.value = true
   try {
     await Promise.all([loadCurrentProject(), loadAssets()])
     const { data } = await listProjectEpisodesApi(projectPublicId.value)
@@ -278,7 +279,7 @@ const loadEpisodes = async () => {
     scripts.value = []
     ElMessage.error(errorDetail(error, '加载剧本列表失败'))
   } finally {
-    loading.value = false
+    if (showLoading) loading.value = false
   }
 }
 
@@ -604,7 +605,11 @@ const openBatchImportDialog = () => {
 }
 
 const goProduction = () => {
-  ElMessage.info('制作工作台功能暂未接入，当前先同步剧本管理功能')
+  if (!projectPublicId.value) {
+    ElMessage.warning('缺少项目信息，无法进入制作工作台')
+    return
+  }
+  router.push({ path: '/production', query: { id: projectPublicId.value } })
 }
 
 const batchExtractAssets = async () => {
@@ -619,8 +624,8 @@ const batchExtractAssets = async () => {
       modelId: currentTextModel.value,
       episodePublicIds: selectedIds.value,
     })
-    await loadEpisodes()
     ElMessage.success('资产抽取任务已提交')
+    void loadEpisodes({ showLoading: false })
   } catch (error) {
     ElMessage.error(errorDetail(error, '资产抽取失败'))
   } finally {
@@ -635,8 +640,8 @@ const extractSingleEpisode = async (script: ScriptRecord) => {
       modelId: currentTextModel.value,
       episodePublicIds: [script.id],
     })
-    await loadEpisodes()
     ElMessage.success('资产抽取任务已提交')
+    void loadEpisodes({ showLoading: false })
   } catch (error) {
     ElMessage.error(errorDetail(error, '资产抽取失败'))
   } finally {

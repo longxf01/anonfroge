@@ -165,10 +165,10 @@ class OpenAICompatibleTextProvider(BaseProvider):
 
 
 class OpenAICompatibleImageProvider(BaseProvider):
-    """OpenAI 兼容协议的通用图像生成 Provider（/images/generations）。
+    """OpenAI 兼容协议的通用图像 Provider（/images/generations 与 /images/edits）。
 
     与 OpenAICompatibleTextProvider 同构：所有走 OpenAI 协议的生图服务复用本类，
-    各服务文件无需各自实现 generate_image。返回供应商原始 JSON，由网关
+    各服务文件无需各自实现 generate_image/edit_image。返回供应商原始 JSON，由网关
     MediaGenerationOutput.from_raw 归一为统一媒体结果。
     """
 
@@ -207,7 +207,16 @@ class OpenAICompatibleImageProvider(BaseProvider):
             "n": 1,
             "response_format": "b64_json",
         }
-        for key in ("size", "response_format", "aspect_ratio", "image_size", "quality", "background", "user", "n"):
+        for key in (
+            "size",
+            "response_format",
+            "aspect_ratio",
+            "image_size",
+            "quality",
+            "background",
+            "user",
+            "n",
+        ):
             if key in kwargs and kwargs[key] is not None:
                 payload[key] = kwargs[key]
 
@@ -238,6 +247,68 @@ class OpenAICompatibleImageProvider(BaseProvider):
             return response.json()
         except ValueError as exc:
             raise ProviderRuntimeError("图像生成响应不是合法 JSON") from exc
+
+    def _build_edit_request(
+        self, *, model_id: str | None = None, prompt: str = "", images: list[Any] | None = None, **kwargs: Any
+    ) -> tuple[dict[str, str], list[tuple[str, tuple[str, bytes, str]]], dict[str, str], str]:
+        resolved_model_id = (model_id or "").strip()
+        if not resolved_model_id:
+            raise ProviderRuntimeError("model_id 不能为空")
+        prompt_text = str(prompt or "").strip()
+        if not prompt_text:
+            raise ProviderRuntimeError("prompt 不能为空")
+
+        payload: dict[str, Any] = {
+            "model": resolved_model_id,
+            "prompt": prompt_text,
+            "n": 1,
+            "response_format": "b64_json",
+        }
+        for key in (
+            "size",
+            "response_format",
+            "aspect_ratio",
+            "image_size",
+            "quality",
+            "background",
+            "user",
+            "n",
+            "input_fidelity",
+        ):
+            if key in kwargs and kwargs[key] is not None:
+                payload[key] = kwargs[key]
+
+        files = _build_image_edit_files(images)
+        headers = {
+            "Authorization": f"Bearer {_resolve_openai_api_key(self.config, self.input_values)}",
+        }
+        return {key: str(value) for key, value in payload.items()}, files, headers, _build_images_edits_url(self.base_url)
+
+    async def edit_image(
+        self, *, model_id: str | None = None, prompt: str = "", images: list[Any] | None = None, **kwargs: Any
+    ) -> Any:
+        """调用 OpenAI 兼容的 images/edits 接口基于参考图编辑图像，返回原始 JSON。"""
+        payload, files, headers, url = self._build_edit_request(
+            model_id=model_id,
+            prompt=prompt,
+            images=images,
+            **kwargs,
+        )
+        try:
+            if self.client is not None:
+                response = await self.client.post(url, headers=headers, data=payload, files=files)
+            else:
+                async with httpx.AsyncClient(timeout=_build_httpx_timeout(self.timeout)) as client:
+                    response = await client.post(url, headers=headers, data=payload, files=files)
+        except httpx.HTTPError as exc:
+            raise ProviderRuntimeError(f"图像编辑请求失败: {_format_http_error(exc, url)}") from exc
+
+        if response.status_code >= 400:
+            raise ProviderRuntimeError(f"图像编辑请求失败，HTTP {response.status_code}: {response.text}")
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise ProviderRuntimeError("图像编辑响应不是合法 JSON") from exc
 
 
 def create_provider(
@@ -350,6 +421,53 @@ def _build_images_generations_url(base_url: str) -> str:
     if normalized.endswith("/images/generations"):
         return normalized
     return f"{normalized}/images/generations"
+
+
+def _build_images_edits_url(base_url: str) -> str:
+    """拼接 OpenAI 兼容的 images/edits 地址。"""
+    normalized = base_url.strip().rstrip("/")
+    if not normalized:
+        raise ProviderRuntimeError("缺少请求地址")
+    if not normalized.startswith(("http://", "https://")):
+        raise ProviderRuntimeError("请求地址必须以 http:// 或 https:// 开头")
+    if normalized.endswith("/images/edits"):
+        return normalized
+    if normalized.endswith("/images/generations"):
+        return f"{normalized[: -len('/images/generations')]}/images/edits"
+    return f"{normalized}/images/edits"
+
+
+def _build_image_edit_files(images: list[Any] | None) -> list[tuple[str, tuple[str, bytes, str]]]:
+    """把参考图输入转换为 httpx multipart files 结构。"""
+
+    if not isinstance(images, list) or not images:
+        raise ProviderRuntimeError("images 不能为空")
+
+    file_parts: list[tuple[str, bytes, str]] = []
+    for index, item in enumerate(images, start=1):
+        filename = f"reference-{index}.png"
+        mime_type = "image/png"
+        data: bytes | None = None
+
+        if isinstance(item, dict):
+            raw_data = item.get("data") or item.get("bytes")
+            if isinstance(raw_data, (bytes, bytearray)):
+                data = bytes(raw_data)
+            raw_filename = str(item.get("filename") or "").strip()
+            if raw_filename:
+                filename = raw_filename
+            raw_mime = str(item.get("mime_type") or item.get("mimeType") or "").strip()
+            if raw_mime:
+                mime_type = raw_mime
+        elif isinstance(item, (bytes, bytearray)):
+            data = bytes(item)
+
+        if not data:
+            raise ProviderRuntimeError("参考图内容不能为空")
+        file_parts.append((filename, data, mime_type))
+
+    field_name = "image[]" if len(file_parts) > 1 else "image"
+    return [(field_name, part) for part in file_parts]
 
 
 def _format_http_error(exc: httpx.HTTPError, url: str) -> str:

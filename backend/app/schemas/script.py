@@ -68,6 +68,19 @@ class ScriptSceneRead(BaseModel):
     interior_exterior: str = ""
 
 
+class ScriptAssetRead(BaseModel):
+    """分集列表中展示的主资产摘要。"""
+
+    model_config = READ_SCHEMA_CONFIG
+
+    public_id: str
+    asset_type: str
+    name: str = ""
+    summary: str = ""
+    description: str = ""
+    status: str = "draft"
+
+
 class ScriptEpisodeRead(BaseModel):
     """剧本分集。"""
 
@@ -147,9 +160,16 @@ class ScriptEpisodeListItem(BaseModel):
     version: int = 1
     is_locked: bool = False
     updated_at: datetime
+    assets: list[ScriptAssetRead] = Field(default_factory=list)
 
     @classmethod
-    def from_row(cls, episode: Any, plan_public_id: str, plan_title: str) -> "ScriptEpisodeListItem":
+    def from_row(
+        cls,
+        episode: Any,
+        plan_public_id: str,
+        plan_title: str,
+        assets: list[Any] | None = None,
+    ) -> "ScriptEpisodeListItem":
         try:
             raw_scenes = json.loads(episode.scenes or "[]")
         except (TypeError, ValueError):
@@ -166,4 +186,5 @@ class ScriptEpisodeListItem(BaseModel):
             version=episode.version,
             is_locked=bool(episode.is_locked),
             updated_at=episode.updated_at,
+            assets=[ScriptAssetRead.model_validate(asset) for asset in assets or []],
         )
