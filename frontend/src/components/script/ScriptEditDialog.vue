@@ -54,12 +54,12 @@
               :label="asset.name"
               :value="asset.publicId"
             >
-              <div class="asset-option">
-                <span :class="`asset-option__type asset-option__type--${asset.assetType}`">
-                  {{ assetTypeLabel(asset.assetType) }}
-                </span>
+              <div
+                class="asset-option"
+                :title="asset.summary ? `${asset.name}：${asset.summary}` : asset.name"
+              >
                 <span class="asset-option__name">{{ asset.name }}</span>
-                <span v-if="asset.description" class="asset-option__desc">{{ asset.description }}</span>
+                <span v-if="asset.summary" class="asset-option__desc">{{ asset.summary }}</span>
               </div>
             </el-option>
           </el-option-group>
@@ -77,12 +77,12 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import type { FormInstance, FormRules } from 'element-plus'
 import MarkdownEditor from '@/components/MarkdownEditor.vue'
 import type { AssetType, ScriptAsset, ScriptEditForm } from './types'
 
-defineProps<{
+const props = defineProps<{
   modelValue: boolean
   title: string
   form: ScriptEditForm
@@ -98,6 +98,19 @@ const emit = defineEmits<{
 }>()
 
 const formRef = ref<FormInstance>()
+
+const selectedAssetHints = computed(() => {
+  const selectedIds = new Set(props.form.relatedAssetIds)
+  return props.groupedAssetOptions
+    .flatMap((group) => group.items)
+    .filter((asset) => selectedIds.has(asset.publicId) && asset.summary)
+    .map((asset) => ({
+      publicId: asset.publicId,
+      name: asset.name,
+      summary: asset.summary,
+      hint: `${asset.name}：${asset.summary}`,
+    }))
+})
 
 const onSubmit = async () => {
   if (!formRef.value) return

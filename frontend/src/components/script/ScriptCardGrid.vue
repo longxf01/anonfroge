@@ -44,9 +44,9 @@
           :key="asset.publicId"
           class="asset-chip"
           :class="`asset-chip--${asset.assetType}`"
-          :title="asset.description"
+          :title="asset.summary"
         >
-          {{ asset.name }}
+          <span class="asset-chip__name">{{ asset.name }}</span>
         </span>
         <span v-if="script.relatedAssets.length === 0" class="asset-empty">
           尚未提取资产

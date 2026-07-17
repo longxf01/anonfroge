@@ -4,3 +4,4 @@ from app.models.novel import *  # noqa: F401
 from app.models.tasks import *  # noqa: F401
 from app.models.screenwriting import *  # noqa: F401
 from app.models.script import *  # noqa: F401
+from app.models.asset import *  # noqa: F401

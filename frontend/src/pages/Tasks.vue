@@ -93,11 +93,11 @@
           />
 
           <TaskDetailPanel
-            v-if="selectedJob"
+            v-if="selectedJobId"
             class="detail-panel"
             :project-public-id="projectPublicId"
-            :job-public-id="selectedJob.publicId"
-            :job="selectedJob"
+            :job-public-id="selectedJobId"
+            :job="selectedJob ?? undefined"
             @mutated="onDetailMutated"
             @cleared="onDetailCleared"
           />
@@ -164,6 +164,9 @@ const jobs = ref<TaskJobResponse[]>([])
 const jobTotal = ref(0)
 const listLoading = ref(false)
 const selectedJobId = ref<string | null>(null)
+const pendingRouteJobId = ref<string | null>(null)
+const lastRouteJobId = ref<string | null>(null)
+const allowDefaultJobSelection = ref(true)
 const statusFilter = ref<FilterValue>('')
 const {
   errorMessage: listErrorMessage,
@@ -189,6 +192,8 @@ const resolveQueryString = (value: unknown) => {
   if (Array.isArray(value)) return typeof value[0] === 'string' ? value[0] : ''
   return typeof value === 'string' ? value : ''
 }
+
+const resolveRouteJobPublicId = () => resolveQueryString(route.query.job).trim()
 
 const resolveSourcePath = () => {
   const source = resolveQueryString(route.query.from).trim()
@@ -222,6 +227,16 @@ const loadProjectMeta = async (publicId: string) => {
   }
 }
 
+const applyPendingRouteJobSelection = (items: TaskJobResponse[]) => {
+  const routeJobId = pendingRouteJobId.value
+  if (!routeJobId) return false
+  if (!items.some((job) => job.publicId === routeJobId)) return false
+  selectedJobId.value = routeJobId
+  pendingRouteJobId.value = null
+  allowDefaultJobSelection.value = false
+  return true
+}
+
 const loadJobs = async () => {
   const id = projectPublicId.value
   if (!id) return
@@ -240,11 +255,24 @@ const loadJobs = async () => {
     const items = data?.items ?? []
     jobs.value = items
     jobTotal.value = data?.total ?? items.length
-    if (selectedJobId.value && !items.some((job) => job.publicId === selectedJobId.value)) {
-      selectedJobId.value = null
+    if (applyPendingRouteJobSelection(items)) {
+      clearListError()
+      return
     }
-    if (!selectedJobId.value && items.length > 0) {
+    if (selectedJobId.value) {
+      const matchedJob = items.find((job) => job.publicId === selectedJobId.value)
+      if (matchedJob) {
+        selectedJobId.value = matchedJob.publicId
+        allowDefaultJobSelection.value = false
+        clearListError()
+        return
+      }
+      selectedJobId.value = null
+      allowDefaultJobSelection.value = false
+    }
+    if (!selectedJobId.value && allowDefaultJobSelection.value && items.length > 0) {
       selectedJobId.value = items[0].publicId
+      allowDefaultJobSelection.value = false
     }
     clearListError()
   } catch (error) {
@@ -264,7 +292,12 @@ const listPoll = useAdaptivePolling({
 
 const loadRouteProject = () => {
   const id = resolveProjectPublicId().trim()
+  const routeJobId = resolveRouteJobPublicId() || null
   const idChanged = projectPublicId.value !== id
+  if (idChanged || lastRouteJobId.value !== routeJobId) {
+    pendingRouteJobId.value = routeJobId
+    lastRouteJobId.value = routeJobId
+  }
   if (idChanged) {
     projectPublicId.value = id
     projectName.value = ''
@@ -272,11 +305,14 @@ const loadRouteProject = () => {
     jobs.value = []
     jobTotal.value = 0
     selectedJobId.value = null
+    allowDefaultJobSelection.value = true
     statusFilter.value = ''
     clearListError()
     if (listPoll.running.value) {
       void listPoll.refreshNow()
     }
+  } else if (listPoll.running.value) {
+    void listPoll.refreshNow()
   }
   void loadProjectMeta(id)
 }
@@ -293,12 +329,18 @@ const handleManualRefresh = async () => {
 }
 
 const onSelectJob = (jobPublicId: string) => {
-  selectedJobId.value = jobPublicId
+  pendingRouteJobId.value = null
+  allowDefaultJobSelection.value = false
+  if (selectedJobId.value !== jobPublicId) {
+    selectedJobId.value = jobPublicId
+  }
 }
 
 const onUpdateFilter = (value: FilterValue) => {
   statusFilter.value = value
+  pendingRouteJobId.value = null
   selectedJobId.value = null
+  allowDefaultJobSelection.value = true
   void listPoll.refreshNow()
 }
 
@@ -307,7 +349,9 @@ const onDetailMutated = () => {
 }
 
 const onDetailCleared = () => {
+  pendingRouteJobId.value = null
   selectedJobId.value = null
+  allowDefaultJobSelection.value = false
   void listPoll.refreshNow()
 }
 
@@ -338,7 +382,11 @@ const showComingSoon = () => {
   ElMessage.info('功能开发中')
 }
 
-watch(() => [route.query.id, route.query.type] as const, loadRouteProject, { immediate: true })
+watch(() => [route.query.id, route.query.type, route.query.job] as const, loadRouteProject, { immediate: true })
+watch(selectedJobId, (nextId, prevId) => {
+  if (nextId === prevId) return
+  pendingRouteJobId.value = null
+})
 
 onMounted(() => {
   listPoll.start()

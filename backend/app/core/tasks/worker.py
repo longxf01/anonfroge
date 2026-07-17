@@ -338,6 +338,7 @@ class TaskWorker:
                         await asyncio.sleep(self.idle_sleep_seconds)
                     continue
 
+                await self._maybe_scavenge_orphans()
                 await self._wait_for_any_record(in_flight)
         except asyncio.CancelledError:
             for task in in_flight:

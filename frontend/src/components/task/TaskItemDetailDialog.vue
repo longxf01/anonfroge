@@ -245,7 +245,7 @@ const payloadCodeMarkdown = computed(() => toCodeMarkdown(payloadCopyText.value,
 
 const outputCopyText = computed(() => formatOutputText(item.value?.outputText || ''))
 
-const outputCodeLanguage = computed(() => detectCodeLanguage(item.value?.outputText || ''))
+const outputCodeLanguage = computed(() => detectCodeLanguage(outputCopyText.value))
 
 const outputCodeMarkdown = computed(() => toCodeMarkdown(outputCopyText.value, outputCodeLanguage.value))
 
@@ -310,14 +310,34 @@ const formatJson = (value: unknown) => {
   }
 }
 
-const formatOutputText = (value: string) => {
+const stripMarkdownCodeFence = (value: string) => {
   const text = value.trim()
+  if (!text.startsWith('```') && !text.startsWith('~~~')) return text
+
+  const lines = text.split(/\r?\n/)
+  if (lines.length < 2) return text
+
+  const opening = lines[0].trim()
+  const closing = lines[lines.length - 1].trim()
+  const openMatch = opening.match(/^(`{3,}|~{3,})[ \t]*[A-Za-z0-9_-]*[ \t]*$/)
+  const closeMatch = closing.match(/^(`{3,}|~{3,})[ \t]*$/)
+  if (!openMatch || !closeMatch) return text
+
+  const openFence = openMatch[1]
+  const closeFence = closeMatch[1]
+  if (openFence[0] !== closeFence[0] || closeFence.length < openFence.length) return text
+
+  return lines.slice(1, -1).join('\n').trim()
+}
+
+const formatOutputText = (value: string) => {
+  const text = stripMarkdownCodeFence(value)
   if (!text) return ''
   try {
     const parsed = JSON.parse(text)
     return JSON.stringify(parsed, null, 2)
   } catch {
-    return value
+    return text
   }
 }
 

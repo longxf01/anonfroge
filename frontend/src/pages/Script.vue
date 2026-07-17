@@ -125,8 +125,16 @@ import {
   unlockScriptEpisodeApi,
   updateScriptEpisodeApi,
   updateScriptPlanApi,
+  type ScriptAsset as EpisodeAssetItem,
   type ScriptEpisodeListItem,
 } from '@/api/script'
+import {
+  extractAssetsApi,
+  listAssetsApi,
+  setEpisodeAssetsApi,
+  type AssetItem,
+} from '@/api/asset'
+import { listProjectsApi, type ProjectRecord } from '@/api/project'
 import Settings from '../components/Settings.vue'
 import ScriptCardGrid from '@/components/script/ScriptCardGrid.vue'
 import ScriptEditDialog from '@/components/script/ScriptEditDialog.vue'
@@ -138,7 +146,6 @@ import ScriptToolbar from '@/components/script/ScriptToolbar.vue'
 import '@/components/script/script.css'
 import type {
   AssetType,
-  ExtractState,
   ImportScriptDraft,
   ImportSplitPreset,
   PreviewEditDraft,
@@ -167,55 +174,64 @@ const errorDetail = (error: unknown, fallback: string): string => {
 
 const scripts = ref<ScriptRecord[]>([])
 const allAssets = ref<ScriptAsset[]>([])
+const currentProject = ref<ProjectRecord | null>(null)
 
 const pad2 = (value: number) => String(value).padStart(2, '0')
 
-const MOCK_ASSET_BLUEPRINTS: Omit<ScriptAsset, 'publicId' | 'episodes'>[] = [
-  { name: '主角', description: '根据当前分集内容生成的主要人物占位资产', assetType: 'role' },
-  { name: '核心场景', description: '根据当前分集内容生成的主要场景占位资产', assetType: 'scene' },
-  { name: '关键道具', description: '根据当前分集内容生成的关键道具占位资产', assetType: 'prop' },
-  { name: '气氛镜头', description: '根据当前分集内容生成的镜头占位资产', assetType: 'lens' },
-]
+const toScriptAsset = (asset: AssetItem): ScriptAsset => ({
+  publicId: asset.publicId,
+  name: asset.name,
+  summary: asset.summary,
+  description: asset.description,
+  assetType: asset.assetType,
+})
 
-const seedMockAssets = (items: ScriptEpisodeListItem[]) => {
-  if (allAssets.value.length > 0) return
-  allAssets.value = items.flatMap((item) => {
-    if (item.episodeIndex > 2) return []
-    return MOCK_ASSET_BLUEPRINTS.slice(0, item.episodeIndex === 1 ? 4 : 2).map((asset, index) => ({
-      ...asset,
-      publicId: `mock-${item.publicId}-${asset.assetType}-${index + 1}`,
-      name: `${item.title || `EP${pad2(item.episodeIndex)}`}·${asset.name}`,
-      episodes: String(item.episodeIndex),
-    }))
-  })
-}
+const assetsByPublicId = computed(() => new Map(allAssets.value.map((asset) => [asset.publicId, asset])))
 
-const bindMockAssetsToEpisode = (script: ScriptRecord): number => {
-  const existing = new Set(allAssets.value.map((asset) => asset.publicId))
-  const created = MOCK_ASSET_BLUEPRINTS.map((asset, index) => ({
-    ...asset,
-    publicId: `mock-${script.id}-${asset.assetType}-${index + 1}`,
-    name: `${script.episodeTitle || `EP${pad2(script.episodeIndex)}`}·${asset.name}`,
-    episodes: String(script.episodeIndex),
-  })).filter((asset) => !existing.has(asset.publicId))
-  if (created.length > 0) {
-    allAssets.value = [...allAssets.value, ...created]
+const toScriptAssetFromEpisode = (asset: EpisodeAssetItem): ScriptAsset => {
+  const fullAsset = assetsByPublicId.value.get(asset.publicId)
+  return {
+    publicId: asset.publicId,
+    name: asset.name,
+    summary: fullAsset?.summary || asset.summary,
+    description: fullAsset?.description || asset.description,
+    assetType: asset.assetType,
   }
-  return created.length
 }
 
-// 把后端分集平铺项映射为列表卡片记录，并填充关联资产。
+const loadCurrentProject = async () => {
+  if (!projectPublicId.value) {
+    currentProject.value = null
+    return
+  }
+  const { data } = await listProjectsApi()
+  currentProject.value = data.find((item) => item.public_id === projectPublicId.value) ?? null
+}
+
+const loadAssets = async () => {
+  if (!projectPublicId.value) {
+    allAssets.value = []
+    return
+  }
+  const { data } = await listAssetsApi(projectPublicId.value)
+  allAssets.value = data.map(toScriptAsset)
+}
+
+const currentTextModel = computed(() => currentProject.value?.text_model?.trim() || '')
+
+const ensureTextModel = () => {
+  if (currentTextModel.value) return true
+  ElMessage.warning('请先在项目设置中选择文本模型，再抽取资产')
+  return false
+}
+
+// 把后端分集平铺项映射为列表卡片记录；关联资产由后端通过 AssetEpisode 返回。
 const toRecord = (item: ScriptEpisodeListItem): ScriptRecord => {
   const episodeLabel = `EP${pad2(item.episodeIndex)}`
   const name = item.planTitle
     ? `${item.planTitle} ${episodeLabel}：${item.title}`
     : `${episodeLabel}：${item.title}`
-  // 关联资产：episodes 字段含本集 index 的资产。
-  const relatedAssets = allAssets.value
-    .filter((asset) => {
-      const indices = asset.episodes.split(',').map((n) => parseInt(n.trim(), 10)).filter((n) => !isNaN(n))
-      return indices.includes(item.episodeIndex)
-    })
+  const relatedAssets = (item.assets ?? []).map(toScriptAssetFromEpisode)
   return {
     id: item.publicId,
     planPublicId: item.planPublicId,
@@ -242,8 +258,8 @@ const loadEpisodes = async () => {
   }
   loading.value = true
   try {
+    await Promise.all([loadCurrentProject(), loadAssets()])
     const { data } = await listProjectEpisodesApi(projectPublicId.value)
-    seedMockAssets(data)
     scripts.value = data.map(toRecord)
   } catch (error) {
     scripts.value = []
@@ -310,13 +326,7 @@ const ASSET_TYPE_ORDER: AssetType[] = ['role', 'faction', 'prop', 'scene', 'lens
 const assetTypeLabel = (type: AssetType) => ASSET_TYPE_LABELS[type]
 
 const assetOptions = computed<ScriptAsset[]>(() => {
-  const map = new Map<string, ScriptAsset>()
-  scripts.value.forEach((script) => {
-    script.relatedAssets.forEach((asset) => {
-      if (!map.has(asset.publicId)) map.set(asset.publicId, asset)
-    })
-  })
-  return Array.from(map.values()).sort((a, b) => {
+  return [...allAssets.value].sort((a, b) => {
     if (a.assetType !== b.assetType) {
       return ASSET_TYPE_ORDER.indexOf(a.assetType) - ASSET_TYPE_ORDER.indexOf(b.assetType)
     }
@@ -561,12 +571,10 @@ const submitForm = async () => {
         title: form.name.trim(),
         body: form.content,
       })
-      const target = scripts.value.find((item) => item.id === editingId.value)
-      if (target) {
-        target.relatedAssets = form.relatedAssetIds
-          .map((id) => assetOptions.value.find((asset) => asset.publicId === id))
-          .filter((asset): asset is ScriptAsset => Boolean(asset))
-      }
+      await setEpisodeAssetsApi(projectPublicId.value, {
+        episodePublicId: editingId.value,
+        assetPublicIds: form.relatedAssetIds,
+      })
       ElMessage.success('剧本已更新')
     }
     formDialogVisible.value = false
@@ -592,45 +600,37 @@ const batchExtractAssets = async () => {
     ElMessage.warning('请先勾选要抽取资产的分集')
     return
   }
+  if (!projectPublicId.value || !ensureTextModel()) return
   extracting.value = true
   try {
-    await new Promise((resolve) => setTimeout(resolve, 300))
-    const selected = scripts.value.filter((script) => selectedIds.value.includes(script.id))
-    const created = selected.reduce((count, script) => count + bindMockAssetsToEpisode(script), 0)
-    scripts.value = scripts.value.map((script) => {
-      if (!selectedIds.value.includes(script.id)) return script
-      const relatedAssets = allAssets.value.filter((asset) => {
-        const indices = asset.episodes.split(',').map((n) => parseInt(n.trim(), 10)).filter((n) => !isNaN(n))
-        return indices.includes(script.episodeIndex)
-      })
-      return { ...script, relatedAssets, extractState: 2 as ExtractState, errorReason: null }
+    await extractAssetsApi(projectPublicId.value, {
+      modelId: currentTextModel.value,
+      episodePublicIds: selectedIds.value,
     })
-    ElMessage.success(`资产已模拟抽取：新增 ${created} 个，更新 ${Math.max(selected.length - created, 0)} 个`)
+    await loadEpisodes()
+    ElMessage.success('资产抽取任务已提交')
+  } catch (error) {
+    ElMessage.error(errorDetail(error, '资产抽取失败'))
   } finally {
     extracting.value = false
   }
 }
-
 const extractSingleEpisode = async (script: ScriptRecord) => {
+  if (!projectPublicId.value || !ensureTextModel()) return
   extractingSingle[script.id] = true
   try {
-    await new Promise((resolve) => setTimeout(resolve, 250))
-    const created = bindMockAssetsToEpisode(script)
-    const relatedAssets = allAssets.value.filter((asset) => {
-      const indices = asset.episodes.split(',').map((n) => parseInt(n.trim(), 10)).filter((n) => !isNaN(n))
-      return indices.includes(script.episodeIndex)
+    await extractAssetsApi(projectPublicId.value, {
+      modelId: currentTextModel.value,
+      episodePublicIds: [script.id],
     })
-    scripts.value = scripts.value.map((item) => (
-      item.id === script.id
-        ? { ...item, relatedAssets, extractState: 2 as ExtractState, errorReason: null }
-        : item
-    ))
-    ElMessage.success(`「${script.name}」资产已模拟抽取：新增 ${created} 个`)
+    await loadEpisodes()
+    ElMessage.success('资产抽取任务已提交')
+  } catch (error) {
+    ElMessage.error(errorDetail(error, '资产抽取失败'))
   } finally {
     extractingSingle[script.id] = false
   }
 }
-
 const parseDownloadFilename = (contentDisposition = '') => {
   const encoded = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1]
   if (encoded) {
@@ -1212,7 +1212,7 @@ const goScreenwriting = () => {
   router.push({ path: '/screenwriting', query: { id: projectPublicId.value } })
 }
 
-const goTasks = () => {
+const goTasks = (jobPublicId = '') => {
   if (!projectPublicId.value) {
     ElMessage.warning('项目信息尚未加载完成，请稍候再试')
     return
@@ -1223,6 +1223,7 @@ const goTasks = () => {
       id: projectPublicId.value,
       type: 'script',
       from: route.fullPath,
+      ...(jobPublicId ? { job: jobPublicId } : {}),
     },
   })
 }

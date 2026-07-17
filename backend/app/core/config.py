@@ -146,6 +146,8 @@ class Settings(object):
     skills_root: str = field(default_factory=lambda: os.getenv("SKILLS_ROOT", "./data/skills"))  # 技能文档根目录
     script_prompts_root: str = field(default_factory=lambda: os.getenv("SCRIPT_PROMPTS_ROOT", "./data/script"))  # 剧本创作工具提示词根目录（供 web 端可视化编辑）
     chapter_event_extraction_prompt_name: str = field( default_factory=lambda: os.getenv("CHAPTER_EVENT_EXTRACTION_PROMPT_NAME", "chapter_event_extraction") )  # 章节事件提取提示词名称
+    asset_extraction_prompt_name: str = field(default_factory=lambda: os.getenv("ASSET_EXTRACTION_PROMPT_NAME", "asset_extraction"))  # 资产抽取提示词名称
+    asset_enrichment_llm_limit: int = field(default_factory=lambda: int(os.getenv("ASSET_ENRICHMENT_LLM_LIMIT", "4")))  # 单个资产抽取子任务允许执行的 RAG 二次模型补全次数上限
     novel_crawl_http_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("NOVEL_CRAWL_HTTP_TIMEOUT_SECONDS", "20.0")))  # 小说爬虫 HTTP 总超时秒数
     novel_crawl_http_connect_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("NOVEL_CRAWL_HTTP_CONNECT_TIMEOUT_SECONDS", "10.0")))  # 小说爬虫 HTTP 连接超时秒数
     novel_crawl_impersonate: str = field(default_factory=lambda: os.getenv("NOVEL_CRAWL_IMPERSONATE", "chrome110"))  # 小说 rule 来源浏览器 TLS 指纹画像

@@ -259,7 +259,7 @@ interface BackendTaskItemRead {
   updated_at: string
 }
 
-interface BackendTaskJobDetail extends BackendTaskJobRead {
+export interface BackendTaskJobDetail extends BackendTaskJobRead {
   items: BackendTaskItemRead[]
 }
 
@@ -561,7 +561,7 @@ const countsFromJob = (job: BackendTaskJobRead, items?: BackendTaskItemRead[]) =
   }
 }
 
-const toTaskJob = (
+export const toTaskJob = (
   job: BackendTaskJobRead,
   projectPublicId: string,
   items?: BackendTaskItemRead[],
@@ -626,6 +626,13 @@ const toBackendItemIdsPayload = (itemPublicIds?: string[] | null) => ({
   item_public_ids: itemPublicIds?.filter(Boolean) ?? null,
 })
 
+const TASK_PAGE_SIZE_MAX = 100
+
+const toBackendPageSize = (pageSize?: number) => {
+  if (typeof pageSize !== 'number' || !Number.isFinite(pageSize)) return undefined
+  return Math.min(TASK_PAGE_SIZE_MAX, Math.max(1, Math.trunc(pageSize)))
+}
+
 const toActivityWindow = (value: BackendActivityWindowView): ActivityWindowView => ({
   submittedItemCount: value.submitted_item_count,
   completedItemCount: value.completed_item_count,
@@ -670,7 +677,7 @@ export const listTaskJobsApi = (
       params: {
         status: toBackendJobStatus(query.status),
         page: query.page,
-        page_size: query.pageSize,
+        page_size: toBackendPageSize(query.pageSize),
       },
     })
     .then((response) => withData(response, toJobList(response.data, projectPublicId)))
@@ -697,7 +704,7 @@ export const listTaskItemsApi = (
         params: {
           status: toBackendItemStatus(query.status),
           page: query.page,
-          page_size: query.pageSize,
+          page_size: toBackendPageSize(query.pageSize),
         },
       },
     )

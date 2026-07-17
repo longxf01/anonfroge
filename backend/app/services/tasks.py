@@ -276,7 +276,13 @@ async def mark_task_item_running(
     )
     result = await session.execute(statement)
     if int(result.rowcount or 0) != 1:
-        await session.rollback()
+        await _fail_exhausted_runnable_task_item(
+            session,
+            item_public_id,
+            worker_id,
+            error_code="task_attempts_exhausted",
+            error_message="任务尝试次数已耗尽，无法继续执行",
+        )
         return False
 
     item = await _get_task_item_model_or_raise(session, item_public_id)
@@ -284,6 +290,52 @@ async def mark_task_item_running(
     await refresh_task_job_progress(session, job)
     await session.commit()
     await session.refresh(item)
+    return True
+
+
+async def _fail_exhausted_runnable_task_item(
+    session: AsyncSession,
+    item_public_id: str,
+    worker_id: str,
+    *,
+    error_code: str,
+    error_message: str,
+) -> bool:
+    """把仍处于可运行状态但次数已耗尽的子项收敛为失败，避免反复入队后被跳过。"""
+
+    await session.rollback()
+    item = await _get_task_item_model_or_raise(session, item_public_id)
+    if (
+        item.status not in RUNNABLE_ITEM_STATUSES
+        or item.disabled_at is not None
+        or item.attempt_count < item.max_attempts
+    ):
+        await session.rollback()
+        return False
+
+    job = await _get_task_job_model_by_id_or_raise(session, item.job_id)
+    now = utc_now()
+    item.status = TaskStatus.FAILED
+    item.worker_id = worker_id.strip()
+    item.error_code = error_code
+    item.error_message = error_message
+    item.heartbeat_at = None
+    item.completed_at = now
+    item.updated_at = now
+    session.add(item)
+    session.add(
+        _build_dead_letter(
+            job,
+            item,
+            stream_id="",
+            stage="claim_exhausted",
+            worker_id=worker_id,
+            error_code=error_code,
+            error_message=error_message,
+        )
+    )
+    await refresh_task_job_progress(session, job)
+    await session.commit()
     return True
 
 
@@ -525,6 +577,7 @@ async def retry_task_item(session: AsyncSession, item_public_id: str) -> TaskIte
 
     now = utc_now()
     item.status = TaskStatus.PENDING
+    item.attempt_count = 0
     item.worker_id = ""
     item.result = "{}"
     item.error_code = ""
