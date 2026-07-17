@@ -26,7 +26,7 @@
           </el-tooltip>
 
           <el-tooltip content="设置" placement="right">
-            <button class="nav-btn" aria-label="设置" @click="showComingSoon">
+            <button class="nav-btn" aria-label="设置" @click="settingsVisible = true">
               <el-icon><Setting /></el-icon>
             </button>
           </el-tooltip>
@@ -111,6 +111,8 @@
         </section>
       </section>
     </div>
+
+    <Settings v-model="settingsVisible" />
   </main>
 </template>
 
@@ -138,6 +140,7 @@ import {
 import { listProjectsApi, type ProjectRecord } from '@/api/project'
 import { useAdaptivePolling } from '@/composables/useAdaptivePolling'
 import { usePollErrorNotice } from '@/composables/usePollErrorNotice'
+import Settings from '../components/Settings.vue'
 import TaskListPanel from '@/components/task/TaskListPanel.vue'
 import TaskDetailPanel from '@/components/task/TaskDetailPanel.vue'
 import TaskMetricsBar from '@/components/task/TaskMetricsBar.vue'
@@ -155,6 +158,7 @@ const projectPublicId = ref('')
 const projectName = ref('')
 const projectType = ref('')
 const reloading = ref(false)
+const settingsVisible = ref(false)
 
 const jobs = ref<TaskJobResponse[]>([])
 const jobTotal = ref(0)

@@ -18,7 +18,7 @@
           </el-tooltip>
 
           <el-tooltip content="任务" placement="right">
-            <button class="nav-btn" aria-label="任务" @click="showComingSoon">
+            <button class="nav-btn" aria-label="任务" @click="goTasks">
               <el-icon><List /></el-icon>
             </button>
           </el-tooltip>
@@ -48,7 +48,7 @@
       <section class="main-panel">
         <header class="page-header">
           <div class="page-header__left">
-            <h1 class="title">原创短剧</h1>
+            <h1 class="title">我的短剧</h1>
             <p class="desc">一句话创意生成短剧方向、分集节奏与资产列表</p>
           </div>
 
@@ -1195,6 +1195,28 @@ const goStoryboardStage = () => {
 
 const goProject = () => {
   router.push('/project')
+}
+
+const resolveProjectPublicId = () => {
+  const projectId = route.query.id
+  if (Array.isArray(projectId)) return projectId[0] || ''
+  return typeof projectId === 'string' ? projectId : ''
+}
+
+const goTasks = () => {
+  const projectId = resolveProjectPublicId()
+  if (!projectId) {
+    ElMessage.warning('项目信息尚未加载完成，请稍候再试')
+    return
+  }
+  router.push({
+    path: '/tasks',
+    query: {
+      id: projectId,
+      type: 'original',
+      from: route.fullPath,
+    },
+  })
 }
 
 const showComingSoon = () => {
