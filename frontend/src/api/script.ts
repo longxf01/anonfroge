@@ -36,6 +36,15 @@ export interface ScriptPlanDetail extends ScriptPlanSummary {
   episodes: ScriptEpisode[]
 }
 
+export interface ScriptAsset {
+  publicId: string
+  assetType: 'role' | 'faction' | 'prop' | 'scene'
+  name: string
+  summary: string
+  description: string
+  status: 'draft' | 'locked'
+}
+
 // 分集平铺列表项：携带所属剧本计划信息，供「我的剧本」卡片直接展示与编辑。
 export interface ScriptEpisodeListItem {
   publicId: string
@@ -49,6 +58,7 @@ export interface ScriptEpisodeListItem {
   version: number
   isLocked: boolean
   updatedAt: string
+  assets: ScriptAsset[]
 }
 
 export interface ScriptPlanCreatePayload {

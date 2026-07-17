@@ -1,14 +1,14 @@
 import type { Component } from 'vue'
 
 export type ExtractState = -1 | 0 | 1 | 2
-export type AssetType = 'role' | 'faction' | 'prop' | 'scene' | 'lens'
+export type AssetType = 'role' | 'faction' | 'prop' | 'scene'
 
 export interface ScriptAsset {
   publicId: string
   name: string
+  summary: string
   description: string
   assetType: AssetType
-  episodes: string
 }
 
 export interface ScriptRecord {

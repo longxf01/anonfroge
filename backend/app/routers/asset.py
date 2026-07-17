@@ -11,10 +11,16 @@ from app.routers.base import BaseView, route
 from app.schemas.asset import (
     AssetAssociationRequest,
     AssetAssociationResult,
+    AssetAutocompleteRequest,
+    AssetBatchRequest,
+    AssetBatchResult,
+    AssetCreateRequest,
     AssetDetailRead,
     AssetEpisodeBrief,
     AssetExtractRequest,
+    AssetManageListResult,
     AssetRead,
+    AssetUpdateRequest,
 )
 from app.schemas.tasks import TaskJobDetail
 from app.services import asset as asset_service
@@ -89,6 +95,171 @@ class AssetView(BaseView):
             await session.rollback()
             self._raise_as_http(exc)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="资产抽取任务提交失败")
+
+    @route(
+        "/autocomplete",
+        methods=["POST"],
+        response_model=TaskJobDetail,
+        status_code=status.HTTP_202_ACCEPTED,
+        middlewares=ASSET_ROUTE_MIDDLEWARES,
+        summary="资产描述补全",
+    )
+    async def autocomplete_assets(
+        self,
+        project_public_id: str,
+        payload: AssetAutocompleteRequest,
+        request: Request,
+        session: SessionDep,
+    ) -> TaskJobDetail:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            return await asset_service.submit_autocomplete_task(
+                session,
+                project_public_id,
+                current_user_public_id,
+                model_id=payload.model_id,
+                asset_public_ids=payload.asset_public_ids,
+            )
+        except (project_service.ProjectServiceError, asset_service.AssetServiceError, task_service.TaskServiceError) as exc:
+            await session.rollback()
+            self._raise_as_http(exc)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="资产描述补全任务提交失败")
+
+    @route(
+        "/manage",
+        methods=["GET"],
+        response_model=AssetManageListResult,
+        middlewares=ASSET_ROUTE_MIDDLEWARES,
+        summary="分页列出资产（含子资产树与引用）",
+    )
+    async def manage_assets(
+        self,
+        project_public_id: str,
+        request: Request,
+        session: SessionDep,
+        asset_type: str = Query(default="", alias="assetType"),
+        keyword: str = Query(default=""),
+        status_filter: str = Query(default="", alias="status"),
+        referenced: str = Query(default=""),
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, ge=1, le=100, alias="pageSize"),
+    ) -> AssetManageListResult:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            result = await asset_service.list_assets_page(
+                session,
+                project_public_id,
+                current_user_public_id,
+                asset_type=asset_type,
+                keyword=keyword,
+                status=status_filter,
+                referenced=referenced,
+                page=page,
+                page_size=page_size,
+            )
+        except (project_service.ProjectServiceError, asset_service.AssetServiceError) as exc:
+            self._raise_as_http(exc)
+        return AssetManageListResult.model_validate(result)
+
+    @route(
+        "",
+        methods=["POST"],
+        response_model=AssetRead,
+        status_code=status.HTTP_201_CREATED,
+        middlewares=ASSET_ROUTE_MIDDLEWARES,
+        summary="手动创建资产",
+    )
+    async def create_asset(
+        self,
+        project_public_id: str,
+        payload: AssetCreateRequest,
+        request: Request,
+        session: SessionDep,
+    ) -> AssetRead:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            asset = await asset_service.create_asset(
+                session,
+                project_public_id,
+                current_user_public_id,
+                asset_type=payload.asset_type,
+                name=payload.name,
+                keyword=payload.keyword,
+                colors=payload.colors,
+                summary=payload.summary,
+                description=payload.description,
+                details=payload.details,
+                accessories=payload.accessories,
+                main_asset=payload.main_asset,
+                variant_label=payload.variant_label,
+            )
+            await session.commit()
+        except (project_service.ProjectServiceError, asset_service.AssetServiceError) as exc:
+            await session.rollback()
+            self._raise_as_http(exc)
+        return AssetRead.model_validate(asset)
+
+    @route(
+        "/batch",
+        methods=["POST"],
+        response_model=AssetBatchResult,
+        middlewares=ASSET_ROUTE_MIDDLEWARES,
+        summary="批量锁定/解锁/删除资产",
+    )
+    async def batch_assets(
+        self,
+        project_public_id: str,
+        payload: AssetBatchRequest,
+        request: Request,
+        session: SessionDep,
+    ) -> AssetBatchResult:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            result = await asset_service.batch_update_assets(
+                session,
+                project_public_id,
+                current_user_public_id,
+                asset_public_ids=payload.asset_public_ids,
+                operation=payload.operation,
+            )
+            await session.commit()
+        except (project_service.ProjectServiceError, asset_service.AssetServiceError) as exc:
+            await session.rollback()
+            self._raise_as_http(exc)
+        return AssetBatchResult(
+            affected=result["affected"],
+            assets=[AssetRead.model_validate(asset) for asset in result["assets"]],
+        )
+
+    @route(
+        "/{asset_public_id}",
+        methods=["PUT"],
+        response_model=AssetRead,
+        middlewares=ASSET_ROUTE_MIDDLEWARES,
+        summary="编辑资产",
+    )
+    async def update_asset(
+        self,
+        project_public_id: str,
+        asset_public_id: str,
+        payload: AssetUpdateRequest,
+        request: Request,
+        session: SessionDep,
+    ) -> AssetRead:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            asset = await asset_service.update_asset(
+                session,
+                project_public_id,
+                current_user_public_id,
+                asset_public_id,
+                fields=payload.model_dump(exclude_unset=True),
+            )
+            await session.commit()
+        except (project_service.ProjectServiceError, asset_service.AssetServiceError) as exc:
+            await session.rollback()
+            self._raise_as_http(exc)
+        return AssetRead.model_validate(asset)
 
     @route(
         "",
@@ -254,13 +425,13 @@ class AssetView(BaseView):
     ) -> Response:
         current_user_public_id = self._current_user_public_id(request)
         try:
-            asset = await asset_service.get_asset(
+            await asset_service.batch_update_assets(
                 session,
                 project_public_id,
                 current_user_public_id,
-                asset_public_id,
+                asset_public_ids=[asset_public_id],
+                operation="delete",
             )
-            await session.delete(asset)
             await session.commit()
         except (project_service.ProjectServiceError, asset_service.AssetServiceError) as exc:
             await session.rollback()

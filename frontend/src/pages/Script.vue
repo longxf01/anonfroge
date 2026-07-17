@@ -15,6 +15,7 @@
           @import="openBatchImportDialog"
           @create="openCreateDialog"
           @production="goProduction"
+          @assets="assetDrawerVisible = true"
         />
 
         <ScriptToolbar
@@ -53,6 +54,13 @@
     </div>
 
     <Settings v-model="settingsVisible" />
+
+    <ScriptAssetDrawer
+      v-model="assetDrawerVisible"
+      :project-public-id="projectPublicId"
+      :text-model-id="currentTextModel"
+      @changed="loadEpisodes"
+    />
 
     <ScriptEditDialog
       ref="formRef"
@@ -140,6 +148,7 @@ import ScriptCardGrid from '@/components/script/ScriptCardGrid.vue'
 import ScriptEditDialog from '@/components/script/ScriptEditDialog.vue'
 import ScriptImportDialog from '@/components/script/ScriptImportDialog.vue'
 import ScriptPageHeader from '@/components/script/ScriptPageHeader.vue'
+import ScriptAssetDrawer from '@/components/script/ScriptAssetDrawer.vue'
 import ScriptPreviewEditDialog from '@/components/script/ScriptPreviewEditDialog.vue'
 import ScriptSidebar from '@/components/script/ScriptSidebar.vue'
 import ScriptToolbar from '@/components/script/ScriptToolbar.vue'
@@ -207,6 +216,8 @@ const loadCurrentProject = async () => {
   const { data } = await listProjectsApi()
   currentProject.value = data.find((item) => item.public_id === projectPublicId.value) ?? null
 }
+
+const assetDrawerVisible = ref(false)
 
 const loadAssets = async () => {
   if (!projectPublicId.value) {
@@ -318,10 +329,9 @@ const ASSET_TYPE_LABELS: Record<AssetType, string> = {
   faction: '势力',
   prop: '道具',
   scene: '场景',
-  lens: '镜头',
 }
 
-const ASSET_TYPE_ORDER: AssetType[] = ['role', 'faction', 'prop', 'scene', 'lens']
+const ASSET_TYPE_ORDER: AssetType[] = ['role', 'faction', 'prop', 'scene']
 
 const assetTypeLabel = (type: AssetType) => ASSET_TYPE_LABELS[type]
 

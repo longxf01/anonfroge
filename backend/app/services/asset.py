@@ -10,7 +10,7 @@ import json
 import re
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import or_, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.sql import delete
 from sqlmodel import select
@@ -23,13 +23,15 @@ from app.models.asset import (
     ASSET_STATUS_DRAFT,
     ASSET_STATUS_LOCKED,
     ASSET_TYPE_FACTION,
-    ASSET_TYPE_LENS,
     ASSET_TYPE_PROP,
     ASSET_TYPE_ROLE,
     ASSET_TYPE_SCENE,
     Asset,
     AssetEpisode,
+    AssetGeneration,
+    AssetMedia,
     AssetRelation,
+    AssetVersion,
 )
 from app.models.novel import NovelChapter
 from app.models.script import ScriptEpisode, ScriptPlan
@@ -44,8 +46,10 @@ from app.utils.time_tools import utc_now
 
 ASSET_EXTRACT_TASK_TYPE = "asset.extract"
 ASSET_EXTRACT_QUEUE_NAME = "asset"
+ASSET_AUTOCOMPLETE_TASK_TYPE = "asset.autocomplete"
 EXTRACTABLE_ASSET_TYPES = {ASSET_TYPE_ROLE, ASSET_TYPE_FACTION, ASSET_TYPE_PROP, ASSET_TYPE_SCENE}
-VALID_ASSET_TYPES = EXTRACTABLE_ASSET_TYPES | {ASSET_TYPE_LENS}
+VALID_ASSET_TYPES = EXTRACTABLE_ASSET_TYPES
+ASSET_BATCH_OPERATIONS = {"lock", "unlock", "delete"}
 
 
 class AssetServiceError(Exception):
@@ -127,6 +131,66 @@ def parse_extracted_assets(raw: str) -> list[dict[str, Any]]:
             }
         )
     return normalized
+
+
+def _parse_json_object(raw: str) -> dict[str, Any] | None:
+    """从模型输出中尽力解析出单个 JSON 对象；失败返回 None。"""
+
+    text = (raw or "").strip()
+    if not text:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+    else:
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            text = text[start : end + 1]
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _coerce_str_map(value: Any) -> dict[str, str]:
+    """把对象字段规整为 dict[str, str]：值非字符串则序列化为文本，丢弃空键空值。"""
+
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key, raw_value in value.items():
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            continue
+        if isinstance(raw_value, str):
+            text = raw_value.strip()
+        elif isinstance(raw_value, (dict, list)):
+            text = json.dumps(raw_value, ensure_ascii=False)
+        else:
+            text = str(raw_value or "").strip()
+        if text:
+            result[normalized_key] = text
+    return result
+
+
+def parse_autocomplete_result(raw: str) -> "AssetAutocompleteResult | None":
+    """解析并校验补全输出为 AssetAutocompleteResult；无法解析或全空返回 None。"""
+
+    from app.schemas.asset import AssetAutocompleteResult
+
+    data = _parse_json_object(raw)
+    if data is None:
+        return None
+    result = AssetAutocompleteResult(
+        summary=str(data.get("summary") or "").strip(),
+        keyword=str(data.get("keyword") or "").strip(),
+        colors=str(data.get("colors") or "").strip(),
+        description=_coerce_str_map(data.get("description")),
+        details=_coerce_str_map(data.get("details")),
+        accessories=_coerce_str_map(data.get("accessories")),
+    )
+    return None if result.is_empty() else result
 
 
 def _normalize_asset_children(value: Any) -> list[dict[str, Any]]:
@@ -242,9 +306,7 @@ async def extract_assets(
         for child in item.get("children") or []:
             work_items.append({"item": child, "parent_item": item})
 
-    llm_enrichment_count = 0
-    llm_enrichment_limit = max(0, int(settings.asset_enrichment_llm_limit))
-    masters_by_item_id: dict[int, Asset] = {}
+    enriched_records: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for record in work_items:
         item = record["item"]
         enrichment = await enrich_asset_description(
@@ -255,12 +317,20 @@ async def extract_assets(
             target_set,
             model_id=model_id,
             gateway=resolved_gateway,
-            allow_llm_enrichment=llm_enrichment_count < llm_enrichment_limit,
         )
-        if enrichment.get("llm_called"):
-            llm_enrichment_count += 1
         enrichments.append(enrichment)
+        enriched_records.append((record, enrichment))
 
+    await _lock_asset_keys(
+        session,
+        int(project.id),
+        user_public_id,
+        [key for record, _ in enriched_records for key in _asset_keys_for_item(record["item"])],
+    )
+
+    masters_by_item_id: dict[int, Asset] = {}
+    for record, enrichment in enriched_records:
+        item = record["item"]
         master, master_new, derived, derived_new = await write_master_and_derivative(
             session,
             int(project.id),
@@ -287,6 +357,159 @@ async def extract_assets(
         results.append(derived)
 
     return {"created": created, "updated": updated, "assets": results, "asset_enrichment": enrichments, **prompt_trace}
+
+
+async def autocomplete_asset(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    *,
+    asset_public_id: str,
+    model_id: str,
+    gateway: Any | None = None,
+) -> dict[str, Any]:
+    """对单个资产做结构化描述补全：校验 + 失败一次重试 + 合并落库。"""
+
+    model_id = model_id.strip()
+    if not model_id:
+        raise AssetServiceError("缺少补全所用文本模型 ID")
+
+    project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    asset = await load_asset_or_raise(session, int(project.id), user_public_id, asset_public_id)
+    if asset.status == ASSET_STATUS_LOCKED:
+        raise AssetServiceError("资产已锁定，请先解锁再补全")
+
+    episode_items = await get_asset_episode_items(session, project_public_id, user_public_id, asset)
+    episode_public_ids = [item["episode_id"] for item in episode_items]
+    if episode_public_ids:
+        script_context, _ = await build_script_context(
+            session, project_public_id, user_public_id, episode_public_ids
+        )
+    else:
+        script_context = ""
+
+    base_kwargs = dict(
+        asset_type=asset.asset_type,
+        name=asset.name,
+        current_summary=asset.summary or "",
+        current_keyword=asset.keyword or "",
+        current_colors=asset.colors or "",
+        current_description=_parse_object_field(asset.description),
+        current_details=_parse_object_field(asset.details),
+        current_accessories=_parse_object_field(asset.accessories),
+        script_context=script_context,
+    )
+
+    resolved_gateway = gateway or build_asset_gateway()
+    last_raw = ""
+    result: "AssetAutocompleteResult | None" = None
+    for attempt in range(2):  # 首次 + 失败一次重试
+        feedback = "" if attempt == 0 else "上次输出不是合法、含有效字段的 JSON 对象，请只输出符合要求的 JSON 对象。"
+        messages = build_autocomplete_messages(**base_kwargs, retry_feedback=feedback)
+        try:
+            last_raw = await _generate_full_text(resolved_gateway, model_id=model_id, messages=messages)
+        except ProviderModelGatewayError as exc:
+            raise AssetServiceError(f"资产描述补全失败：{exc}") from exc
+        result = parse_autocomplete_result(last_raw)
+        if result is not None:
+            break
+
+    prompt_trace = _model_prompt_trace(model_id=model_id, messages=messages)
+    prompt_trace["raw_output"] = last_raw
+    prompt_trace["output_text"] = last_raw
+
+    if result is None:
+        raise AssetServiceError(
+            "模型未返回可用的补全内容，请重试或更换模型",
+            result={**prompt_trace, "asset_public_id": asset_public_id},
+        )
+
+    merge_asset_missing_fields(
+        asset,
+        {
+            "keyword": result.keyword,
+            "colors": result.colors,
+            "summary": result.summary,
+            "description": result.description,
+            "details": result.details,
+            "accessories": result.accessories,
+        },
+    )
+    asset.updated_at = utc_now()
+    session.add(asset)
+    await session.flush()
+    return {"asset": asset, "asset_public_id": asset.public_id, **prompt_trace}
+
+
+async def build_autocomplete_task_items(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    *,
+    model_id: str,
+    asset_public_ids: list[str],
+) -> list[TaskItemCreate]:
+    """按资产构造补全任务子项，逐个校验资产存在。"""
+
+    project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    items: list[TaskItemCreate] = []
+    for asset_public_id in _dedupe_public_ids(asset_public_ids):
+        asset = await load_asset_or_raise(session, int(project.id), user_public_id, asset_public_id)
+        items.append(
+            TaskItemCreate(
+                item_type=ASSET_AUTOCOMPLETE_TASK_TYPE,
+                item_key=f"asset:{asset_public_id}",
+                payload={
+                    "project_public_id": project_public_id,
+                    "current_user_public_id": user_public_id,
+                    "model_id": model_id,
+                    "asset_public_id": asset_public_id,
+                    "asset_name": asset.name,
+                },
+            )
+        )
+    return items
+
+
+async def submit_autocomplete_task(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    *,
+    model_id: str,
+    asset_public_ids: list[str],
+    engine: Any | None = None,
+) -> TaskJobDetail:
+    """提交资产描述补全异步任务；一个 job 可含多个资产子项。"""
+
+    model_id = model_id.strip()
+    if not model_id:
+        raise AssetServiceError("缺少补全所用文本模型 ID")
+    await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    items = await build_autocomplete_task_items(
+        session, project_public_id, user_public_id, model_id=model_id, asset_public_ids=asset_public_ids
+    )
+    if not items:
+        raise AssetServiceError("没有可用于描述补全的资产")
+
+    job_name = "资产描述补全" if len(items) == 1 else f"资产描述批量补全：{len(items)} 个资产"
+    resolved_engine = engine or default_async_task_engine
+    return await resolved_engine.create_and_enqueue_task_job(
+        session,
+        TaskJobCreate(
+            task_type=ASSET_AUTOCOMPLETE_TASK_TYPE,
+            queue_name=ASSET_EXTRACT_QUEUE_NAME,
+            name=job_name,
+            created_by=user_public_id,
+            payload={
+                "project_public_id": project_public_id,
+                "current_user_public_id": user_public_id,
+                "model_id": model_id,
+                "asset_count": len(items),
+            },
+            items=items,
+        ),
+    )
 
 
 async def submit_extract_assets_task(
@@ -680,7 +903,6 @@ async def enrich_asset_description(
     *,
     model_id: str,
     gateway: Any,
-    allow_llm_enrichment: bool = True,
 ) -> dict[str, Any]:
     """用项目 RAG 检索正文细节补全资产描述。"""
 
@@ -717,15 +939,6 @@ async def enrich_asset_description(
             "asset_type": asset_type,
             "supplement": "",
             "status": "no_rag_context",
-            "rag_runtime": rag_runtime,
-        }
-
-    if not allow_llm_enrichment:
-        return {
-            "name": name,
-            "asset_type": asset_type,
-            "supplement": "",
-            "status": "skipped_enrichment_limit",
             "rag_runtime": rag_runtime,
         }
 
@@ -854,6 +1067,29 @@ async def write_master_and_derivative(
         label=state,
     )
     return master, master_new, derived, derived_new
+
+
+def _asset_keys_for_item(item: dict[str, Any]) -> list[tuple[str, str]]:
+    """返回单个抽取项将写入的主资产与衍生资产唯一键。"""
+
+    asset_type = str(item["asset_type"])
+    master_name = str(item["name"]).strip()
+    if not master_name:
+        return []
+    derived_name = _derive_variant_asset_name(master_name, _infer_asset_state(item))
+    return [(asset_type, master_name), (asset_type, derived_name)]
+
+
+async def _lock_asset_keys(
+    session: AsyncSession,
+    project_id: int,
+    user_public_id: str,
+    keys: list[tuple[str, str]],
+) -> None:
+    """按稳定顺序预取本事务内全部资产锁，避免并发任务交叉等待。"""
+
+    for key in sorted(set(keys), key=lambda item: (item[0], item[1])):
+        await _lock_asset_key(session, project_id, user_public_id, key)
 
 
 async def _upsert_child_relation(
@@ -1145,6 +1381,56 @@ def load_asset_extraction_prompt(registry: PromptRegistry | None = None) -> str:
     return prompt_registry.skill(prompt_name)
 
 
+def load_asset_autocomplete_prompt(registry: PromptRegistry | None = None) -> str:
+    """从 data/skills 读取资产描述补全核心提示词。"""
+
+    prompt_name = settings.asset_autocomplete_prompt_name.strip()
+    if not prompt_name:
+        raise AssetServiceError("资产描述补全提示词名称未配置")
+    prompt_registry = registry or PromptRegistry.from_settings()
+    return prompt_registry.skill(prompt_name)
+
+
+def build_autocomplete_messages(
+    *,
+    asset_type: str,
+    name: str,
+    current_summary: str,
+    current_keyword: str,
+    current_colors: str,
+    current_description: dict[str, Any],
+    current_details: dict[str, Any],
+    current_accessories: dict[str, Any],
+    script_context: str,
+    retry_feedback: str = "",
+) -> list[dict[str, str]]:
+    """构建单个资产描述补全提示词。"""
+
+    system = load_asset_autocomplete_prompt()
+    current_block = json.dumps(
+        {
+            "assetType": asset_type,
+            "name": name,
+            "summary": current_summary,
+            "keyword": current_keyword,
+            "colors": current_colors,
+            "description": current_description,
+            "details": current_details,
+            "accessories": current_accessories,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    user = (
+        f"## 资产现有信息\n{current_block}\n\n"
+        f"## 关联正文上下文\n{script_context.strip() or '（未找到关联正文）'}\n\n"
+        "请输出补全后的资产 JSON 对象。"
+    )
+    if retry_feedback.strip():
+        user += f"\n\n## 上一次输出的问题（必须修正）\n{retry_feedback.strip()}"
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
 def _model_prompt_trace(*, model_id: str, messages: list[dict[str, str]]) -> dict[str, Any]:
     """记录资产抽取模型调用的提示词信息。"""
 
@@ -1269,3 +1555,422 @@ async def load_asset_or_raise(
     if asset is None:
         raise AssetNotFoundError("资产不存在或无权访问")
     return asset
+
+
+# ---------------------------------------------------------------------------
+# 资产管理：分页筛选 / 父子树 / 正文引用 / 手动增改 / 批量与级联删除
+# ---------------------------------------------------------------------------
+
+ASSET_TYPE_DISPLAY_ORDER = (
+    ASSET_TYPE_ROLE,
+    ASSET_TYPE_FACTION,
+    ASSET_TYPE_PROP,
+    ASSET_TYPE_SCENE,
+)
+
+
+def _asset_read_dict(asset: Asset) -> dict[str, Any]:
+    """把资产实体转为响应字典（含子资产/引用前的基础字段）。"""
+
+    return {
+        "public_id": asset.public_id,
+        "asset_type": asset.asset_type,
+        "name": asset.name,
+        "keyword": asset.keyword,
+        "colors": asset.colors,
+        "summary": asset.summary,
+        "description": asset.description,
+        "details": asset.details,
+        "accessories": asset.accessories,
+        "status": asset.status,
+        "main_asset": asset.main_asset,
+        "variant_label": asset.variant_label,
+        "created_at": asset.created_at,
+        "updated_at": asset.updated_at,
+    }
+
+
+def _asset_reference_dict(episode: Any, plan: Any, source: str, snippet: str) -> dict[str, Any]:
+    """构造资产引用记录字典。"""
+
+    return {
+        "episode_public_id": str(episode.public_id),
+        "episode_index": int(episode.episode_index),
+        "episode_title": episode.title or "",
+        "plan_public_id": str(plan.public_id),
+        "plan_title": plan.title or "",
+        "source": source,
+        "snippet": snippet,
+    }
+
+
+def _reference_snippet(body: str, index: int, length: int) -> str:
+    """围绕命中位置截取一小段正文，便于人工核对。"""
+
+    start = max(0, index - 20)
+    end = min(len(body), index + length + 20)
+    snippet = body[start:end].replace("\n", " ").strip()
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(body) else ""
+    return f"{prefix}{snippet}{suffix}"
+
+
+async def find_asset_references(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    assets: list[Asset],
+) -> dict[str, list[dict[str, Any]]]:
+    """查询资产被剧本分集引用的记录：AssetEpisode 显式关联 + 正文名称命中。"""
+
+    project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    result: dict[str, list[dict[str, Any]]] = {asset.public_id: [] for asset in assets}
+    if not assets:
+        return result
+    asset_ids = [int(asset.id) for asset in assets if asset.id is not None]
+    asset_by_id = {int(asset.id): asset for asset in assets if asset.id is not None}
+
+    ep_statement = (
+        select(ScriptEpisode, ScriptPlan)
+        .join(ScriptPlan, ScriptEpisode.plan_id == ScriptPlan.id)
+        .where(
+            ScriptPlan.project_id == project.id,
+            ScriptPlan.user_public_id == user_public_id,
+            ScriptPlan.disabled_at.is_(None),
+            ScriptEpisode.disabled_at.is_(None),
+        )
+        .order_by(ScriptEpisode.episode_index, ScriptEpisode.id)
+    )
+    ep_rows = list((await session.exec(ep_statement)).all())
+    episode_by_id = {int(episode.id): (episode, plan) for episode, plan in ep_rows}
+
+    seen: set[tuple[str, str, str]] = set()
+    if asset_ids:
+        assoc_statement = select(AssetEpisode).where(
+            AssetEpisode.project_id == project.id,
+            AssetEpisode.user_public_id == user_public_id,
+            AssetEpisode.asset_id.in_(asset_ids),
+        )
+        for link in (await session.exec(assoc_statement)).all():
+            pair = episode_by_id.get(int(link.episode_id))
+            asset = asset_by_id.get(int(link.asset_id))
+            if pair is None or asset is None:
+                continue
+            episode, plan = pair
+            key = (asset.public_id, str(episode.public_id), "association")
+            if key in seen:
+                continue
+            seen.add(key)
+            result[asset.public_id].append(_asset_reference_dict(episode, plan, "association", ""))
+
+    for episode, plan in ep_rows:
+        body = episode.body or ""
+        if not body:
+            continue
+        for asset in assets:
+            name = (asset.name or "").strip()
+            if not name:
+                continue
+            index = body.find(name)
+            if index == -1:
+                continue
+            key = (asset.public_id, str(episode.public_id), "text")
+            if key in seen:
+                continue
+            seen.add(key)
+            result[asset.public_id].append(
+                _asset_reference_dict(episode, plan, "text", _reference_snippet(body, index, len(name)))
+            )
+    return result
+
+
+async def list_assets_page(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    *,
+    asset_type: str = "",
+    keyword: str = "",
+    status: str = "",
+    referenced: str = "",
+    page: int = 1,
+    page_size: int = 20,
+) -> dict[str, Any]:
+    """分页 + 筛选列出资产；根资产带 child_of 子资产树与正文引用。"""
+
+    project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    normalized_type = asset_type.strip().lower()
+    if normalized_type and normalized_type not in VALID_ASSET_TYPES:
+        raise AssetServiceError(f"不支持的资产类型：{asset_type}")
+    normalized_status = status.strip().lower()
+    if normalized_status and normalized_status not in {ASSET_STATUS_DRAFT, ASSET_STATUS_LOCKED}:
+        raise AssetServiceError(f"不支持的资产状态：{status}")
+    normalized_referenced = referenced.strip().lower()
+    page = max(1, int(page))
+    page_size = min(100, max(1, int(page_size)))
+
+    statement = select(Asset).where(
+        Asset.project_id == project.id,
+        Asset.user_public_id == user_public_id,
+        Asset.disabled_at.is_(None),
+    )
+    all_assets = list((await session.exec(statement)).all())
+    asset_by_id = {int(asset.id): asset for asset in all_assets if asset.id is not None}
+
+    children_by_parent: dict[int, list[Asset]] = {}
+    child_ids: set[int] = set()
+    if asset_by_id:
+        rel_statement = select(AssetRelation).where(
+            AssetRelation.relation_type == ASSET_RELATION_CHILD_OF,
+            AssetRelation.source_asset_id.in_(list(asset_by_id.keys())),
+        )
+        for relation in (await session.exec(rel_statement)).all():
+            child = asset_by_id.get(int(relation.source_asset_id))
+            parent = asset_by_id.get(int(relation.target_asset_id))
+            if child is None or parent is None:
+                continue
+            children_by_parent.setdefault(int(parent.id), []).append(child)
+            child_ids.add(int(child.id))
+
+    references_map = await find_asset_references(session, project_public_id, user_public_id, all_assets)
+    order = {asset_type_name: index for index, asset_type_name in enumerate(ASSET_TYPE_DISPLAY_ORDER)}
+
+    def _match(asset: Asset) -> bool:
+        if normalized_status and asset.status != normalized_status:
+            return False
+        if keyword.strip():
+            kw = keyword.strip().lower()
+            # 仅匹配名称/关键词/变体标签等"标识字段"，不匹配 summary/description 长文，
+            # 否则搜主角名会命中几乎所有资产的描述，等同于没过滤。
+            haystack = " ".join(
+                [asset.name or "", asset.keyword or "", asset.variant_label or ""]
+            ).lower()
+            if kw not in haystack:
+                return False
+        if normalized_referenced in {"with", "without"}:
+            has_ref = bool(references_map.get(asset.public_id))
+            if normalized_referenced == "with" and not has_ref:
+                return False
+            if normalized_referenced == "without" and has_ref:
+                return False
+        return True
+
+    candidates = [asset for asset in all_assets if int(asset.id) not in child_ids]
+    if normalized_type:
+        candidates = [asset for asset in candidates if asset.asset_type == normalized_type]
+    include_children = True
+
+    filtered = [asset for asset in candidates if _match(asset)]
+    filtered.sort(key=lambda asset: (order.get(asset.asset_type, 99), asset.name or ""))
+    total = len(filtered)
+    start = (page - 1) * page_size
+    page_items = filtered[start : start + page_size]
+
+    def _build(asset: Asset) -> dict[str, Any]:
+        data = _asset_read_dict(asset)
+        data["references"] = references_map.get(asset.public_id, [])
+        if include_children:
+            children = sorted(
+                children_by_parent.get(int(asset.id), []),
+                key=lambda child: (order.get(child.asset_type, 99), child.name or ""),
+            )
+            data["children"] = [
+                {**_asset_read_dict(child), "references": references_map.get(child.public_id, []), "children": []}
+                for child in children
+            ]
+        else:
+            data["children"] = []
+        return data
+
+    pages = (total + page_size - 1) // page_size if page_size else 0
+    return {
+        "items": [_build(asset) for asset in page_items],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+async def create_asset(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    *,
+    asset_type: str,
+    name: str,
+    keyword: str = "",
+    colors: str = "",
+    summary: str = "",
+    description: str = "",
+    details: str = "{}",
+    accessories: str = "{}",
+    main_asset: bool = True,
+    variant_label: str = "",
+) -> Asset:
+    """手动创建根资产；类型受限于 VALID_ASSET_TYPES，名称唯一。"""
+
+    project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    normalized_type = asset_type.strip().lower()
+    if normalized_type not in VALID_ASSET_TYPES:
+        raise AssetServiceError(f"不支持手动创建的资产类型：{asset_type}")
+    trimmed_name = name.strip()
+    if not trimmed_name:
+        raise AssetServiceError("资产名称不能为空")
+
+    key = (normalized_type, trimmed_name)
+    await _lock_asset_key(session, int(project.id), user_public_id, key)
+    if await load_existing_asset_by_key(session, int(project.id), user_public_id, key) is not None:
+        raise AssetServiceError(f"已存在同名资产：{trimmed_name}")
+
+    asset = Asset(
+        project_id=int(project.id),
+        user_public_id=user_public_id,
+        asset_type=normalized_type,
+        name=trimmed_name,
+        keyword=keyword.strip()[:500],
+        colors=colors.strip()[:1000],
+        summary=summary,
+        description=description or "",
+        details=details or "{}",
+        accessories=accessories or "{}",
+        main_asset=bool(main_asset),
+        variant_label=variant_label.strip()[:100],
+    )
+    session.add(asset)
+    await session.flush()
+    return asset
+
+
+async def update_asset(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    asset_public_id: str,
+    *,
+    fields: dict[str, Any],
+) -> Asset:
+    """编辑未锁定资产；仅更新提供的字段，重命名需保持唯一。"""
+
+    project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    asset = await load_asset_or_raise(session, int(project.id), user_public_id, asset_public_id)
+    if asset.status == ASSET_STATUS_LOCKED:
+        raise AssetServiceError("资产已锁定，请先解锁再编辑")
+
+    new_name = fields.get("name")
+    if new_name is not None:
+        trimmed = str(new_name).strip()
+        if not trimmed:
+            raise AssetServiceError("资产名称不能为空")
+        if trimmed != asset.name:
+            key = (asset.asset_type, trimmed)
+            await _lock_asset_key(session, int(project.id), user_public_id, key)
+            existing = await load_existing_asset_by_key(session, int(project.id), user_public_id, key)
+            if existing is not None and existing.public_id != asset.public_id:
+                raise AssetServiceError(f"已存在同名资产：{trimmed}")
+            asset.name = trimmed[:200]
+
+    for attr in ("keyword", "colors", "summary", "description", "details", "accessories", "variant_label"):
+        value = fields.get(attr)
+        if value is not None:
+            setattr(asset, attr, value)
+    asset.updated_at = utc_now()
+    session.add(asset)
+    await session.flush()
+    return asset
+
+
+async def load_assets_by_public_ids(
+    session: AsyncSession,
+    project_id: int,
+    user_public_id: str,
+    public_ids: list[str],
+) -> list[Asset]:
+    """按请求顺序加载资产，缺失则报错。"""
+
+    result: list[Asset] = []
+    for public_id in _dedupe_public_ids(public_ids):
+        result.append(await load_asset_or_raise(session, project_id, user_public_id, public_id))
+    return result
+
+
+async def delete_assets_with_children(
+    session: AsyncSession,
+    project_id: int,
+    user_public_id: str,
+    assets: list[Asset],
+) -> int:
+    """级联硬删除资产及其全部 child_of 后代，并清理关系/分集/版本/媒体/生成记录。"""
+
+    target_ids: set[int] = set()
+    frontier = [int(asset.id) for asset in assets if asset.id is not None]
+    while frontier:
+        current = frontier.pop()
+        if current in target_ids:
+            continue
+        target_ids.add(current)
+        rows = (
+            await session.exec(
+                select(AssetRelation).where(
+                    AssetRelation.target_asset_id == current,
+                    AssetRelation.relation_type == ASSET_RELATION_CHILD_OF,
+                )
+            )
+        ).all()
+        for relation in rows:
+            child_id = int(relation.source_asset_id)
+            if child_id not in target_ids:
+                frontier.append(child_id)
+
+    if not target_ids:
+        return 0
+    id_list = list(target_ids)
+    await session.exec(
+        delete(AssetRelation).where(
+            or_(AssetRelation.source_asset_id.in_(id_list), AssetRelation.target_asset_id.in_(id_list))
+        )
+    )
+    await session.exec(delete(AssetEpisode).where(AssetEpisode.asset_id.in_(id_list)))
+    await session.exec(delete(AssetVersion).where(AssetVersion.asset_id.in_(id_list)))
+    await session.exec(delete(AssetMedia).where(AssetMedia.asset_id.in_(id_list)))
+    await session.exec(delete(AssetGeneration).where(AssetGeneration.asset_id.in_(id_list)))
+    await session.exec(
+        delete(Asset).where(
+            Asset.id.in_(id_list),
+            Asset.project_id == project_id,
+            Asset.user_public_id == user_public_id,
+        )
+    )
+    await session.flush()
+    return len(id_list)
+
+
+async def batch_update_assets(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    *,
+    asset_public_ids: list[str],
+    operation: str,
+) -> dict[str, Any]:
+    """批量锁定/解锁/删除资产。"""
+
+    project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    normalized_op = operation.strip().lower()
+    if normalized_op not in ASSET_BATCH_OPERATIONS:
+        raise AssetServiceError(f"不支持的批量操作：{operation}")
+    assets = await load_assets_by_public_ids(session, int(project.id), user_public_id, asset_public_ids)
+    if not assets:
+        raise AssetServiceError("没有可操作的资产")
+
+    if normalized_op == "delete":
+        affected = await delete_assets_with_children(session, int(project.id), user_public_id, assets)
+        return {"affected": affected, "assets": []}
+
+    target_status = ASSET_STATUS_LOCKED if normalized_op == "lock" else ASSET_STATUS_DRAFT
+    for asset in assets:
+        asset.status = target_status
+        asset.updated_at = utc_now()
+        session.add(asset)
+    await session.flush()
+    return {"affected": len(assets), "assets": assets}

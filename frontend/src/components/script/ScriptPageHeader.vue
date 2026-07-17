@@ -21,6 +21,11 @@
         &nbsp;新建剧本
       </el-button>
 
+      <el-button class="header-action" size="large" @click="emit('assets')">
+        <el-icon><Collection /></el-icon>
+        &nbsp;资产管理
+      </el-button>
+
       <el-button class="header-action" size="large" @click="emit('production')">
         <el-icon><Film /></el-icon>
         &nbsp;进入生产工作台
@@ -30,12 +35,13 @@
 </template>
 
 <script setup lang="ts">
-import { Back, Film, Plus, Upload } from '@element-plus/icons-vue'
+import { Back, Collection, Film, Plus, Upload } from '@element-plus/icons-vue'
 
 const emit = defineEmits<{
   (e: 'back-screenwriting'): void
   (e: 'import'): void
   (e: 'create'): void
   (e: 'production'): void
+  (e: 'assets'): void
 }>()
 </script>

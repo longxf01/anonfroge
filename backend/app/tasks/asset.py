@@ -68,6 +68,45 @@ def _payload_str_list(value: Any) -> list[str]:
     return result
 
 
+async def autocomplete_asset_task(context: Any) -> dict[str, Any]:
+    """资产描述补全子任务处理器。"""
+
+    payload = context.message.payload
+    project_public_id = str(payload.get("project_public_id") or "").strip()
+    current_user_public_id = str(payload.get("current_user_public_id") or "").strip()
+    model_id = str(payload.get("model_id") or "").strip()
+    asset_public_id = str(payload.get("asset_public_id") or "").strip()
+    if not project_public_id or not current_user_public_id or not model_id or not asset_public_id:
+        raise ValueError("资产补全任务参数不完整")
+
+    try:
+        result = await asset_service.autocomplete_asset(
+            context.session,
+            project_public_id,
+            current_user_public_id,
+            asset_public_id=asset_public_id,
+            model_id=model_id,
+        )
+        await context.session.commit()
+    except asset_service.AssetServiceError as exc:
+        await context.session.rollback()
+        raise TaskHandlerFailure(
+            str(exc),
+            error_code="asset_autocomplete_failed",
+            result={**exc.result, "asset_public_id": asset_public_id},
+        ) from exc
+
+    return {
+        "asset_public_id": result["asset"].public_id,
+        "model_id": result.get("model_id") or model_id,
+        "messages": result.get("messages") or [],
+        "composed_prompt": str(result.get("composed_prompt") or ""),
+        "raw_output": str(result.get("raw_output") or ""),
+        "output_text": str(result.get("output_text") or ""),
+    }
+
+
 ASYNC_TASKS = (
     AsyncTaskDefinition(asset_service.ASSET_EXTRACT_TASK_TYPE, extract_assets_task),
+    AsyncTaskDefinition(asset_service.ASSET_AUTOCOMPLETE_TASK_TYPE, autocomplete_asset_task),
 )
