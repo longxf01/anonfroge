@@ -59,6 +59,7 @@
       v-model="assetDrawerVisible"
       :project-public-id="projectPublicId"
       :text-model-id="currentTextModel"
+      :image-model-id="currentImageModel"
       @changed="loadEpisodes"
     />
 
@@ -229,6 +230,7 @@ const loadAssets = async () => {
 }
 
 const currentTextModel = computed(() => currentProject.value?.text_model?.trim() || '')
+const currentImageModel = computed(() => currentProject.value?.image_model?.trim() || '')
 
 const ensureTextModel = () => {
   if (currentTextModel.value) return true

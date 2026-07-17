@@ -4,6 +4,7 @@ from typing import Any
 
 from app.core.tasks.engine import AsyncTaskDefinition, TaskHandlerFailure
 from app.services import asset as asset_service
+from app.services import asset_media as asset_media_service
 
 
 async def extract_assets_task(context: Any) -> dict[str, Any]:
@@ -106,7 +107,55 @@ async def autocomplete_asset_task(context: Any) -> dict[str, Any]:
     }
 
 
+async def image_generation_asset_task(context: Any) -> dict[str, Any]:
+    """资产图像生成子任务处理器。"""
+
+    payload = context.message.payload
+    project_public_id = str(payload.get("project_public_id") or "").strip()
+    current_user_public_id = str(payload.get("current_user_public_id") or "").strip()
+    model_id = str(payload.get("model_id") or "").strip()
+    asset_public_id = str(payload.get("asset_public_id") or "").strip()
+    prompt = str(payload.get("prompt") or "")
+    aspect_ratio = str(payload.get("aspect_ratio") or "")
+    image_size = str(payload.get("image_size") or "")
+    if not project_public_id or not current_user_public_id or not model_id or not asset_public_id:
+        raise ValueError("资产图像生成任务参数不完整")
+
+    try:
+        result = await asset_media_service.generate_asset_image(
+            context.session,
+            project_public_id,
+            current_user_public_id,
+            asset_public_id=asset_public_id,
+            model_id=model_id,
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            image_size=image_size,
+        )
+        await context.session.commit()
+    except asset_service.AssetServiceError as exc:
+        await context.session.rollback()
+        raise TaskHandlerFailure(
+            str(exc),
+            error_code="asset_image_generation_failed",
+            result={**exc.result, "asset_public_id": asset_public_id},
+        ) from exc
+
+    media = result["media"]
+    generation = result["generation"]
+    return {
+        "asset_public_id": asset_public_id,
+        "media_public_id": media.public_id,
+        "url": media.url,
+        "model_id": generation.model_id,
+        "composed_prompt": str(result.get("composed_prompt") or ""),
+        "raw_output": str(result.get("raw_output") or ""),
+        "output_text": str(result.get("output_text") or "")
+    }
+
+
 ASYNC_TASKS = (
     AsyncTaskDefinition(asset_service.ASSET_EXTRACT_TASK_TYPE, extract_assets_task),
     AsyncTaskDefinition(asset_service.ASSET_AUTOCOMPLETE_TASK_TYPE, autocomplete_asset_task),
+    AsyncTaskDefinition(asset_media_service.ASSET_IMAGE_GENERATION_TASK_TYPE, image_generation_asset_task),
 )

@@ -164,6 +164,82 @@ class OpenAICompatibleTextProvider(BaseProvider):
         return ""
 
 
+class OpenAICompatibleImageProvider(BaseProvider):
+    """OpenAI 兼容协议的通用图像生成 Provider（/images/generations）。
+
+    与 OpenAICompatibleTextProvider 同构：所有走 OpenAI 协议的生图服务复用本类，
+    各服务文件无需各自实现 generate_image。返回供应商原始 JSON，由网关
+    MediaGenerationOutput.from_raw 归一为统一媒体结果。
+    """
+
+    provider_key = "openai_compatible"
+    model_type = "image"
+
+    def __init__(
+        self,
+        config: ProviderConfig,
+        *,
+        input_values: dict[str, str] | None = None,
+        timeout: float = 60.0,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self.config = config
+        self.provider_key = config.key
+        self.provider_config = config.model_dump(mode="json")
+        self.input_values = {**config.input_values, **(input_values or {})}
+        self.base_url = config.base_url
+        self.timeout = timeout
+        self.client = client
+
+    def _build_request(
+        self, *, model_id: str | None = None, prompt: str = "", **kwargs: Any
+    ) -> tuple[dict[str, Any], dict[str, str], str]:
+        resolved_model_id = (model_id or "").strip()
+        if not resolved_model_id:
+            raise ProviderRuntimeError("model_id 不能为空")
+        prompt_text = str(prompt or "").strip()
+        if not prompt_text:
+            raise ProviderRuntimeError("prompt 不能为空")
+
+        payload: dict[str, Any] = {
+            "model": resolved_model_id,
+            "prompt": prompt_text,
+            "n": 1,
+            "response_format": "b64_json",
+        }
+        for key in ("size", "response_format", "aspect_ratio", "image_size", "quality", "background", "user", "n"):
+            if key in kwargs and kwargs[key] is not None:
+                payload[key] = kwargs[key]
+
+        headers = {
+            "Authorization": f"Bearer {_resolve_openai_api_key(self.config, self.input_values)}",
+            "Content-Type": "application/json",
+        }
+        return payload, headers, _build_images_generations_url(self.base_url)
+
+    async def generate(self, *, model_id: str | None = None, **kwargs: Any) -> Any:
+        return await self.generate_image(model_id=model_id, **kwargs)
+
+    async def generate_image(self, *, model_id: str | None = None, prompt: str = "", **kwargs: Any) -> Any:
+        """调用 OpenAI 兼容的 images/generations 接口生成图像，返回原始 JSON。"""
+        payload, headers, url = self._build_request(model_id=model_id, prompt=prompt, **kwargs)
+        try:
+            if self.client is not None:
+                response = await self.client.post(url, headers=headers, json=payload)
+            else:
+                async with httpx.AsyncClient(timeout=_build_httpx_timeout(self.timeout)) as client:
+                    response = await client.post(url, headers=headers, json=payload)
+        except httpx.HTTPError as exc:
+            raise ProviderRuntimeError(f"图像生成请求失败: {_format_http_error(exc, url)}") from exc
+
+        if response.status_code >= 400:
+            raise ProviderRuntimeError(f"图像生成请求失败，HTTP {response.status_code}: {response.text}")
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise ProviderRuntimeError("图像生成响应不是合法 JSON") from exc
+
+
 def create_provider(
     provider_key: str,
     model_type: str,
@@ -215,6 +291,13 @@ def create_provider_for_model(
                         timeout=timeout,
                         client=client,
                     )
+                if _should_use_openai_compatible_image_provider(config, model.model_type):
+                    return OpenAICompatibleImageProvider(
+                        config,
+                        input_values=input_values,
+                        timeout=timeout,
+                        client=client,
+                    )
                 return create_provider(
                     config.key,
                     model.model_type,
@@ -235,6 +318,16 @@ def _should_use_openai_compatible_text_provider(config: ProviderConfig, model_ty
     return bool(config.base_url.strip().rstrip("/").endswith("/v1"))
 
 
+def _should_use_openai_compatible_image_provider(config: ProviderConfig, model_type: str) -> bool:
+    """判断图像模型是否可使用内置 OpenAI 兼容生图调用器。"""
+    if model_type != "image":
+        return False
+    protocol = config.protocol.strip().lower()
+    if protocol in {"openai", "openai-compatible", "openai_compatible"}:
+        return True
+    return bool(config.base_url.strip().rstrip("/").endswith("/v1"))
+
+
 def _build_chat_completions_url(base_url: str) -> str:
     """拼接 OpenAI 兼容的 chat completions 地址。"""
     normalized = base_url.strip().rstrip("/")
@@ -245,6 +338,18 @@ def _build_chat_completions_url(base_url: str) -> str:
     if normalized.endswith("/chat/completions"):
         return normalized
     return f"{normalized}/chat/completions"
+
+
+def _build_images_generations_url(base_url: str) -> str:
+    """拼接 OpenAI 兼容的 images/generations 地址。"""
+    normalized = base_url.strip().rstrip("/")
+    if not normalized:
+        raise ProviderRuntimeError("缺少请求地址")
+    if not normalized.startswith(("http://", "https://")):
+        raise ProviderRuntimeError("请求地址必须以 http:// 或 https:// 开头")
+    if normalized.endswith("/images/generations"):
+        return normalized
+    return f"{normalized}/images/generations"
 
 
 def _format_http_error(exc: httpx.HTTPError, url: str) -> str:

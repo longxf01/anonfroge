@@ -2,8 +2,8 @@
   <section class="detail">
     <header class="detail-head">
       <div class="head-left">
-        <h2 class="head-title" :title="job.name">{{ job.name }}</h2>
-        <TaskStatusTag :status="job.status" />
+        <h2 class="head-title" :title="job?.name || ''">{{ job?.name || '任务详情' }}</h2>
+        <TaskStatusTag :status="job?.status || 'pending'" />
       </div>
       <div class="head-actions">
         <el-button
@@ -62,34 +62,34 @@
     <div class="info-bar">
       <div class="info-item">
         <label>任务类型</label>
-        <span>{{ TASK_TYPE_LABEL[job.taskType] ?? job.taskType }}</span>
+        <span>{{ job ? (TASK_TYPE_LABEL[job.taskType] ?? job.taskType) : '—' }}</span>
       </div>
       <div class="info-item">
         <label>模型</label>
-        <span class="mono">{{ job.modelId || '—' }}</span>
+        <span class="mono">{{ job?.modelId || '—' }}</span>
       </div>
       <div class="info-item">
         <label>队列</label>
-        <span class="mono">{{ job.providerKey || '—' }}</span>
+        <span class="mono">{{ job?.providerKey || '—' }}</span>
       </div>
       <div class="info-item">
         <label>创建</label>
-        <span>{{ formatTime(job.createdAt) }}</span>
+        <span>{{ formatTime(job?.createdAt) }}</span>
       </div>
       <div class="info-item">
         <label>开始</label>
-        <span>{{ formatTime(job.startedAt) }}</span>
+        <span>{{ formatTime(job?.startedAt) }}</span>
       </div>
       <div class="info-item">
         <label>结束</label>
-        <span>{{ formatTime(job.finishedAt) }}</span>
+        <span>{{ formatTime(job?.finishedAt) }}</span>
       </div>
     </div>
 
     <div class="progress-block">
       <div class="progress-summary">
         <span class="summary-text">
-          已完成 <strong>{{ doneCount }}</strong> / {{ job.totalCount }}
+          已完成 <strong>{{ doneCount }}</strong> / {{ job?.totalCount ?? 0 }}
         </span>
         <span class="summary-percent">{{ percent }}%</span>
       </div>
@@ -100,27 +100,27 @@
       </div>
       <div class="count-grid">
         <div class="count-card pending">
-          <span class="num">{{ job.pendingCount }}</span>
+          <span class="num">{{ job?.pendingCount ?? 0 }}</span>
           <span class="lbl">排队中</span>
         </div>
         <div class="count-card running">
-          <span class="num">{{ job.runningCount }}</span>
+          <span class="num">{{ job?.runningCount ?? 0 }}</span>
           <span class="lbl">运行中</span>
         </div>
         <div class="count-card paused">
-          <span class="num">{{ job.pausedCount }}</span>
+          <span class="num">{{ job?.pausedCount ?? 0 }}</span>
           <span class="lbl">已暂停</span>
         </div>
         <div class="count-card succeeded">
-          <span class="num">{{ job.succeededCount }}</span>
+          <span class="num">{{ job?.succeededCount ?? 0 }}</span>
           <span class="lbl">已完成</span>
         </div>
         <div class="count-card failed">
-          <span class="num">{{ job.failedCount }}</span>
+          <span class="num">{{ job?.failedCount ?? 0 }}</span>
           <span class="lbl">失败</span>
         </div>
         <div class="count-card canceled">
-          <span class="num">{{ job.canceledCount }}</span>
+          <span class="num">{{ job?.canceledCount ?? 0 }}</span>
           <span class="lbl">已取消</span>
         </div>
       </div>
@@ -139,6 +139,7 @@
       :project-public-id="projectPublicId"
       :job-public-id="jobPublicId"
       :item-public-id="openItemId"
+      :initial-item="openItem"
     />
   </section>
 
@@ -163,6 +164,7 @@ import {
   resumeTaskJobApi,
   retryTaskJobApi,
   type AgentTaskType,
+  type TaskItemResponse,
   type TaskJobResponse,
 } from '@/api/task'
 import { useAdaptivePolling } from '@/composables/useAdaptivePolling'
@@ -174,7 +176,7 @@ import TaskItemDetailDialog from './TaskItemDetailDialog.vue'
 const props = defineProps<{
   projectPublicId: string
   jobPublicId: string
-  job: TaskJobResponse
+  job?: TaskJobResponse
 }>()
 
 const emit = defineEmits<{
@@ -195,7 +197,7 @@ const TASK_TYPE_LABEL: Record<AgentTaskType, string> = {
   'novel.chapter.clean_event': '章节事件清洗',
 }
 
-const job = ref<TaskJobResponse>(props.job)
+const job = ref<TaskJobResponse | null>(props.job ?? null)
 const loading = ref(false)
 const actionLoading = ref(false)
 const {
@@ -205,9 +207,11 @@ const {
 
 const itemDialogVisible = ref(false)
 const openItemId = ref<string | null>(null)
+const openItem = ref<TaskItemResponse | null>(null)
 
-const onOpenItem = (itemPublicId: string) => {
-  openItemId.value = itemPublicId
+const onOpenItem = (item: TaskItemResponse) => {
+  openItem.value = item
+  openItemId.value = item.publicId
   itemDialogVisible.value = true
 }
 
@@ -387,6 +391,7 @@ const onRemove = () =>
 watch(
   () => props.job,
   (nextJob) => {
+    if (!nextJob) return
     if (!job.value || job.value.publicId !== nextJob.publicId) {
       job.value = nextJob
       clearDetailLoadError()

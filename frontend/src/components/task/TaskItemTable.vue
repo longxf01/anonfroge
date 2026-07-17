@@ -102,7 +102,7 @@
             v-for="item in items"
             :key="item.publicId"
             class="row"
-            @click="emit('open-item', item.publicId)"
+            @click="emit('open-item', item)"
           >
             <td class="col-check" @click.stop>
               <el-checkbox
@@ -194,7 +194,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  (e: 'open-item', itemPublicId: string): void
+  (e: 'open-item', item: TaskItemResponse): void
   (e: 'mutated'): void
 }>()
 

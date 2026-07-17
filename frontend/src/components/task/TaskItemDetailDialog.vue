@@ -8,7 +8,7 @@
     modal-class="task-dark-overlay"
     :close-on-click-modal="false"
   >
-    <div v-if="loading" class="state">加载条目详情中…</div>
+    <div v-if="loading && !item" class="state">加载条目详情中…</div>
     <div v-else-if="!item" class="state">未能加载条目详情</div>
     <div v-else class="content">
       <section class="meta-row">
@@ -151,6 +151,44 @@
         />
       </section>
 
+      <section v-if="imagePreviewUrl" class="viewer-section media-viewer-section">
+        <div class="viewer-title media-viewer-title">
+          <div class="viewer-title-left">
+            <span class="window-dots" aria-hidden="true">
+              <i class="dot red"></i>
+              <i class="dot yellow"></i>
+              <i class="dot green"></i>
+            </span>
+            <h4>生成图片</h4>
+          </div>
+          <div class="viewer-title-actions">
+            <span v-if="item.mediaPublicId" class="viewer-language">{{ item.mediaPublicId }}</span>
+            <button class="title-copy-btn" type="button" @click="copyViewerText('图片地址', imagePreviewUrl)">
+              {{ copiedLabel === '图片地址' ? '已复制!' : '复制地址' }}
+            </button>
+            <el-tooltip content="新窗口打开" placement="top">
+              <button
+                class="title-icon-btn preview-icon-btn"
+                type="button"
+                aria-label="新窗口打开生成图片"
+                @click="openImageUrl"
+              >
+                <el-icon><Link /></el-icon>
+              </button>
+            </el-tooltip>
+          </div>
+        </div>
+        <div class="image-preview-shell">
+          <img
+            class="generated-image-preview"
+            :src="imagePreviewUrl"
+            alt="异步任务生成图片"
+            loading="lazy"
+            @click="imageViewerVisible = true"
+          />
+        </div>
+      </section>
+
       <section v-if="item.outputText" class="viewer-section">
         <MdPreview
           class="readonly-code-preview output-code-preview"
@@ -186,12 +224,20 @@
       />
     </div>
   </el-dialog>
+
+  <el-image-viewer
+    v-if="imageViewerVisible && imagePreviewUrl"
+    :url-list="[imagePreviewUrl]"
+    hide-on-click-modal
+    teleported
+    @close="imageViewerVisible = false"
+  />
 </template>
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { ElButton, ElDialog, ElMessage } from 'element-plus'
-import { ArrowDownBold, FullScreen } from '@element-plus/icons-vue'
+import { ArrowDownBold, FullScreen, Link } from '@element-plus/icons-vue'
 import { MdEditor, MdPreview } from 'md-editor-v3'
 import { getTaskItemApi, type TaskItemResponse } from '@/api/task'
 import { getErrorMessage } from '@/composables/usePollErrorNotice'
@@ -202,6 +248,7 @@ const props = defineProps<{
   projectPublicId: string
   jobPublicId: string
   itemPublicId: string | null
+  initialItem?: TaskItemResponse | null
 }>()
 
 const emit = defineEmits<{
@@ -216,8 +263,9 @@ const visible = computed({
 const item = ref<TaskItemResponse | null>(null)
 const loading = ref(false)
 const promptMaximized = ref(false)
-const promptCopied = ref(false)
-let promptCopyResetTimer: number | null = null
+const imageViewerVisible = ref(false)
+const copiedLabel = ref('')
+let copyResetTimer: number | null = null
 
 const expanded = reactive({
   prompt: true,
@@ -249,35 +297,44 @@ const outputCodeLanguage = computed(() => detectCodeLanguage(outputCopyText.valu
 
 const outputCodeMarkdown = computed(() => toCodeMarkdown(outputCopyText.value, outputCodeLanguage.value))
 
+const imagePreviewUrl = computed(() => item.value?.mediaUrl || '')
+
+const promptCopied = computed(() => copiedLabel.value === '任务提示词')
+
 const toggle = (key: keyof typeof expanded) => {
   expanded[key] = !expanded[key]
 }
 
-const clearPromptCopyState = () => {
-  if (promptCopyResetTimer !== null) {
-    window.clearTimeout(promptCopyResetTimer)
-    promptCopyResetTimer = null
+const clearCopyState = () => {
+  if (copyResetTimer !== null) {
+    window.clearTimeout(copyResetTimer)
+    copyResetTimer = null
   }
-  promptCopied.value = false
+  copiedLabel.value = ''
 }
 
-const showPromptCopied = () => {
-  clearPromptCopyState()
-  promptCopied.value = true
-  promptCopyResetTimer = window.setTimeout(() => {
-    promptCopied.value = false
-    promptCopyResetTimer = null
+const showCopied = (label: string) => {
+  clearCopyState()
+  copiedLabel.value = label
+  copyResetTimer = window.setTimeout(() => {
+    copiedLabel.value = ''
+    copyResetTimer = null
   }, 1500)
 }
 
 const copyViewerText = async (label: string, value: string) => {
   try {
     await navigator.clipboard.writeText(value || '')
-    showPromptCopied()
+    showCopied(label)
   } catch (error) {
     console.error(`${label}复制失败`, error)
     ElMessage.error(`${label}复制失败`)
   }
+}
+
+const openImageUrl = () => {
+  if (!imagePreviewUrl.value) return
+  window.open(imagePreviewUrl.value, '_blank', 'noopener,noreferrer')
 }
 
 const formatTime = (value: string | null | undefined) => {
@@ -368,7 +425,11 @@ const loadItem = async () => {
       props.jobPublicId,
       props.itemPublicId,
     )
-    item.value = data
+    item.value = {
+      ...data,
+      mediaUrl: data.mediaUrl || item.value?.mediaUrl || null,
+      mediaPublicId: data.mediaPublicId || item.value?.mediaPublicId || null,
+    }
   } catch (error) {
     console.error('加载条目详情失败', error)
     ElMessage.error(getErrorMessage(error, '加载条目详情失败'))
@@ -381,19 +442,21 @@ watch(
   () => [props.modelValue, props.itemPublicId] as const,
   ([open, id]) => {
     if (open && id) {
-      item.value = null
+      item.value = props.initialItem?.publicId === id ? props.initialItem : null
       expanded.prompt = true
-      clearPromptCopyState()
+      imageViewerVisible.value = false
+      clearCopyState()
       void loadItem()
     } else if (!open) {
       item.value = null
       promptMaximized.value = false
-      clearPromptCopyState()
+      imageViewerVisible.value = false
+      clearCopyState()
     }
   },
 )
 
-onBeforeUnmount(clearPromptCopyState)
+onBeforeUnmount(clearCopyState)
 </script>
 
 <style scoped>
@@ -654,6 +717,10 @@ onBeforeUnmount(clearPromptCopyState)
   font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
   font-size: 14px;
   line-height: 40px;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .title-copy-btn {
@@ -998,6 +1065,40 @@ onBeforeUnmount(clearPromptCopyState)
 .dialog-btn:focus {
   background: rgba(255, 255, 255, 0.1);
   border-color: rgba(255, 255, 255, 0.22);
+}
+
+.media-viewer-title {
+  cursor: default;
+}
+
+.image-preview-shell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 220px;
+  max-height: min(58vh, 520px);
+  padding: 12px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  background:
+    linear-gradient(45deg, rgba(255, 255, 255, 0.025) 25%, transparent 25%),
+    linear-gradient(-45deg, rgba(255, 255, 255, 0.025) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, rgba(255, 255, 255, 0.025) 75%),
+    linear-gradient(-45deg, transparent 75%, rgba(255, 255, 255, 0.025) 75%),
+    #0d1117;
+  background-position: 0 0, 0 10px, 10px -10px, -10px 0;
+  background-size: 20px 20px;
+}
+
+.generated-image-preview {
+  display: block;
+  max-width: 100%;
+  max-height: calc(min(58vh, 520px) - 24px);
+  object-fit: contain;
+  border-radius: 8px;
+  cursor: zoom-in;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
 }
 </style>
 

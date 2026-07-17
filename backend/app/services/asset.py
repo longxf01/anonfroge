@@ -1766,8 +1766,17 @@ async def list_assets_page(
     start = (page - 1) * page_size
     page_items = filtered[start : start + page_size]
 
+    from app.services import asset_media  # 局部导入避免与 asset_media 的循环依赖
+
+    cover_candidates: list[Asset] = list(page_items)
+    if include_children:
+        for root in page_items:
+            cover_candidates.extend(children_by_parent.get(int(root.id), []))
+    cover_map = await asset_media.cover_urls_for(session, int(project.id), user_public_id, cover_candidates)
+
     def _build(asset: Asset) -> dict[str, Any]:
         data = _asset_read_dict(asset)
+        data["thumbnail_url"] = cover_map.get(asset.public_id, "")
         data["references"] = references_map.get(asset.public_id, [])
         if include_children:
             children = sorted(
@@ -1775,7 +1784,12 @@ async def list_assets_page(
                 key=lambda child: (order.get(child.asset_type, 99), child.name or ""),
             )
             data["children"] = [
-                {**_asset_read_dict(child), "references": references_map.get(child.public_id, []), "children": []}
+                {
+                    **_asset_read_dict(child),
+                    "thumbnail_url": cover_map.get(child.public_id, ""),
+                    "references": references_map.get(child.public_id, []),
+                    "children": [],
+                }
                 for child in children
             ]
         else:
@@ -1880,6 +1894,96 @@ async def update_asset(
     return asset
 
 
+async def set_asset_parent(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    asset_public_id: str,
+    *,
+    parent_asset_public_id: str | None,
+) -> Asset:
+    """设置或解除资产父子关系；空父资产表示解绑。"""
+
+    project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    project_id = int(project.id)
+    asset = await load_asset_or_raise(session, project_id, user_public_id, asset_public_id)
+    if asset.status == ASSET_STATUS_LOCKED:
+        raise AssetServiceError("资产已锁定，请先解锁再调整父子关系")
+    if asset.id is None:
+        raise AssetServiceError("资产数据异常，无法调整父子关系")
+
+    parent_public_id = str(parent_asset_public_id or "").strip()
+    parent: Asset | None = None
+    if parent_public_id:
+        parent = await load_asset_or_raise(session, project_id, user_public_id, parent_public_id)
+        if parent.id is None:
+            raise AssetServiceError("父资产数据异常，无法调整父子关系")
+        if int(parent.id) == int(asset.id):
+            raise AssetServiceError("资产不能绑定为自己的父资产")
+        if await _asset_is_descendant(session, ancestor_id=int(asset.id), candidate_id=int(parent.id)):
+            raise AssetServiceError("不能绑定到当前资产的子资产，避免形成循环层级")
+        existing_parent_relation = (
+            await session.exec(
+                select(AssetRelation).where(
+                    AssetRelation.source_asset_id == int(parent.id),
+                    AssetRelation.relation_type == ASSET_RELATION_CHILD_OF,
+                )
+            )
+        ).first()
+        if existing_parent_relation is not None:
+            raise AssetServiceError("当前仅支持一层父子资产结构，不能绑定到子资产")
+
+    await session.exec(
+        delete(AssetRelation).where(
+            AssetRelation.source_asset_id == int(asset.id),
+            AssetRelation.relation_type == ASSET_RELATION_CHILD_OF,
+        )
+    )
+
+    if parent is not None:
+        await _upsert_child_relation(
+            session,
+            project_id,
+            user_public_id,
+            parent=parent,
+            child=asset,
+            label=asset.variant_label or asset.name,
+        )
+
+    asset.main_asset = parent is None
+    asset.updated_at = utc_now()
+    session.add(asset)
+    await session.flush()
+    return asset
+
+
+async def _asset_is_descendant(session: AsyncSession, *, ancestor_id: int, candidate_id: int) -> bool:
+    """判断 candidate 是否为 ancestor 的 child_of 后代。"""
+
+    frontier = [ancestor_id]
+    visited: set[int] = set()
+    while frontier:
+        current = frontier.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        rows = (
+            await session.exec(
+                select(AssetRelation).where(
+                    AssetRelation.target_asset_id == current,
+                    AssetRelation.relation_type == ASSET_RELATION_CHILD_OF,
+                )
+            )
+        ).all()
+        for relation in rows:
+            child_id = int(relation.source_asset_id)
+            if child_id == candidate_id:
+                return True
+            if child_id not in visited:
+                frontier.append(child_id)
+    return False
+
+
 async def load_assets_by_public_ids(
     session: AsyncSession,
     project_id: int,
@@ -1925,6 +2029,10 @@ async def delete_assets_with_children(
     if not target_ids:
         return 0
     id_list = list(target_ids)
+
+    from app.services import asset_media  # 局部导入避免循环依赖
+
+    await asset_media.delete_media_files_for_asset_ids(session, id_list)
     await session.exec(
         delete(AssetRelation).where(
             or_(AssetRelation.source_asset_id.in_(id_list), AssetRelation.target_asset_id.in_(id_list))

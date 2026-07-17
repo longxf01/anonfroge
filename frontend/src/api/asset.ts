@@ -142,6 +142,10 @@ export interface AssetUpdatePayload {
   variantLabel?: string
 }
 
+export interface AssetParentUpdatePayload {
+  parentAssetPublicId?: string | null
+}
+
 export interface AssetBatchPayload {
   assetPublicIds: string[]
   operation: 'lock' | 'unlock' | 'delete'
@@ -172,6 +176,15 @@ export const updateAssetApi = (
   payload: AssetUpdatePayload,
 ) => request.put<AssetItem>(`${projectAssetPath(projectPublicId)}/${encodeURIComponent(assetPublicId)}`, payload)
 
+export const setAssetParentApi = (
+  projectPublicId: string,
+  assetPublicId: string,
+  payload: AssetParentUpdatePayload,
+) => request.put<AssetItem>(
+  `${projectAssetPath(projectPublicId)}/${encodeURIComponent(assetPublicId)}/parent`,
+  payload,
+)
+
 export const batchAssetsApi = (projectPublicId: string, payload: AssetBatchPayload) =>
   request.post<AssetBatchResult>(`${projectAssetPath(projectPublicId)}/batch`, payload)
 
@@ -183,3 +196,67 @@ export const lockAssetApi = (projectPublicId: string, assetPublicId: string) =>
 
 export const unlockAssetApi = (projectPublicId: string, assetPublicId: string) =>
   request.post<AssetItem>(`${projectAssetPath(projectPublicId)}/${encodeURIComponent(assetPublicId)}/unlock`)
+
+// ---------------------------------------------------------------------------
+// 资产媒体（图像生成 / 画廊 / 封面 / 删除）
+// ---------------------------------------------------------------------------
+
+export interface AssetMediaItem {
+  publicId: string
+  mediaType: string
+  mediaRole: string
+  url: string
+  mimeType: string
+  width: number
+  height: number
+  prompt: string
+  createdAt: string
+}
+
+export interface AssetImageGeneratePayload {
+  modelId: string
+  assetPublicIds: string[]
+  prompt?: string
+  aspectRatio?: string
+  imageSize?: string
+  count?: number
+}
+
+export interface AssetImagePromptResult {
+  prompt: string
+}
+
+// 配图生成只提交异步任务，真正的模型调用由 Worker 执行。
+export const generateAssetImagesApi = (
+  projectPublicId: string,
+  payload: AssetImageGeneratePayload,
+) => (
+  request
+    .post<BackendTaskJobDetail>(`${projectAssetPath(projectPublicId)}/media/generate`, payload)
+    .then((response) => ({
+      ...response,
+      data: toTaskJob(response.data, projectPublicId, response.data.items),
+    } as typeof response & { data: TaskJobResponse }))
+)
+
+export const synthesizeAssetImagePromptApi = (projectPublicId: string, assetPublicId: string) =>
+  request.post<AssetImagePromptResult>(
+    `${projectAssetPath(projectPublicId)}/${encodeURIComponent(assetPublicId)}/media/prompt`,
+    undefined,
+    { timeout: 300000 },
+  )
+
+export const listAssetMediaApi = (projectPublicId: string, assetPublicId: string) =>
+  request.get<AssetMediaItem[]>(
+    `${projectAssetPath(projectPublicId)}/${encodeURIComponent(assetPublicId)}/media`,
+  )
+
+export const setAssetMediaCoverApi = (projectPublicId: string, mediaPublicId: string) =>
+  request.post<AssetMediaItem>(
+    `${projectAssetPath(projectPublicId)}/media/${encodeURIComponent(mediaPublicId)}/cover`,
+  )
+
+export const deleteAssetMediaApi = (projectPublicId: string, mediaPublicId: string) =>
+  request.delete<void>(
+    `${projectAssetPath(projectPublicId)}/media/${encodeURIComponent(mediaPublicId)}`,
+  )

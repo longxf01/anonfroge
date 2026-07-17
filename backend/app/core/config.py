@@ -148,6 +148,8 @@ class Settings(object):
     chapter_event_extraction_prompt_name: str = field( default_factory=lambda: os.getenv("CHAPTER_EVENT_EXTRACTION_PROMPT_NAME", "chapter_event_extraction") )  # 章节事件提取提示词名称
     asset_extraction_prompt_name: str = field(default_factory=lambda: os.getenv("ASSET_EXTRACTION_PROMPT_NAME", "asset_extraction"))  # 资产抽取提示词名称
     asset_autocomplete_prompt_name: str = field(default_factory=lambda: os.getenv("ASSET_AUTOCOMPLETE_PROMPT_NAME", "asset_autocomplete"))  # 资产描述补全提示词名称
+    asset_image_prompt_name: str = field(default_factory=lambda: os.getenv("ASSET_IMAGE_PROMPT_NAME", "asset_image_prompt"))  # 资产生图专业提示词合成提示词名称
+    asset_media_root: str = field(default_factory=lambda: os.getenv("ASSET_MEDIA_ROOT", "./data/asset_media"))  # 资产生成媒体本地存储根目录
     novel_crawl_http_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("NOVEL_CRAWL_HTTP_TIMEOUT_SECONDS", "20.0")))  # 小说爬虫 HTTP 总超时秒数
     novel_crawl_http_connect_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("NOVEL_CRAWL_HTTP_CONNECT_TIMEOUT_SECONDS", "10.0")))  # 小说爬虫 HTTP 连接超时秒数
     novel_crawl_impersonate: str = field(default_factory=lambda: os.getenv("NOVEL_CRAWL_IMPERSONATE", "chrome110"))  # 小说 rule 来源浏览器 TLS 指纹画像

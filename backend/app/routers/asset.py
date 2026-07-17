@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Query, Request, Response, status
+from fastapi.responses import FileResponse
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.database import get_session
@@ -18,12 +19,17 @@ from app.schemas.asset import (
     AssetDetailRead,
     AssetEpisodeBrief,
     AssetExtractRequest,
+    AssetImageGenerateRequest,
+    AssetImagePromptRead,
     AssetManageListResult,
+    AssetMediaRead,
+    AssetParentUpdateRequest,
     AssetRead,
     AssetUpdateRequest,
 )
 from app.schemas.tasks import TaskJobDetail
 from app.services import asset as asset_service
+from app.services import asset_media as asset_media_service
 from app.services import project as project_service
 from app.services import tasks as task_service
 
@@ -260,6 +266,187 @@ class AssetView(BaseView):
             await session.rollback()
             self._raise_as_http(exc)
         return AssetRead.model_validate(asset)
+
+    @route(
+        "/{asset_public_id}/parent",
+        methods=["PUT"],
+        response_model=AssetRead,
+        middlewares=ASSET_ROUTE_MIDDLEWARES,
+        summary="设置或解除资产父子关系",
+    )
+    async def set_asset_parent(
+        self,
+        project_public_id: str,
+        asset_public_id: str,
+        payload: AssetParentUpdateRequest,
+        request: Request,
+        session: SessionDep,
+    ) -> AssetRead:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            asset = await asset_service.set_asset_parent(
+                session,
+                project_public_id,
+                current_user_public_id,
+                asset_public_id,
+                parent_asset_public_id=payload.parent_asset_public_id,
+            )
+            await session.commit()
+        except (project_service.ProjectServiceError, asset_service.AssetServiceError) as exc:
+            await session.rollback()
+            self._raise_as_http(exc)
+        return AssetRead.model_validate(asset)
+
+    @route(
+        "/media/generate",
+        methods=["POST"],
+        response_model=TaskJobDetail,
+        status_code=status.HTTP_202_ACCEPTED,
+        middlewares=ASSET_ROUTE_MIDDLEWARES,
+        summary="资产配图生成",
+    )
+    async def generate_asset_images(
+        self,
+        project_public_id: str,
+        payload: AssetImageGenerateRequest,
+        request: Request,
+        session: SessionDep,
+    ) -> TaskJobDetail:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            return await asset_media_service.submit_asset_image_generation_task(
+                session,
+                project_public_id,
+                current_user_public_id,
+                model_id=payload.model_id,
+                asset_public_ids=payload.asset_public_ids,
+                prompt=payload.prompt,
+                aspect_ratio=payload.aspect_ratio,
+                image_size=payload.image_size,
+                count=payload.count,
+            )
+        except (project_service.ProjectServiceError, asset_service.AssetServiceError, task_service.TaskServiceError) as exc:
+            await session.rollback()
+            self._raise_as_http(exc)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="资产配图任务提交失败")
+
+    @route(
+        "/{asset_public_id}/media/prompt",
+        methods=["POST"],
+        response_model=AssetImagePromptRead,
+        middlewares=ASSET_ROUTE_MIDDLEWARES,
+        summary="生成资产生图专业提示词",
+    )
+    async def synthesize_asset_image_prompt(
+        self,
+        project_public_id: str,
+        asset_public_id: str,
+        request: Request,
+        session: SessionDep,
+    ) -> AssetImagePromptRead:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            prompt = await asset_media_service.synthesize_asset_image_prompt(
+                session,
+                project_public_id,
+                current_user_public_id,
+                asset_public_id=asset_public_id,
+            )
+        except (project_service.ProjectServiceError, asset_service.AssetServiceError) as exc:
+            self._raise_as_http(exc)
+        return AssetImagePromptRead(prompt=prompt)
+
+    @route(
+        "/media/{media_public_id}/cover",
+        methods=["POST"],
+        response_model=AssetMediaRead,
+        middlewares=ASSET_ROUTE_MIDDLEWARES,
+        summary="设为资产封面",
+    )
+    async def set_asset_media_cover(
+        self,
+        project_public_id: str,
+        media_public_id: str,
+        request: Request,
+        session: SessionDep,
+    ) -> AssetMediaRead:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            media = await asset_media_service.set_asset_cover(
+                session, project_public_id, current_user_public_id, media_public_id
+            )
+            await session.commit()
+        except (project_service.ProjectServiceError, asset_service.AssetServiceError) as exc:
+            await session.rollback()
+            self._raise_as_http(exc)
+        return AssetMediaRead.model_validate(media)
+
+    @route(
+        "/media/{media_public_id}/content",
+        methods=["GET"],
+        summary="读取资产媒体内容",
+        description="按媒体公开 ID 读取生成图片，供 HTML src 直接访问。",
+    )
+    async def get_asset_media_content(
+        self,
+        project_public_id: str,
+        media_public_id: str,
+        request: Request,
+        session: SessionDep,
+    ) -> FileResponse:
+        try:
+            path, mime_type = await asset_media_service.get_media_file(session, media_public_id)
+        except asset_service.AssetServiceError as exc:
+            self._raise_as_http(exc)
+        return FileResponse(path, media_type=mime_type)
+
+    @route(
+        "/media/{media_public_id}",
+        methods=["DELETE"],
+        status_code=status.HTTP_204_NO_CONTENT,
+        middlewares=ASSET_ROUTE_MIDDLEWARES,
+        summary="删除资产媒体",
+    )
+    async def delete_asset_media(
+        self,
+        project_public_id: str,
+        media_public_id: str,
+        request: Request,
+        session: SessionDep,
+    ) -> Response:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            await asset_media_service.delete_asset_media(
+                session, project_public_id, current_user_public_id, media_public_id
+            )
+            await session.commit()
+        except (project_service.ProjectServiceError, asset_service.AssetServiceError) as exc:
+            await session.rollback()
+            self._raise_as_http(exc)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @route(
+        "/{asset_public_id}/media",
+        methods=["GET"],
+        response_model=list[AssetMediaRead],
+        middlewares=ASSET_ROUTE_MIDDLEWARES,
+        summary="列出资产媒体",
+    )
+    async def list_asset_media(
+        self,
+        project_public_id: str,
+        asset_public_id: str,
+        request: Request,
+        session: SessionDep,
+    ) -> list[AssetMediaRead]:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            medias = await asset_media_service.list_asset_media(
+                session, project_public_id, current_user_public_id, asset_public_id
+            )
+        except (project_service.ProjectServiceError, asset_service.AssetServiceError) as exc:
+            self._raise_as_http(exc)
+        return [AssetMediaRead.model_validate(media) for media in medias]
 
     @route(
         "",
