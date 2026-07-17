@@ -6,10 +6,13 @@
 
 from __future__ import annotations
 
+import io
 import json
 import re
+import zipfile
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -30,11 +33,29 @@ class ScriptServiceError(Exception):
     """剧本管理服务失败。"""
 
 
+class ScriptPlanNotFoundError(ScriptServiceError):
+    """剧本计划不存在或无权访问。"""
+
+
+class ScriptEpisodeNotFoundError(ScriptServiceError):
+    """剧本分集不存在或无权访问。"""
+
+
+@dataclass(frozen=True)
+class ExportedScriptZip:
+    """剧本分集导出的 ZIP 文件内容。"""
+
+    filename: str
+    content: bytes
+    episode_count: int
+
+
 _SCENE_SLUG_RE = re.compile(r"^(\d+\s*[-－]\s*\d+)\s+(.+)$")
 _SCENE_TIME_RE = re.compile(r"(日|夜|晨|清晨|上午|中午|午后|下午|傍晚|黄昏|深夜|连续)")
 _SCENE_PLACE_RE = re.compile(r"(内|外)")
 _EP_TITLE_TAIL_RE = re.compile(r"\bEP\s*0?\d+\s*[：:\-\s]*(.*)$", re.IGNORECASE)
 _CN_TITLE_RE = re.compile(r"第\s*\d+\s*集\s*(.*)$")
+_UNSAFE_ZIP_NAME_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 
 @dataclass(frozen=True)
@@ -271,15 +292,7 @@ async def get_plan_detail(
 ) -> tuple[ScriptPlan, list[ScriptEpisode]]:
     """读取剧本计划详情与分集（校验归属当前用户与项目）。"""
     project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
-    statement = select(ScriptPlan).where(
-        ScriptPlan.public_id == plan_public_id,
-        ScriptPlan.project_id == project.id,
-        ScriptPlan.user_public_id == user_public_id,
-        ScriptPlan.disabled_at.is_(None),
-    )
-    plan = (await session.exec(statement)).first()
-    if plan is None:
-        raise ScriptServiceError("剧本计划不存在或无权访问")
+    plan = await _get_plan_or_raise(session, project, user_public_id, plan_public_id)
     episodes = await _load_plan_episodes(session, plan.id)
     return plan, episodes
 
@@ -330,3 +343,285 @@ async def _load_plan_episodes(session: AsyncSession, plan_id: int) -> list[Scrip
         .order_by(ScriptEpisode.episode_index)
     )
     return list((await session.exec(statement)).all())
+
+
+async def _get_plan_or_raise(
+    session: AsyncSession,
+    project: Any,
+    user_public_id: str,
+    plan_public_id: str,
+) -> ScriptPlan:
+    """按公开 ID 获取剧本计划，不存在或不归属当前项目/用户时抛业务异常。"""
+    statement = select(ScriptPlan).where(
+        ScriptPlan.public_id == plan_public_id,
+        ScriptPlan.project_id == project.id,
+        ScriptPlan.user_public_id == user_public_id,
+        ScriptPlan.disabled_at.is_(None),
+    )
+    plan = (await session.exec(statement)).first()
+    if plan is None:
+        raise ScriptPlanNotFoundError("剧本计划不存在或无权访问")
+    return plan
+
+
+async def create_plan_from_content(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    *,
+    title: str,
+    content: str,
+) -> ScriptPlan:
+    """把整段剧本 Markdown 解析为分集并落库为一份新的剧本计划（手动新建/导入）。
+
+    每次调用都创建一份独立计划，来源隔离键以 manual: 前缀加随机串保证唯一；
+    解析不出任何分集时报错。
+    """
+    project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    episodes = parse_script_episodes(content)
+    if not episodes:
+        raise ScriptServiceError("未能从内容中解析出分集，请检查剧本格式（需含分集标题）")
+
+    resolved_title = title.strip() or str(getattr(project, "name", "") or "").strip() or "未命名剧本"
+    plan = ScriptPlan(
+        project_id=project.id,
+        user_public_id=user_public_id,
+        source_isolation_key=f"manual:{uuid4()}",
+        title=resolved_title,
+        status="manual",
+    )
+    session.add(plan)
+    await session.flush()
+
+    for parsed in episodes:
+        session.add(
+            ScriptEpisode(
+                plan_id=plan.id,
+                episode_index=parsed.episode_index,
+                title=parsed.title,
+                summary=parsed.summary,
+                body=parsed.body,
+                scenes=_scenes_to_json(parsed.scenes),
+                version=1,
+            )
+        )
+    await session.flush()
+    return plan
+
+
+async def list_project_episodes(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+) -> list[tuple[ScriptEpisode, str, str]]:
+    """平铺列出项目下当前用户的全部分集，每项携带所属计划的公开 ID 与标题。"""
+    project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    statement = (
+        select(ScriptEpisode, ScriptPlan.public_id, ScriptPlan.title)
+        .join(ScriptPlan, ScriptEpisode.plan_id == ScriptPlan.id)
+        .where(
+            ScriptPlan.project_id == project.id,
+            ScriptPlan.user_public_id == user_public_id,
+            ScriptPlan.disabled_at.is_(None),
+            ScriptEpisode.disabled_at.is_(None),
+        )
+        .order_by(ScriptPlan.updated_at.desc(), ScriptPlan.id, ScriptEpisode.episode_index)
+    )
+    result = await session.exec(statement)
+    return [(episode, plan_public_id, plan_title) for episode, plan_public_id, plan_title in result.all()]
+
+
+async def export_episodes_zip(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    *,
+    episode_public_ids: list[str],
+) -> ExportedScriptZip:
+    """把选中的分集导出为 ZIP，每个分集一个 Markdown 文件。"""
+    if not episode_public_ids:
+        raise ScriptServiceError("请选择要导出的剧本分集")
+
+    project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    requested_ids = list(dict.fromkeys(episode_public_ids))
+    statement = (
+        select(ScriptEpisode, ScriptPlan)
+        .join(ScriptPlan, ScriptEpisode.plan_id == ScriptPlan.id)
+        .where(
+            ScriptEpisode.public_id.in_(requested_ids),
+            ScriptEpisode.disabled_at.is_(None),
+            ScriptPlan.project_id == project.id,
+            ScriptPlan.user_public_id == user_public_id,
+            ScriptPlan.disabled_at.is_(None),
+        )
+        .order_by(ScriptPlan.title, ScriptPlan.id, ScriptEpisode.episode_index)
+    )
+    rows = list((await session.exec(statement)).all())
+    if not rows:
+        raise ScriptEpisodeNotFoundError("未找到可导出的剧本分集")
+
+    buffer = io.BytesIO()
+    used_paths: set[str] = set()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for episode, plan in rows:
+            relative_path = _unique_zip_path(
+                used_paths,
+                f"{_safe_zip_name(plan.title or '未命名剧本')}/"
+                f"EP{episode.episode_index:02d}-{_safe_zip_name(episode.title or '未命名分集')}.md",
+            )
+            archive.writestr(relative_path, _format_episode_export(plan, episode).encode("utf-8"))
+
+    timestamp = utc_now().strftime("%Y%m%d-%H%M")
+    return ExportedScriptZip(
+        filename=f"scripts-{timestamp}.zip",
+        content=buffer.getvalue(),
+        episode_count=len(rows),
+    )
+
+
+def _safe_zip_name(value: str) -> str:
+    name = _UNSAFE_ZIP_NAME_RE.sub("_", value.strip()).strip(". ")
+    return name or "未命名"
+
+
+def _unique_zip_path(used_paths: set[str], relative_path: str) -> str:
+    if relative_path not in used_paths:
+        used_paths.add(relative_path)
+        return relative_path
+
+    stem, suffix = relative_path.rsplit(".", 1) if "." in relative_path else (relative_path, "")
+    counter = 2
+    while True:
+        candidate = f"{stem}-{counter}.{suffix}" if suffix else f"{stem}-{counter}"
+        if candidate not in used_paths:
+            used_paths.add(candidate)
+            return candidate
+        counter += 1
+
+
+def _format_episode_export(plan: ScriptPlan, episode: ScriptEpisode) -> str:
+    return episode.body
+
+
+async def update_plan(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    plan_public_id: str,
+    *,
+    title: str,
+) -> ScriptPlan:
+    """更新剧本计划元信息（当前支持剧名）。"""
+    project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    plan = await _get_plan_or_raise(session, project, user_public_id, plan_public_id)
+    plan.title = title.strip() or plan.title
+    plan.updated_at = utc_now()
+    session.add(plan)
+    await session.flush()
+    return plan
+
+
+async def delete_plan(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    plan_public_id: str,
+) -> None:
+    """删除整部剧本计划及其全部分集。"""
+    project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    plan = await _get_plan_or_raise(session, project, user_public_id, plan_public_id)
+    for episode in await _load_plan_episodes(session, plan.id):
+        await session.delete(episode)
+    await session.delete(plan)
+    await session.flush()
+
+
+async def get_episode_or_raise(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    episode_public_id: str,
+) -> tuple[ScriptEpisode, ScriptPlan]:
+    """按公开 ID 获取分集及其所属计划，校验归属当前项目与用户。"""
+    project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    statement = (
+        select(ScriptEpisode, ScriptPlan)
+        .join(ScriptPlan, ScriptEpisode.plan_id == ScriptPlan.id)
+        .where(
+            ScriptEpisode.public_id == episode_public_id,
+            ScriptEpisode.disabled_at.is_(None),
+            ScriptPlan.project_id == project.id,
+            ScriptPlan.user_public_id == user_public_id,
+            ScriptPlan.disabled_at.is_(None),
+        )
+    )
+    row = (await session.exec(statement)).first()
+    if row is None:
+        raise ScriptEpisodeNotFoundError("分集不存在或无权访问")
+    episode, plan = row
+    return episode, plan
+
+
+async def update_episode(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    episode_public_id: str,
+    *,
+    title: str | None = None,
+    summary: str | None = None,
+    body: str | None = None,
+) -> tuple[ScriptEpisode, ScriptPlan]:
+    """编辑分集：仅更新提交的字段；正文变更时重解析场次并递增版本。"""
+    episode, plan = await get_episode_or_raise(
+        session, project_public_id, user_public_id, episode_public_id
+    )
+    if title is not None:
+        episode.title = title
+    if summary is not None:
+        episode.summary = summary
+    if body is not None and body != episode.body:
+        episode.body = body
+        episode.scenes = _scenes_to_json(_parse_scenes(body))
+        episode.version += 1
+    episode.updated_at = utc_now()
+    plan.updated_at = utc_now()
+    session.add(episode)
+    session.add(plan)
+    await session.flush()
+    return episode, plan
+
+
+async def set_episode_lock(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    episode_public_id: str,
+    *,
+    locked: bool,
+) -> tuple[ScriptEpisode, ScriptPlan]:
+    """设置或解除分集的人工锁定。"""
+    episode, plan = await get_episode_or_raise(
+        session, project_public_id, user_public_id, episode_public_id
+    )
+    episode.is_locked = 1 if locked else 0
+    episode.updated_at = utc_now()
+    session.add(episode)
+    await session.flush()
+    return episode, plan
+
+
+async def delete_episode(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    episode_public_id: str,
+) -> None:
+    """删除单个分集。"""
+    episode, plan = await get_episode_or_raise(
+        session, project_public_id, user_public_id, episode_public_id
+    )
+    await session.delete(episode)
+    plan.updated_at = utc_now()
+    session.add(plan)
+    await session.flush()

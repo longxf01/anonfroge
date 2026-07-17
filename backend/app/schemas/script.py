@@ -21,6 +21,41 @@ class ScriptSyncPayload(BaseModel):
     title: str = Field(default="", max_length=200)
 
 
+class ScriptPlanCreate(BaseModel):
+    """手动新建/导入整部剧本的请求：把整段 Markdown 解析为分集落库。"""
+
+    model_config = WRITE_SCHEMA_CONFIG
+
+    title: str = Field(default="", max_length=200)
+    content: str = Field(min_length=1, description="整部剧本 Markdown，按分集标题拆分。")
+
+
+class ScriptPlanUpdate(BaseModel):
+    """更新剧本计划元信息的请求。"""
+
+    model_config = WRITE_SCHEMA_CONFIG
+
+    title: str = Field(min_length=1, max_length=200)
+
+
+class ScriptEpisodeUpdate(BaseModel):
+    """编辑单集的请求；仅提交的字段会被更新，正文变更会重解析场次并递增版本。"""
+
+    model_config = WRITE_SCHEMA_CONFIG
+
+    title: str | None = Field(default=None, max_length=200)
+    summary: str | None = None
+    body: str | None = None
+
+
+class ScriptExportRequest(BaseModel):
+    """导出选中剧本分集的请求。"""
+
+    model_config = WRITE_SCHEMA_CONFIG
+
+    episode_public_ids: list[str] = Field(default_factory=list, min_length=1)
+
+
 class ScriptSceneRead(BaseModel):
     """剧本分集的单场结构。"""
 
@@ -94,3 +129,41 @@ class ScriptPlanDetail(BaseModel):
     status: str = "synced"
     updated_at: datetime
     episodes: list[ScriptEpisodeRead] = Field(default_factory=list)
+
+
+class ScriptEpisodeListItem(BaseModel):
+    """分集平铺列表项：携带所属剧本计划信息，供「我的剧本」卡片直接展示与编辑。"""
+
+    model_config = READ_SCHEMA_CONFIG
+
+    public_id: str
+    plan_public_id: str
+    plan_title: str = ""
+    episode_index: int
+    title: str = ""
+    summary: str = ""
+    body: str = ""
+    scenes: list[ScriptSceneRead] = Field(default_factory=list)
+    version: int = 1
+    is_locked: bool = False
+    updated_at: datetime
+
+    @classmethod
+    def from_row(cls, episode: Any, plan_public_id: str, plan_title: str) -> "ScriptEpisodeListItem":
+        try:
+            raw_scenes = json.loads(episode.scenes or "[]")
+        except (TypeError, ValueError):
+            raw_scenes = []
+        return cls(
+            public_id=episode.public_id,
+            plan_public_id=plan_public_id,
+            plan_title=plan_title,
+            episode_index=episode.episode_index,
+            title=episode.title,
+            summary=episode.summary,
+            body=episode.body,
+            scenes=[ScriptSceneRead.model_validate(scene) for scene in raw_scenes if isinstance(scene, dict)],
+            version=episode.version,
+            is_locked=bool(episode.is_locked),
+            updated_at=episode.updated_at,
+        )
