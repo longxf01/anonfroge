@@ -192,6 +192,7 @@ class Settings(object):
     screenwriting_rag_vector_store_root: str = field(default_factory=lambda: os.getenv("SCREENWRITING_RAG_VECTOR_STORE_ROOT", DEFAULT_SCREENWRITING_RAG_VECTOR_STORE_ROOT))  # 剧本创作 RAG ChromaDB 项目级持久化根目录
     screenwriting_rag_visual_intent_keywords: tuple[str, ...] = field(default_factory=lambda: _env_str_tuple("SCREENWRITING_RAG_VISUAL_INTENT_KEYWORDS", DEFAULT_SCREENWRITING_RAG_VISUAL_INTENT_KEYWORDS))  # 剧本创作 RAG 技能资料召回意图关键词
     screenwriting_stage_team_enabled: bool = field(default_factory=lambda: _env_bool("SCREENWRITING_STAGE_TEAM_ENABLED", True))  # 剧本创作阶段生成是否启用 CrewAI 多角色团队（关闭则回退单 Agent）
+    storyboard_table_prompt_name: str = field(default_factory=lambda: os.getenv("STORYBOARD_TABLE_PROMPT_NAME", "storyboard_table_generation"))  # 分镜表格生成提示词名称
 
 settings = Settings()
 

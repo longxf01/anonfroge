@@ -399,7 +399,7 @@ const normalizeItemStatus = (status: BackendTaskStatus | string): TaskItemStatus
 }
 
 const itemSeq = (item: BackendTaskItemRead) => {
-  const raw = item.payload?.chapter_index ?? item.id
+  const raw = item.payload?.chapter_index ?? item.payload?.episode_index ?? item.payload?.shot_index ?? item.id
   const parsed = Number(raw)
   return Number.isFinite(parsed) ? parsed : item.id
 }
@@ -595,7 +595,12 @@ const toTaskItem = (item: BackendTaskItemRead, job?: BackendTaskJobRead): TaskIt
     job?.payload?.model_id,
     job?.payload?.modelId,
   )
-  const stageTimings = taskStageTimings(item.result?.asset_timing ?? item.result?.assetTiming)
+  const stageTimings = taskStageTimings(
+    item.result?.asset_timing ??
+    item.result?.assetTiming ??
+    item.result?.storyboard_timing ??
+    item.result?.storyboardTiming,
+  )
   const itemDurationMs = durationMs(item.created_at, item.completed_at)
   return {
     publicId: item.public_id,

@@ -194,6 +194,7 @@ const TASK_TYPE_LABEL: Record<AgentTaskType, string> = {
   asset_prompt_generation: '资产提示词生成',
   asset_image_generation: '资产图像生成',
   storyboard_script: '分镜剧本',
+  'storyboard.generate': '分镜表生成',
   'novel.chapter.clean_event': '章节事件清洗',
 }
 

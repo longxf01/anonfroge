@@ -9,6 +9,7 @@ from app.routers.tasks import router as tasks_router
 from app.routers.screenwriting import router as screenwriting_router
 from app.routers.script import router as script_router
 from app.routers.asset import router as asset_router
+from app.routers.storyboard import router as storyboard_router
 
 api_router = APIRouter(prefix=settings.api_prefix)
 
@@ -20,6 +21,7 @@ api_router.include_router(tasks_router)
 api_router.include_router(screenwriting_router)
 api_router.include_router(script_router)
 api_router.include_router(asset_router)
+api_router.include_router(storyboard_router)
 
 @api_router.get(
     "/health",  # 实际路径：/api/health

@@ -4,8 +4,12 @@ from __future__ import annotations
 # 业务模块内声明异步任务列表时使用的属性名。
 ASYNC_TASKS_ATTRIBUTE: str = "ASYNC_TASKS"
 
-# 默认不加载任何业务异步任务模块，具体项目通过配置显式声明。
-DEFAULT_ASYNC_TASK_MODULES: tuple[str, ...] = ()
+# 默认加载当前项目已提供的业务异步任务模块；仍可通过 ASYNC_TASK_MODULES 覆盖。
+DEFAULT_ASYNC_TASK_MODULES: tuple[str, ...] = (
+    "app.tasks.novel",
+    "app.tasks.asset",
+    "app.tasks.storyboard",
+)
 # Redis Stream 默认名称。
 DEFAULT_TASK_STREAM_NAME: str = "task:stream"
 # Redis Stream 默认消费组名称。
@@ -37,6 +41,8 @@ DEFAULT_TASK_WORKER_RETRY_BACKOFF_SECONDS: float = 30.0
 DEFAULT_TASK_WORKER_SHUTDOWN_TIMEOUT_SECONDS: float = 30.0
 # 运行中任务默认失联判定秒数。
 DEFAULT_TASK_STALE_RUNNING_TIMEOUT_SECONDS: float = 600.0
+# OrphanScavenger 默认扫描间隔秒数。
+DEFAULT_TASK_ORPHAN_SCAVENGER_INTERVAL_SECONDS: float = 30.0
 
 # 媒体生成任务默认通用超时秒数。
 DEFAULT_MEDIA_GENERATION_TIMEOUT_SECONDS: float = 1800.0
@@ -53,6 +59,3 @@ DEFAULT_MEDIA_GENERATION_MAX_CONCURRENCY: int = 2
 TASK_STREAM_EVENT_ITEM_QUEUED: str = "task.item.queued"
 # Redis Stream 任务消息结构版本号。
 TASK_STREAM_MESSAGE_VERSION: str = "1"
-
-# OrphanScavenger 默认扫描间隔秒数。
-DEFAULT_TASK_ORPHAN_SCAVENGER_INTERVAL_SECONDS: float = 30.0
