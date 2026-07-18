@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import Depends, File, HTTPException, Query, Request, Response, UploadFile, status
-from fastapi.responses import FileResponse
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.database import get_session
@@ -28,7 +27,7 @@ from app.schemas.asset import (
 )
 from app.schemas.tasks import TaskJobDetail
 from app.services import asset as asset_service
-from app.services import asset_media as asset_media_service
+from app.services import media as media_service
 from app.services import project as project_service
 from app.services import tasks as task_service
 
@@ -66,7 +65,11 @@ class AssetView(BaseView):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
         if isinstance(exc, asset_service.AssetNotFoundError):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        if isinstance(exc, media_service.MediaNotFoundError):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         if isinstance(exc, asset_service.AssetServiceError):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        if isinstance(exc, media_service.MediaServiceError):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         if isinstance(exc, task_service.TaskServiceError):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -313,7 +316,7 @@ class AssetView(BaseView):
     ) -> TaskJobDetail:
         current_user_public_id = self._current_user_public_id(request)
         try:
-            return await asset_media_service.submit_asset_image_generation_task(
+            return await media_service.submit_asset_image_generation_task(
                 session,
                 project_public_id,
                 current_user_public_id,
@@ -347,7 +350,7 @@ class AssetView(BaseView):
     ) -> TaskJobDetail:
         current_user_public_id = self._current_user_public_id(request)
         try:
-            return await asset_media_service.submit_asset_image_prompt_task(
+            return await media_service.submit_asset_image_prompt_task(
                 session,
                 project_public_id,
                 current_user_public_id,
@@ -377,7 +380,7 @@ class AssetView(BaseView):
         current_user_public_id = self._current_user_public_id(request)
         try:
             data = await file.read()
-            media = await asset_media_service.upload_asset_reference_image(
+            media = await media_service.upload_asset_reference_image(
                 session,
                 project_public_id,
                 current_user_public_id,
@@ -408,33 +411,18 @@ class AssetView(BaseView):
     ) -> AssetMediaRead:
         current_user_public_id = self._current_user_public_id(request)
         try:
-            media = await asset_media_service.set_asset_cover(
+            media = await media_service.set_asset_cover(
                 session, project_public_id, current_user_public_id, media_public_id
             )
             await session.commit()
-        except (project_service.ProjectServiceError, asset_service.AssetServiceError) as exc:
+        except (
+            project_service.ProjectServiceError,
+            asset_service.AssetServiceError,
+            media_service.MediaServiceError,
+        ) as exc:
             await session.rollback()
             self._raise_as_http(exc)
         return AssetMediaRead.model_validate(media)
-
-    @route(
-        "/media/{media_public_id}/content",
-        methods=["GET"],
-        summary="读取资产媒体内容",
-        description="按媒体公开 ID 读取生成图片，供 HTML src 直接访问。",
-    )
-    async def get_asset_media_content(
-        self,
-        project_public_id: str,
-        media_public_id: str,
-        request: Request,
-        session: SessionDep,
-    ) -> FileResponse:
-        try:
-            path, mime_type = await asset_media_service.get_media_file(session, media_public_id)
-        except asset_service.AssetServiceError as exc:
-            self._raise_as_http(exc)
-        return FileResponse(path, media_type=mime_type)
 
     @route(
         "/media/{media_public_id}",
@@ -452,11 +440,15 @@ class AssetView(BaseView):
     ) -> Response:
         current_user_public_id = self._current_user_public_id(request)
         try:
-            await asset_media_service.delete_asset_media(
+            await media_service.delete_asset_media(
                 session, project_public_id, current_user_public_id, media_public_id
             )
             await session.commit()
-        except (project_service.ProjectServiceError, asset_service.AssetServiceError) as exc:
+        except (
+            project_service.ProjectServiceError,
+            asset_service.AssetServiceError,
+            media_service.MediaServiceError,
+        ) as exc:
             await session.rollback()
             self._raise_as_http(exc)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -477,7 +469,7 @@ class AssetView(BaseView):
     ) -> list[AssetMediaRead]:
         current_user_public_id = self._current_user_public_id(request)
         try:
-            medias = await asset_media_service.list_asset_media(
+            medias = await media_service.list_asset_media(
                 session, project_public_id, current_user_public_id, asset_public_id
             )
         except (project_service.ProjectServiceError, asset_service.AssetServiceError) as exc:

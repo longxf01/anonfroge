@@ -28,8 +28,6 @@ from app.models.asset import (
     ASSET_TYPE_SCENE,
     Asset,
     AssetEpisode,
-    AssetGeneration,
-    AssetMedia,
     AssetRelation,
     AssetVersion,
 )
@@ -50,14 +48,19 @@ ASSET_AUTOCOMPLETE_TASK_TYPE = "asset.autocomplete"
 EXTRACTABLE_ASSET_TYPES = {ASSET_TYPE_ROLE, ASSET_TYPE_FACTION, ASSET_TYPE_PROP, ASSET_TYPE_SCENE}
 VALID_ASSET_TYPES = EXTRACTABLE_ASSET_TYPES
 ASSET_BATCH_OPERATIONS = {"lock", "unlock", "delete"}
+VARIANT_STATE_KEYS = ("状态", "形态", "阶段", "年龄阶段", "变体标签", "状态标签")
 
 
 class AssetServiceError(Exception):
-    """资产服务基础异常。"""
+    """资产服务基础异常。
 
-    def __init__(self, message: str, *, result: dict[str, Any] | None = None) -> None:
+    retryable=False 表示确定性失败（参数/前置状态问题），任务系统不应重试。
+    """
+
+    def __init__(self, message: str, *, result: dict[str, Any] | None = None, retryable: bool = True) -> None:
         super().__init__(message)
         self.result = result or {}
+        self.retryable = bool(retryable)
 
 
 class AssetNotFoundError(AssetServiceError):
@@ -351,10 +354,13 @@ async def extract_assets(
                 child=master,
                 label=str(master.variant_label or _infer_asset_state(item) or item.get("name") or "")[:120],
             )
-        created += int(master_new) + int(derived_new)
-        updated += int(not master_new) + int(not derived_new)
+        created += int(master_new)
+        updated += int(not master_new)
         results.append(master)
-        results.append(derived)
+        if derived is not None:
+            created += int(derived_new)
+            updated += int(not derived_new)
+            results.append(derived)
 
     return {"created": created, "updated": updated, "assets": results, "asset_enrichment": enrichments, **prompt_trace}
 
@@ -1025,21 +1031,20 @@ async def write_master_and_derivative(
     incoming_indices: set[int],
     *,
     supplement: str,
-) -> tuple[Asset, bool, Asset, bool]:
+) -> tuple[Asset, bool, Asset | None, bool]:
     """写入资产的主记录与衍生记录。
 
-    首次出现：建主资产（parent 为空）+ 衍生资产（parent 指向主资产，name 为“主名·状态名”）。
-    再次出现：主资产累加剧集；按状态名命中已有衍生则合并剧集，否则新增一条衍生。
+    无明确状态：仅写主资产。
+    有明确状态：主资产累加稳定字段；按状态名写入或合并衍生资产。
     返回（主资产, 主是否新建, 衍生资产, 衍生是否新建）。
     """
 
     asset_type = str(item["asset_type"])
     master_name = str(item["name"]).strip()
     state = _infer_asset_state(item)
-    derived_name = _derive_variant_asset_name(master_name, state)
     enriched = _with_supplement(item, supplement)
 
-    master_item = {**enriched, "name": master_name, "main_asset": True, "variant_label": ""}
+    master_item = _build_master_asset_item(enriched, master_name, state)
     master, master_new = await _upsert_asset(
         session,
         project_id,
@@ -1049,7 +1054,11 @@ async def write_master_and_derivative(
         incoming_indices=incoming_indices,
     )
 
-    derived_item = {**enriched, "name": derived_name, "main_asset": False, "variant_label": state}
+    if not state.strip():
+        return master, master_new, None, False
+
+    derived_name = _derive_variant_asset_name(master_name, state)
+    derived_item = _build_derivative_asset_item(enriched, derived_name, state)
     derived, derived_new = await _upsert_asset(
         session,
         project_id,
@@ -1076,8 +1085,11 @@ def _asset_keys_for_item(item: dict[str, Any]) -> list[tuple[str, str]]:
     master_name = str(item["name"]).strip()
     if not master_name:
         return []
-    derived_name = _derive_variant_asset_name(master_name, _infer_asset_state(item))
-    return [(asset_type, master_name), (asset_type, derived_name)]
+    keys = [(asset_type, master_name)]
+    state = _infer_asset_state(item)
+    if state.strip():
+        keys.append((asset_type, _derive_variant_asset_name(master_name, state)))
+    return keys
 
 
 async def _lock_asset_keys(
@@ -1257,7 +1269,7 @@ def _infer_asset_state(item: dict[str, Any]) -> str:
     """从 description 推断资产的状态/形态名；无明确状态返回空串。"""
 
     description = _coerce_mapping(item.get("description"))
-    for key in ("状态", "形态", "阶段", "年龄阶段", "变体标签", "状态标签"):
+    for key in VARIANT_STATE_KEYS:
         text = str(description.get(key) or "").strip()
         if text:
             return _normalize_variant_label(text)
@@ -1296,6 +1308,75 @@ def _with_supplement(item: dict[str, Any], supplement: str) -> dict[str, Any]:
     result["description"] = description
     return result
 
+
+def _build_master_asset_item(item: dict[str, Any], master_name: str, state: str) -> dict[str, Any]:
+    """构造主资产写入项，仅移除明确的衍生状态字段。"""
+
+    description = _coerce_mapping(item.get("description"))
+    details = _coerce_mapping(item.get("details"))
+    accessories = _coerce_mapping(item.get("accessories"))
+    if state.strip():
+        description, _ = _split_explicit_variant_mapping(description, state)
+        details, _ = _split_explicit_variant_mapping(details, state)
+        accessories, _ = _split_explicit_variant_mapping(accessories, state)
+    return {
+        **item,
+        "name": master_name,
+        "description": description,
+        "details": details,
+        "accessories": accessories,
+        "main_asset": True,
+        "variant_label": "",
+    }
+
+
+def _build_derivative_asset_item(item: dict[str, Any], derived_name: str, state: str) -> dict[str, Any]:
+    """构造衍生资产写入项，只写入明确结构化的状态差异字段。"""
+
+    _, description = _split_explicit_variant_mapping(_coerce_mapping(item.get("description")), state)
+    _, details = _split_explicit_variant_mapping(_coerce_mapping(item.get("details")), state)
+    _, accessories = _split_explicit_variant_mapping(_coerce_mapping(item.get("accessories")), state)
+    state_text = state.strip()
+    if not description and state_text:
+        description["状态"] = state_text
+    return {
+        **item,
+        "name": derived_name,
+        "keyword": "",
+        "colors": "",
+        "summary": f"{derived_name}，记录相对主资产的{state_text}状态差异。",
+        "description": description,
+        "details": details,
+        "accessories": accessories,
+        "main_asset": False,
+        "variant_label": state,
+    }
+
+
+def _split_explicit_variant_mapping(mapping: dict[str, Any], state: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """按结构化状态字段拆分主资产字段和衍生字段。"""
+
+    stable: dict[str, Any] = {}
+    variant: dict[str, Any] = {}
+    for key, value in mapping.items():
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            continue
+        target = variant if _is_explicit_variant_key(normalized_key, state) else stable
+        target[normalized_key] = value
+    return stable, variant
+
+
+def _is_explicit_variant_key(key: str, state: str) -> bool:
+    """判断字段名是否明确标识当前衍生状态。"""
+
+    normalized_key = str(key or "").strip()
+    normalized_state = str(state or "").strip()
+    if normalized_key in VARIANT_STATE_KEYS:
+        return True
+    if normalized_key == "场景类型" and normalized_state == "衍生资产":
+        return True
+    return bool(normalized_state and normalized_state in normalized_key)
 
 
 def merge_asset_missing_fields(asset: Asset, item: dict[str, Any]) -> None:
@@ -1766,13 +1847,13 @@ async def list_assets_page(
     start = (page - 1) * page_size
     page_items = filtered[start : start + page_size]
 
-    from app.services import asset_media  # 局部导入避免与 asset_media 的循环依赖
+    from app.services import media as media_service  # 局部导入避免与媒体服务的循环依赖
 
     cover_candidates: list[Asset] = list(page_items)
     if include_children:
         for root in page_items:
             cover_candidates.extend(children_by_parent.get(int(root.id), []))
-    cover_map = await asset_media.cover_urls_for(session, int(project.id), user_public_id, cover_candidates)
+    cover_map = await media_service.cover_urls_for(session, int(project.id), user_public_id, cover_candidates)
 
     def _build(asset: Asset) -> dict[str, Any]:
         data = _asset_read_dict(asset)
@@ -1949,9 +2030,7 @@ async def set_asset_parent(
             child=asset,
             label=asset.variant_label or asset.name,
         )
-        asset.main_asset = False
-    else:
-        asset.main_asset = True
+    asset.main_asset = parent is None
     asset.updated_at = utc_now()
     session.add(asset)
     await session.flush()
@@ -2031,9 +2110,12 @@ async def delete_assets_with_children(
         return 0
     id_list = list(target_ids)
 
-    from app.services import asset_media  # 局部导入避免循环依赖
+    from app.services import media as media_service  # 局部导入避免与媒体服务的循环依赖
 
-    await asset_media.delete_media_files_for_asset_ids(session, id_list)
+    target_public_ids = list(
+        (await session.exec(select(Asset.public_id).where(Asset.id.in_(id_list)))).all()
+    )
+    await media_service.delete_media_for_assets(session, target_public_ids)
     await session.exec(
         delete(AssetRelation).where(
             or_(AssetRelation.source_asset_id.in_(id_list), AssetRelation.target_asset_id.in_(id_list))
@@ -2041,8 +2123,6 @@ async def delete_assets_with_children(
     )
     await session.exec(delete(AssetEpisode).where(AssetEpisode.asset_id.in_(id_list)))
     await session.exec(delete(AssetVersion).where(AssetVersion.asset_id.in_(id_list)))
-    await session.exec(delete(AssetMedia).where(AssetMedia.asset_id.in_(id_list)))
-    await session.exec(delete(AssetGeneration).where(AssetGeneration.asset_id.in_(id_list)))
     await session.exec(
         delete(Asset).where(
             Asset.id.in_(id_list),

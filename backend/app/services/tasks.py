@@ -375,8 +375,10 @@ async def record_task_item_failure(
     stream_id: str = "",
     stage: str = "handler",
     result: dict[str, Any] | None = None,
+    retryable: bool = True,
 ) -> TaskItemRead:
-    """记录任务子项失败；未达最大次数时按指数退避重新排队，超限后进入 DLQ。"""
+    """记录任务子项失败；可重试失败未达最大次数时按指数退避重新排队，
+    确定性失败（retryable=False）或超限后直接置失败并进入 DLQ。"""
     item = await _get_task_item_model_or_raise(session, item_public_id)
     job = await _get_task_job_model_by_id_or_raise(session, item.job_id)
     now = utc_now()
@@ -388,7 +390,7 @@ async def record_task_item_failure(
     if result is not None:
         item.result = _dump_json(result)
 
-    if item.attempt_count < item.max_attempts:
+    if retryable and item.attempt_count < item.max_attempts:
         item.status = TaskStatus.PENDING
         item.started_at = None
         item.completed_at = None

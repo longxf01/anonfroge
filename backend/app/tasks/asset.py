@@ -4,7 +4,7 @@ from typing import Any
 
 from app.core.tasks.engine import AsyncTaskDefinition, TaskHandlerFailure
 from app.services import asset as asset_service
-from app.services import asset_media as asset_media_service
+from app.services import media as media_service
 
 
 async def extract_assets_task(context: Any) -> dict[str, Any]:
@@ -37,6 +37,7 @@ async def extract_assets_task(context: Any) -> dict[str, Any]:
             str(exc),
             error_code="asset_extract_failed",
             result=failure_result,
+            retryable=exc.retryable,
         ) from exc
 
     assets = result["assets"]
@@ -97,6 +98,7 @@ async def autocomplete_asset_task(context: Any) -> dict[str, Any]:
             str(exc),
             error_code="asset_autocomplete_failed",
             result={**exc.result, "asset_public_id": asset_public_id},
+            retryable=exc.retryable,
         ) from exc
 
     return {
@@ -125,7 +127,7 @@ async def image_generation_asset_task(context: Any) -> dict[str, Any]:
         raise ValueError("资产图像生成任务参数不完整")
 
     try:
-        result = await asset_media_service.generate_asset_image(
+        result = await media_service.generate_asset_image(
             context.session,
             project_public_id,
             current_user_public_id,
@@ -145,21 +147,21 @@ async def image_generation_asset_task(context: Any) -> dict[str, Any]:
             str(exc),
             error_code="asset_image_generation_failed",
             result={**exc.result, "asset_public_id": asset_public_id},
+            retryable=exc.retryable,
         ) from exc
 
     media = result["media"]
-    generation = result["generation"]
+    # 成功结果只保留前端与追溯消费的字段：raw_output 与 output_text 同值，
+    # 完整 prompt_trace 仅在失败路径随 result 留痕。
     return {
         "asset_public_id": asset_public_id,
         "media_public_id": media.public_id,
         "url": media.url,
-        "model_id": generation.model_id,
+        "model_id": media.model_id or model_id,
         "prompt": str(result.get("prompt") or ""),
         "composed_prompt": str(result.get("composed_prompt") or ""),
-        "raw_output": str(result.get("raw_output") or ""),
         "output_text": str(result.get("output_text") or ""),
         "asset_timing": result.get("asset_timing") or {},
-        "generation_public_id": generation.public_id,
     }
 
 
@@ -175,7 +177,7 @@ async def image_prompt_asset_task(context: Any) -> dict[str, Any]:
         raise ValueError("资产生图提示词任务参数不完整")
 
     try:
-        result = await asset_media_service.synthesize_asset_image_prompt_detail(
+        result = await media_service.synthesize_asset_image_prompt_detail(
             context.session,
             project_public_id,
             current_user_public_id,
@@ -188,18 +190,19 @@ async def image_prompt_asset_task(context: Any) -> dict[str, Any]:
             str(exc),
             error_code="asset_image_prompt_failed",
             result={**exc.result, "asset_public_id": asset_public_id},
+            retryable=exc.retryable,
         ) from exc
 
+    # 成功结果不落 messages（含艺术风格手册全文）与 raw_output（与 output_text
+    # 仅差代码围栏）；失败路径的 prompt_trace 仍保留完整消息用于排查。
     return {
         "asset_public_id": asset_public_id,
         "asset_name": str(result.get("asset_name") or ""),
         "model_id": result.get("model_id") or model_id,
         "image_model_id": str(result.get("image_model_id") or ""),
         "art_style_id": str(result.get("art_style_id") or ""),
-        "messages": result.get("messages") or [],
         "composed_prompt": str(result.get("composed_prompt") or ""),
         "prompt": str(result.get("prompt") or ""),
-        "raw_output": str(result.get("raw_output") or ""),
         "output_text": str(result.get("output_text") or ""),
         "asset_timing": result.get("asset_timing") or {},
     }
@@ -208,6 +211,6 @@ async def image_prompt_asset_task(context: Any) -> dict[str, Any]:
 ASYNC_TASKS = (
     AsyncTaskDefinition(asset_service.ASSET_EXTRACT_TASK_TYPE, extract_assets_task),
     AsyncTaskDefinition(asset_service.ASSET_AUTOCOMPLETE_TASK_TYPE, autocomplete_asset_task),
-    AsyncTaskDefinition(asset_media_service.ASSET_IMAGE_PROMPT_TASK_TYPE, image_prompt_asset_task),
-    AsyncTaskDefinition(asset_media_service.ASSET_IMAGE_GENERATION_TASK_TYPE, image_generation_asset_task),
+    AsyncTaskDefinition(media_service.ASSET_IMAGE_PROMPT_TASK_TYPE, image_prompt_asset_task),
+    AsyncTaskDefinition(media_service.ASSET_IMAGE_GENERATION_TASK_TYPE, image_generation_asset_task),
 )

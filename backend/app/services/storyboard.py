@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Storyboard service for ProductionAgent's production workbench."""
+"""为ProductionAgent的生产工作台提供的故事板服务"""
 
 import json
 import math
@@ -31,7 +31,7 @@ from app.utils.time_tools import utc_now
 
 STORYBOARD_GENERATE_TASK_TYPE = "storyboard.generate"
 STORYBOARD_QUEUE_NAME = "storyboard"
-STORYBOARD_TABLE_PROMPT_NAME = "storyboard_table_generation"
+STORYBOARD_TABLE_PROMPT_NAME = settings.storyboard_table_prompt_name or "storyboard_table_generation"
 SHOT_STATUS_VALUES = {STORYBOARD_STATUS_DRAFT, STORYBOARD_STATUS_LOCKED}
 
 EPISODE_CONTEXT_MAX_CHARS = 9000
@@ -45,23 +45,27 @@ _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]")
 _SCRIPT_SCENE_HEADING_RE = re.compile(r"^(?:#{1,4}\s*)?(\d+\s*[-－]\s*\d+)\s+(.+?)\s*$")
 _SCRIPT_DIALOGUE_RE = re.compile(r"^([^：:\n]{1,40})[：:](.+)$")
 _FALLBACK_STORYBOARD_TABLE_PROMPT = (
-    "You are ProductionAgent's storyboard-table execution agent. "
-    "Return only a JSON array. Each item must include sequence, description, scene, "
-    "associateAssetsNames, duration, shotSize, cameraMove, action, emotion, lighting, "
-    "lines, sound, and associateAssetsIds."
+    "你是 ProductionAgent 的分镜表执行 Agent。"
+    "只返回 JSON 数组。每个条目必须包含 sequence、description、scene、"
+    "associateAssetsNames、duration、shotSize、cameraMove、action、emotion、lighting、"
+    "lines、sound 和 associateAssetsIds。"
 )
 
 
 class StoryboardServiceError(Exception):
-    """Base storyboard service error."""
+    """分镜服务基础异常。
 
-    def __init__(self, message: str, *, result: dict[str, Any] | None = None) -> None:
+    retryable=False 表示确定性失败（参数/前置状态问题），任务系统不应重试。
+    """
+
+    def __init__(self, message: str, *, result: dict[str, Any] | None = None, retryable: bool = True) -> None:
         super().__init__(message)
         self.result = result or {}
+        self.retryable = bool(retryable)
 
 
 class StoryboardShotNotFoundError(StoryboardServiceError):
-    """Storyboard shot not found or inaccessible."""
+    """分镜镜头不存在或无权访问。"""
 
 
 class _StoryboardTiming:
@@ -114,7 +118,7 @@ async def generate_storyboard(
     director_style: str = "",
     gateway: Any | None = None,
 ) -> dict[str, Any]:
-    """Generate and persist storyboard shots for one script episode."""
+    """为单个剧本分集生成并持久化分镜镜头。"""
 
     model_id = model_id.strip()
     if not model_id:

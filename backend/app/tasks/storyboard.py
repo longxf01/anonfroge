@@ -36,6 +36,7 @@ async def generate_storyboard_task(context: Any) -> dict[str, Any]:
             str(exc),
             error_code="storyboard_generation_failed",
             result={**exc.result, "episode_public_id": episode_public_id},
+            retryable=exc.retryable,
         ) from exc
 
     shots = result["shots"]

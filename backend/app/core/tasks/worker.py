@@ -240,6 +240,7 @@ class TaskWorker:
                     exc.error_message,
                     stage="handler_failure",
                     result=exc.result,
+                    retryable=exc.retryable,
                 )
                 self._log_task_event(
                     logging.WARNING,
@@ -464,6 +465,7 @@ class TaskWorker:
         *,
         stage: str,
         result: dict[str, Any] | None = None,
+        retryable: bool = True,
     ) -> int | None:
         try:
             await self._mark_item_failed(
@@ -474,6 +476,7 @@ class TaskWorker:
                 stream_id=record.stream_id,
                 stage=stage,
                 result=result,
+                retryable=retryable,
             )
         except Exception as exc:
             await session.rollback()
@@ -536,6 +539,7 @@ class TaskWorker:
         stream_id: str = "",
         stage: str = "handler",
         result: dict[str, Any] | None = None,
+        retryable: bool = True,
     ) -> None:
         await self.task_engine.mark_task_item_failed(
             session,
@@ -546,6 +550,7 @@ class TaskWorker:
             stream_id=stream_id,
             stage=stage,
             result=result,
+            retryable=retryable,
         )
 
     async def _ack(self, stream_id: str) -> int:

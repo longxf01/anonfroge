@@ -241,7 +241,7 @@ class ProviderModelGateway:
         *,
         model_id: str,
         prompt: str = "",
-        images: list[Any],
+        images: list[Any] | None = None,
         provider_key: str | None = None,
         input_values: dict[str, str] | None = None,
         **kwargs: Any,
@@ -262,6 +262,37 @@ class ProviderModelGateway:
             raw = await asyncio.wait_for(request, timeout=self.timeout) if self.timeout > 0 else await request
         except TimeoutError as exc:
             raise ProviderModelGatewayError(f"图像编辑超时：{self.timeout}秒") from exc
+        except ProviderModelGatewayError:
+            raise
+        except Exception as exc:
+            raise ProviderModelGatewayError(str(exc)) from exc
+        return MediaGenerationOutput.from_raw(raw)
+
+    async def generate_video(
+        self,
+        *,
+        model_id: str,
+        prompt: str = "",
+        provider_key: str | None = None,
+        input_values: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> MediaGenerationOutput:
+        """调用视频模型生成视频（含首尾帧/参考图输入），返回归一化媒体结果。"""
+
+        try:
+            provider = provider_runtime.create_provider_for_model(
+                model_id,
+                provider_key=provider_key,
+                input_values=input_values,
+                timeout=self.timeout,
+            )
+            method = getattr(provider, "generate_video", None)
+            if not callable(method):
+                raise ProviderModelGatewayError(f"模型 {model_id} 不支持视频生成")
+            request = method(model_id=model_id, prompt=prompt, **kwargs)
+            raw = await asyncio.wait_for(request, timeout=self.timeout) if self.timeout > 0 else await request
+        except TimeoutError as exc:
+            raise ProviderModelGatewayError(f"视频生成超时：{self.timeout}秒") from exc
         except ProviderModelGatewayError:
             raise
         except Exception as exc:

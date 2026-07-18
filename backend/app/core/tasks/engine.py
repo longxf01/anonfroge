@@ -54,7 +54,11 @@ TaskHandler = Callable[[Any], TaskHandlerResult | Awaitable[TaskHandlerResult]]
 
 
 class TaskHandlerFailure(Exception):
-    """任务处理器主动声明的业务失败，可携带诊断结果写回任务子项。"""
+    """任务处理器主动声明的业务失败，可携带诊断结果写回任务子项。
+
+    retryable=False 表示确定性失败（参数缺失、前置状态不满足等），
+    重试也不会成功，任务系统应直接置失败而不进入指数退避重排队。
+    """
 
     def __init__(
         self,
@@ -62,11 +66,13 @@ class TaskHandlerFailure(Exception):
         *,
         error_code: str = "task_handler_failed",
         result: dict[str, Any] | None = None,
+        retryable: bool = True,
     ) -> None:
         super().__init__(error_message)
         self.error_code = error_code.strip() or "task_handler_failed"
         self.error_message = error_message.strip() or self.error_code
         self.result = result or {}
+        self.retryable = bool(retryable)
 
 
 class TaskHandlerRegistry:
@@ -475,6 +481,7 @@ class AsyncTaskEngine:
         stream_id: str = "",
         stage: str = "handler",
         result: dict[str, Any] | None = None,
+        retryable: bool = True,
     ) -> bool:
         """标记任务子项执行失败，子项不存在时返回 False。"""
         try:
@@ -488,6 +495,7 @@ class AsyncTaskEngine:
                 stream_id=stream_id,
                 stage=stage,
                 result=result,
+                retryable=retryable,
             )
         except TaskItemNotFoundError:
             await session.rollback()

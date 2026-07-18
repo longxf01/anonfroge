@@ -27,13 +27,24 @@
 
       <div v-if="isDerivativeAsset" class="gen-block reference-block">
         <div class="gen-label-row">
-          <label class="gen-label">主资产参考图</label>
-          <div v-if="referenceCandidates.length" class="reference-tools">
-            <span class="reference-count">
+          <label class="gen-label">参考图</label>
+          <div class="reference-tools">
+            <span v-if="referenceCandidates.length" class="reference-count">
               已选择 {{ referenceMediaPublicIds.length }} / {{ referenceCandidates.length }} 张
             </span>
-            <el-button link size="small" @click="selectAllReferenceMedia">全选</el-button>
+            <el-button link size="small" :loading="uploadingReference" @click="triggerReferenceUpload">
+              <el-icon><Upload /></el-icon>&nbsp;上传参考图
+            </el-button>
             <el-button
+              v-if="referenceCandidates.length"
+              link
+              size="small"
+              @click="selectAllReferenceMedia"
+            >
+              全选
+            </el-button>
+            <el-button
+              v-if="referenceCandidates.length"
               link
               size="small"
               :disabled="referenceMediaPublicIds.length === 0"
@@ -43,24 +54,45 @@
             </el-button>
           </div>
         </div>
+        <input
+          ref="referenceUploadInput"
+          class="reference-upload-input"
+          type="file"
+          accept="image/png,image/jpeg,image/webp"
+          multiple
+          @change="onReferenceFilesChange"
+        />
         <div v-if="referenceCandidates.length" class="reference-strip">
-          <button
+          <div
             v-for="media in referenceCandidates"
             :key="`ref-${media.publicId}`"
-            type="button"
+            role="button"
+            tabindex="0"
             class="reference-tile"
             :class="{ 'is-selected': isReferenceSelected(media.publicId) }"
             :aria-pressed="isReferenceSelected(media.publicId)"
-            title="点击切换这张主资产图是否作为参考"
+            title="点击切换这张图是否作为参考"
             @click="toggleReferenceMedia(media.publicId)"
+            @keydown.enter.prevent="toggleReferenceMedia(media.publicId)"
+            @keydown.space.prevent="toggleReferenceMedia(media.publicId)"
           >
-            <img :src="media.url" :alt="referenceAsset?.name || '主资产参考图'" loading="lazy" />
+            <img :src="media.url" :alt="referenceAsset?.name || '参考图'" loading="lazy" />
             <span class="reference-role">{{ mediaRoleLabel(media) }}</span>
             <span class="reference-state">{{ isReferenceSelected(media.publicId) ? '已选' : '未选' }}</span>
-          </button>
+            <button
+              v-if="media.mediaRole === 'reference'"
+              type="button"
+              class="reference-remove"
+              title="删除这张上传参考图"
+              aria-label="删除这张上传参考图"
+              @click.stop="removeReferenceMedia(media)"
+            >
+              <el-icon><Close /></el-icon>
+            </button>
+          </div>
         </div>
         <p v-else class="reference-empty">
-          衍生资产需要先为主资产生成配图；主资产有图后将自动使用图片编辑接口生成衍生图。
+          衍生资产基于参考图出图：可先为主资产生成配图，或直接上传本地参考图。
         </p>
       </div>
 
@@ -235,13 +267,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Loading, MagicStick, Picture, Refresh, RefreshRight, Star, ZoomIn } from '@element-plus/icons-vue'
+import { Close, Delete, Loading, MagicStick, Picture, Refresh, RefreshRight, Star, Upload, ZoomIn } from '@element-plus/icons-vue'
 import {
   deleteAssetMediaApi,
   generateAssetImagesApi,
   listAssetMediaApi,
   setAssetMediaCoverApi,
   synthesizeAssetImagePromptApi,
+  uploadAssetReferenceImageApi,
   type AssetManageItem,
   type AssetMediaItem,
 } from '@/api/asset'
@@ -282,8 +315,11 @@ const RATIOS: RatioOption[] = [
 const SIZES = ['1K', '2K', '4K']
 const COUNTS = [1, 2, 3, 4]
 const PROMPT_POLL_INTERVAL_MS = 3000
+const PROMPT_MAX_POLL_ATTEMPTS = 100
 const MEDIA_POLL_INTERVAL_MS = 4000
 const MEDIA_MAX_POLL_ATTEMPTS = 120
+const REFERENCE_UPLOAD_MAX_BYTES = 20 * 1024 * 1024
+const REFERENCE_UPLOAD_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/webp'])
 
 const form = reactive({
   prompt: '',
@@ -310,13 +346,27 @@ const prompting = computed(
   () => currentAssetPublicId.value !== '' && !!promptingAssets[currentAssetPublicId.value],
 )
 const cardAspect = computed(() => form.aspectRatio.replace(':', ' / '))
-const isDerivativeAsset = computed(() => props.asset ? !props.asset.mainAsset : false)
+// 衍生判定与后端一致：以是否传入父资产（child_of 绑定）为准，
+// main_asset 标记缺失的普通资产不能被误判成衍生而无法生图。
+const isDerivativeAsset = computed(() => (
+  props.asset ? !props.asset.mainAsset && !!props.referenceAsset?.publicId : false
+))
 const galleryMedias = computed(() => medias.value.filter((media) => media.mediaRole !== 'reference'))
-const referenceCandidates = computed(() => referenceMedias.value.filter((media) => (
+// 参考图候选 = 当前资产上传的本地参考图 + 父资产的生成图/封面。
+const uploadedReferenceMedias = computed(() => medias.value.filter((media) => (
+  media.mediaType === 'image' &&
+  media.mediaRole === 'reference' &&
+  !!media.url
+)))
+const parentReferenceMedias = computed(() => referenceMedias.value.filter((media) => (
   media.mediaType === 'image' &&
   media.mediaRole !== 'reference' &&
   !!media.url
 )))
+const referenceCandidates = computed(() => [
+  ...uploadedReferenceMedias.value,
+  ...parentReferenceMedias.value,
+])
 const referenceCandidatePublicIds = computed(() => referenceCandidates.value.map((media) => media.publicId))
 const referenceMediaPublicIds = computed(() => {
   const candidates = new Set(referenceCandidatePublicIds.value)
@@ -340,6 +390,74 @@ const toggleReferenceMedia = (mediaPublicId: string) => {
   if (selected.has(mediaPublicId)) selected.delete(mediaPublicId)
   else selected.add(mediaPublicId)
   selectedReferenceMediaPublicIds.value = referenceCandidatePublicIds.value.filter((publicId) => selected.has(publicId))
+}
+
+const uploadingReference = ref(false)
+const referenceUploadInput = ref<HTMLInputElement | null>(null)
+
+const triggerReferenceUpload = () => {
+  referenceUploadInput.value?.click()
+}
+
+const onReferenceFilesChange = async (event: Event) => {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files ?? [])
+  input.value = ''
+  const assetPublicId = currentAssetPublicId.value
+  if (!files.length || !assetPublicId) return
+  const valid: File[] = []
+  for (const file of files) {
+    if (!REFERENCE_UPLOAD_MIME_TYPES.has((file.type || '').toLowerCase())) {
+      ElMessage.warning(`「${file.name}」不是 PNG/JPEG/WebP 图片，已跳过`)
+      continue
+    }
+    if (file.size > REFERENCE_UPLOAD_MAX_BYTES) {
+      ElMessage.warning(`「${file.name}」超过 20MB 上限，已跳过`)
+      continue
+    }
+    valid.push(file)
+  }
+  if (!valid.length) return
+  uploadingReference.value = true
+  try {
+    const uploadedPublicIds: string[] = []
+    for (const file of valid) {
+      const { data } = await uploadAssetReferenceImageApi(props.projectPublicId, assetPublicId, file)
+      uploadedPublicIds.push(data.publicId)
+    }
+    if (currentAssetPublicId.value !== assetPublicId) return
+    await loadMedia({ silent: true })
+    selectedReferenceMediaPublicIds.value = [
+      ...new Set([...selectedReferenceMediaPublicIds.value, ...uploadedPublicIds]),
+    ]
+    ElMessage.success(`已上传 ${uploadedPublicIds.length} 张参考图`)
+  } catch (error) {
+    ElMessage.error((error as Error)?.message || '上传参考图失败')
+    if (currentAssetPublicId.value === assetPublicId) await loadMedia({ silent: true })
+  } finally {
+    uploadingReference.value = false
+  }
+}
+
+const removeReferenceMedia = async (media: AssetMediaItem) => {
+  try {
+    await ElMessageBox.confirm('确认删除这张上传的参考图？', '删除参考图', {
+      type: 'warning',
+      customClass: 'script-asset-messagebox',
+    })
+  } catch {
+    return
+  }
+  try {
+    await deleteAssetMediaApi(props.projectPublicId, media.publicId)
+    selectedReferenceMediaPublicIds.value = selectedReferenceMediaPublicIds.value.filter(
+      (publicId) => publicId !== media.publicId,
+    )
+    await loadMedia({ silent: true })
+    ElMessage.success('已删除参考图')
+  } catch (error) {
+    ElMessage.error((error as Error)?.message || '删除参考图失败')
+  }
 }
 
 const ratioOptionFromValue = (value: string): RatioOption | null => {
@@ -513,6 +631,7 @@ const loadReferenceMedia = async () => {
 }
 
 let promptPollTimer: ReturnType<typeof setTimeout> | undefined
+let promptPollTries = 0
 let promptPollingJobPublicId = ''
 let promptPollingAssetPublicId = ''
 let promptPollingResolve: ((prompt: string) => void) | undefined
@@ -534,6 +653,7 @@ const stopPromptPolling = (prompt = '') => {
   if (promptPollTimer) clearTimeout(promptPollTimer)
   const resolve = promptPollingResolve
   promptPollTimer = undefined
+  promptPollTries = 0
   promptPollingJobPublicId = ''
   promptPollingAssetPublicId = ''
   promptPollingResolve = undefined
@@ -552,6 +672,7 @@ const startPromptPolling = (jobPublicId: string, assetPublicId: string) => {
         stopPromptPolling()
         return
       }
+      promptPollTries += 1
       try {
         const { data: job } = await getTaskJobApi(props.projectPublicId, jobPublicId)
         const prompt = promptFromJob(job)
@@ -573,6 +694,14 @@ const startPromptPolling = (jobPublicId: string, assetPublicId: string) => {
         stopPromptPolling()
         if (currentAssetPublicId.value === assetPublicId) {
           ElMessage.error((error as Error)?.message || '读取专业提示词任务状态失败')
+        }
+        return
+      }
+      // 有上限的轮询：任务长期无进展时结束等待并释放生成按钮，避免 UI 被永久锁死。
+      if (promptPollTries >= PROMPT_MAX_POLL_ATTEMPTS) {
+        stopPromptPolling()
+        if (currentAssetPublicId.value === assetPublicId) {
+          ElMessage.warning('专业提示词任务耗时过长，已停止等待，可稍后在任务中心查看结果')
         }
         return
       }
@@ -708,12 +837,8 @@ const generate = async () => {
   const imageSize = form.imageSize
   const count = form.count
   const referenceIds = isDerivativeAsset.value ? referenceMediaPublicIds.value : []
-  if (isDerivativeAsset.value && !props.referenceAsset?.publicId) {
-    ElMessage.warning('衍生资产需要先绑定主资产，再生成衍生图')
-    return
-  }
   if (isDerivativeAsset.value && referenceIds.length === 0) {
-    ElMessage.warning('请先为主资产生成配图，再生成衍生资产图')
+    ElMessage.warning('请先勾选参考图：可为主资产生成配图，或直接上传本地参考图')
     return
   }
   generatingAssets[assetPublicId] = true
@@ -945,6 +1070,30 @@ onBeforeUnmount(stopAllPolling)
 }
 .script-asset-media-dialog .reference-tile.is-selected .reference-state {
   background: rgba(37, 99, 235, 0.9);
+}
+.script-asset-media-dialog .reference-upload-input {
+  display: none;
+}
+.script-asset-media-dialog .reference-remove {
+  position: absolute;
+  top: 5px;
+  left: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  color: #ffffff;
+  background: rgba(220, 38, 38, 0.82);
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 11px;
+}
+.script-asset-media-dialog .reference-remove:hover,
+.script-asset-media-dialog .reference-remove:focus-visible {
+  background: #dc2626;
 }
 .script-asset-media-dialog .reference-empty {
   margin: 0;
