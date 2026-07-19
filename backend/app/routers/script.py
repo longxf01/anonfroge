@@ -173,8 +173,8 @@ class ScriptView(BaseView):
         except (project_service.ProjectServiceError, script_service.ScriptServiceError) as exc:
             self._raise_as_http(exc)
         return [
-            ScriptEpisodeListItem.from_row(episode, plan_public_id, plan_title)
-            for episode, plan_public_id, plan_title in rows
+            ScriptEpisodeListItem.from_row(episode, plan_public_id, plan_title, assets)
+            for episode, plan_public_id, plan_title, assets in rows
         ]
 
     @route(

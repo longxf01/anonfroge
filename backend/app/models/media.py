@@ -21,11 +21,12 @@ MEDIA_STATUS_PROCESSING = "processing"
 MEDIA_STATUS_READY = "ready"
 MEDIA_STATUS_FAILED = "failed"
 
-# 媒体用途：参考素材、普通生成图、封面定妆、预览。
+# 媒体用途：参考素材、普通生成图、封面定妆、预览、宫格分镜图。
 MEDIA_ROLE_REFERENCE = "reference"
 MEDIA_ROLE_GENERATED = "generated"
 MEDIA_ROLE_FINAL = "final"
 MEDIA_ROLE_PREVIEW = "preview"
+MEDIA_ROLE_GRID = "grid"
 
 # 媒体挂靠的业务对象类型；业务侧仍以 media_public_id 回链，
 # scope 仅用于画廊列举与级联清理，不承担外键约束。

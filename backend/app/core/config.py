@@ -155,8 +155,8 @@ class Settings(object):
     media_s3_bucket: str = field(default_factory=lambda: os.getenv("MEDIA_S3_BUCKET", "nonaforage"))  # S3 媒体存储桶
     media_s3_endpoint_url: str = field(default_factory=lambda: os.getenv("MEDIA_S3_ENDPOINT_URL", "oss-cn-beijing.aliyuncs.com"))  # S3 兼容端点地址
     media_s3_region: str = field(default_factory=lambda: os.getenv("MEDIA_S3_REGION", "cn-beijing"))  # S3 区域
-    media_s3_access_key_id: str = field(default_factory=lambda: os.getenv("MEDIA_S3_ACCESS_KEY_ID", "LTA121"))  # S3 访问密钥 ID
-    media_s3_secret_access_key: str = field(default_factory=lambda: os.getenv("MEDIA_S3_SECRET_ACCESS_KEY", "PQh1212"))  # S3 访问密钥
+    media_s3_access_key_id: str = field(default_factory=lambda: os.getenv("MEDIA_S3_ACCESS_KEY_ID", ""))  # S3 访问密钥 ID
+    media_s3_secret_access_key: str = field(default_factory=lambda: os.getenv("MEDIA_S3_SECRET_ACCESS_KEY", ""))  # S3 访问密钥
     media_s3_public_base_url: str = field(default_factory=lambda: os.getenv("MEDIA_S3_PUBLIC_BASE_URL", "nonaforage.oss-accelerate.aliyuncs.com"))  # S3 公网基地址（CDN）
     media_s3_addressing_style: str = field(default_factory=lambda: os.getenv("MEDIA_S3_ADDRESSING_STYLE", "virtual"))  # S3 寻址风格：virtual/path
     novel_crawl_http_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("NOVEL_CRAWL_HTTP_TIMEOUT_SECONDS", "20.0")))  # 小说爬虫 HTTP 总超时秒数
@@ -202,6 +202,11 @@ class Settings(object):
     screenwriting_rag_visual_intent_keywords: tuple[str, ...] = field(default_factory=lambda: _env_str_tuple("SCREENWRITING_RAG_VISUAL_INTENT_KEYWORDS", DEFAULT_SCREENWRITING_RAG_VISUAL_INTENT_KEYWORDS))  # 剧本创作 RAG 技能资料召回意图关键词
     screenwriting_stage_team_enabled: bool = field(default_factory=lambda: _env_bool("SCREENWRITING_STAGE_TEAM_ENABLED", True))  # 剧本创作阶段生成是否启用 CrewAI 多角色团队（关闭则回退单 Agent）
     storyboard_table_prompt_name: str = field(default_factory=lambda: os.getenv("STORYBOARD_TABLE_PROMPT_NAME", "storyboard_table_generation"))  # 分镜表格生成提示词名称
+    storyboard_grid_image_prompt_name: str = field(default_factory=lambda: os.getenv("STORYBOARD_GRID_IMAGE_PROMPT_NAME", "storyboard_grid_image_generation"))  # 宫格分镜图生成提示词名称
+    storyboard_frame_image_prompt_name: str = field(default_factory=lambda: os.getenv("STORYBOARD_FRAME_IMAGE_PROMPT_NAME", "storyboard_frame_image_generation"))  # 单帧分镜图（1 宫格）生成提示词名称
+    art_style_distill_prompt_name: str = field(default_factory=lambda: os.getenv("ART_STYLE_DISTILL_PROMPT_NAME", "art_style_prompt_distill"))  # 艺术风格提示词提炼技能名称
+    director_style_distill_prompt_name: str = field(default_factory=lambda: os.getenv("DIRECTOR_STYLE_DISTILL_PROMPT_NAME", "director_style_prompt_distill"))  # 导演叙事提示词提炼技能名称
+    shot_video_prompt_name: str = field(default_factory=lambda: os.getenv("SHOT_VIDEO_PROMPT_NAME", "shot_video_generation"))  # 镜头视频生成提示词名称
 
 settings = Settings()
 

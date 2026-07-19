@@ -16,6 +16,11 @@ from app.core.base_provider import BaseProvider
 from app.core.config import settings
 from app.schemas.provider import ProviderConfig
 from app.services import provider as provider_service
+from app.services.video_generation_spec import (
+    VideoGenerationSpecError,
+    is_seedance_2_model,
+    seedance_dimensions,
+)
 from app.utils.secret_tools import decrypt_secret
 
 
@@ -331,23 +336,21 @@ class VolcengineArkVideoProvider(BaseProvider):
     返回归一化 dict（url/usage/seed/duration_ms），由网关 MediaGenerationOutput
     收敛为统一媒体结果。
 
-    生成参数分两层透传：分辨率/比例/时长/帧率/种子/水印/固定机位映射为提示词
-    尾部文本指令（--resolution 等）；其余标量参数（generate_audio、
-    return_last_frame 等）作为请求体字段随任务提交，向前兼容新增体级参数。
+    生成参数使用方舟当前推荐的请求体字段传入并接受强校验；调用方可继续使用
+    aspect_ratio/duration_seconds 等内部别名，适配器在提交前统一转换。
     """
 
     provider_key = "volcengine_ark"
     model_type = "video"
 
-    # 提示词尾部文本指令映射：参数名（含别名）→ 指令名。
-    _TEXT_COMMAND_ALIASES: tuple[tuple[tuple[str, ...], str], ...] = (
-        (("resolution",), "resolution"),
-        (("ratio", "aspect_ratio"), "ratio"),
-        (("duration", "duration_seconds"), "duration"),
-        (("fps", "frames_per_second", "framespersecond"), "fps"),
-        (("seed",), "seed"),
-        (("watermark",), "watermark"),
-        (("camera_fixed", "camerafixed"), "camerafixed"),
+    _BODY_PARAM_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("resolution", ("resolution",)),
+        ("ratio", ("ratio", "aspect_ratio")),
+        ("duration", ("duration", "duration_seconds")),
+        ("fps", ("fps", "frames_per_second", "framespersecond")),
+        ("seed", ("seed",)),
+        ("watermark", ("watermark",)),
+        ("camera_fixed", ("camera_fixed", "camerafixed")),
     )
 
     def __init__(
@@ -401,7 +404,17 @@ class VolcengineArkVideoProvider(BaseProvider):
         tasks_url = _build_content_generation_tasks_url(self.base_url)
         task_id = await self._submit_task(tasks_url, headers, payload)
         task = await self._poll_task(f"{tasks_url}/{task_id}", headers)
-        return self._normalize_task_result(task)
+        dimension_source = first_frame or next(iter(references or []), None) or last_frame
+        fallback_width = 0
+        fallback_height = 0
+        if isinstance(dimension_source, dict):
+            fallback_width = int(dimension_source.get("width") or 0)
+            fallback_height = int(dimension_source.get("height") or 0)
+        return self._normalize_task_result(
+            task,
+            fallback_width=fallback_width,
+            fallback_height=fallback_height,
+        )
 
     def _build_task_payload(
         self,
@@ -420,43 +433,37 @@ class VolcengineArkVideoProvider(BaseProvider):
         if not prompt_text:
             raise ProviderRuntimeError("prompt 不能为空")
 
-        commands, body_extra = self._split_generation_params(kwargs)
-        if commands:
-            prompt_text = f"{prompt_text} {' '.join(commands)}"
+        body_extra = self._normalize_generation_params(kwargs)
 
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt_text}]
         if first_frame is not None:
             content.append(self._image_content_item(first_frame, role="first_frame"))
-        if last_frame is not None:
-            content.append(self._image_content_item(last_frame, role="last_frame"))
         for reference in references or []:
             content.append(self._image_content_item(reference, role="reference_image"))
+        if last_frame is not None:
+            content.append(self._image_content_item(last_frame, role="last_frame"))
 
         return {"model": resolved_model_id, "content": content, **body_extra}
 
-    def _split_generation_params(self, params: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
-        """把生成参数拆为提示词文本指令与请求体字段两层。"""
+    def _normalize_generation_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        """把内部参数别名收敛为方舟强校验请求体字段。"""
 
-        commands: list[str] = []
+        body_extra: dict[str, Any] = {}
         consumed: set[str] = set()
-        for aliases, command in self._TEXT_COMMAND_ALIASES:
+        for field_name, aliases in self._BODY_PARAM_ALIASES:
             for alias in aliases:
                 if alias in params and params[alias] not in (None, ""):
-                    commands.append(f"--{command} {self._command_value(params[alias])}")
+                    body_extra[field_name] = params[alias]
                     consumed.update(aliases)
                     break
-        body_extra = {
-            key: value
-            for key, value in params.items()
-            if key not in consumed and value is not None
-        }
-        return commands, body_extra
-
-    @staticmethod
-    def _command_value(value: Any) -> str:
-        if isinstance(value, bool):
-            return "true" if value else "false"
-        return str(value).strip()
+        body_extra.update(
+            {
+                key: value
+                for key, value in params.items()
+                if key not in consumed and value not in (None, "")
+            }
+        )
+        return body_extra
 
     @staticmethod
     def _image_content_item(image: Any, *, role: str) -> dict[str, Any]:
@@ -527,7 +534,12 @@ class VolcengineArkVideoProvider(BaseProvider):
             await asyncio.sleep(self.poll_interval)
 
     @staticmethod
-    def _normalize_task_result(task: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_task_result(
+        task: dict[str, Any],
+        *,
+        fallback_width: int = 0,
+        fallback_height: int = 0,
+    ) -> dict[str, Any]:
         content = task.get("content") if isinstance(task.get("content"), dict) else {}
         video_url = str(content.get("video_url") or content.get("url") or "").strip()
         if not video_url:
@@ -537,12 +549,31 @@ class VolcengineArkVideoProvider(BaseProvider):
         raw_duration = task.get("duration")
         if isinstance(raw_duration, (int, float)) and raw_duration > 0:
             duration_ms = int(float(raw_duration) * 1000)
+        model_id = str(task.get("model") or "").strip()
+        resolution = str(task.get("resolution") or "").strip().lower()
+        ratio = str(task.get("ratio") or "").strip()
+        width = int(task.get("width") or 0)
+        height = int(task.get("height") or 0)
+        if is_seedance_2_model(model_id) and resolution and ratio and ratio != "adaptive":
+            try:
+                width, height = seedance_dimensions(resolution, ratio)
+            except VideoGenerationSpecError as exc:
+                raise ProviderRuntimeError(f"Seedance 视频结果规格无效：{exc}") from exc
+        elif is_seedance_2_model(model_id) and ratio == "adaptive" and (width <= 0 or height <= 0):
+            width = int(fallback_width or 0)
+            height = int(fallback_height or 0)
+            if width <= 0 or height <= 0:
+                raise ProviderRuntimeError("Seedance adaptive 视频结果缺少可验证的像素尺寸")
         return {
             "url": video_url,
             "mime_type": "video/mp4",
+            "width": width,
+            "height": height,
             "usage": usage,
             "seed": str(task.get("seed") or ""),
             "duration_ms": duration_ms,
+            "resolution": resolution,
+            "ratio": ratio,
             "raw": task,
         }
 
@@ -646,7 +677,7 @@ def _should_use_openai_compatible_image_provider(config: ProviderConfig, model_t
     if model_type != "image":
         return False
     protocol = config.protocol.strip().lower()
-    if protocol in {"openai", "openai-compatible", "openai_compatible"}:
+    if protocol in {"openai", "openai-compatible", "openai_compatible", "qwen", "volcengine"}:
         return True
     return bool(config.base_url.strip().rstrip("/").endswith("/v1"))
 

@@ -17,6 +17,7 @@ from uuid import uuid4
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from app.models.asset import Asset, AssetEpisode
 from app.models.script import ScriptEpisode, ScriptPlan
 from app.services import project as project_service
 from app.services.screenwriting.constants import WORKFLOW_PROJECT_CONFIG
@@ -413,7 +414,7 @@ async def list_project_episodes(
     session: AsyncSession,
     project_public_id: str,
     user_public_id: str,
-) -> list[tuple[ScriptEpisode, str, str]]:
+) -> list[tuple[ScriptEpisode, str, str, list[Asset]]]:
     """平铺列出项目下当前用户的全部分集，每项携带所属计划的公开 ID 与标题。"""
     project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
     statement = (
@@ -428,7 +429,40 @@ async def list_project_episodes(
         .order_by(ScriptPlan.updated_at.desc(), ScriptPlan.id, ScriptEpisode.episode_index)
     )
     result = await session.exec(statement)
-    return [(episode, plan_public_id, plan_title) for episode, plan_public_id, plan_title in result.all()]
+    rows = [(episode, plan_public_id, plan_title) for episode, plan_public_id, plan_title in result.all()]
+    if not rows:
+        return []
+
+    episode_ids = [int(episode.id) for episode, _, _ in rows if episode.id is not None]
+    assets_by_episode_id: dict[int, list[Asset]] = {episode_id: [] for episode_id in episode_ids}
+    if episode_ids:
+        asset_statement = (
+            select(AssetEpisode.episode_id, Asset)
+            .join(Asset, AssetEpisode.asset_id == Asset.id)
+            .where(
+                AssetEpisode.project_id == project.id,
+                AssetEpisode.user_public_id == user_public_id,
+                AssetEpisode.episode_id.in_(episode_ids),
+                Asset.disabled_at.is_(None),
+                Asset.main_asset.is_(True),
+            )
+            .order_by(Asset.asset_type, Asset.name, Asset.id)
+        )
+        asset_rows = list((await session.exec(asset_statement)).all())
+        seen_by_episode: dict[int, set[int]] = {}
+        for episode_id, asset in asset_rows:
+            asset_id = int(asset.id)
+            seen = seen_by_episode.setdefault(int(episode_id), set())
+            if asset_id in seen:
+                continue
+            seen.add(asset_id)
+            assets_by_episode_id.setdefault(int(episode_id), []).append(asset)
+
+    return [
+        (episode, plan_public_id, plan_title, assets_by_episode_id.get(int(episode.id), []))
+        for episode, plan_public_id, plan_title in rows
+    ]
+
 
 
 async def export_episodes_zip(

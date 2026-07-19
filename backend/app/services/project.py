@@ -257,6 +257,12 @@ async def update_project(
         if value is not None:
             setattr(project, field_name, value)
 
+    # 重新绑定风格/导演手册时，清空已固定的提炼提示词，下次生成前重新提炼。
+    if "art_style" in payload.model_fields_set and payload.art_style is not None:
+        project.art_style_prompt = ""
+    if "director_manual" in payload.model_fields_set and payload.director_manual is not None:
+        project.director_style_prompt = ""
+
     project.updated_at = utc_now()
     session.add(project)
     await session.commit()

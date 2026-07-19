@@ -5,14 +5,13 @@ from __future__ import annotations
 import json
 import math
 import re
-from pathlib import Path
 from time import perf_counter
 from typing import Any
 
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.core.config import BASE_DIR, settings
+from app.core.config import settings
 from app.core.tasks.engine import default_async_task_engine
 from app.models.asset import Asset, AssetEpisode
 from app.models.script import ScriptEpisode
@@ -24,6 +23,7 @@ from app.models.storyboard import (
 from app.schemas.tasks import TaskItemCreate, TaskJobCreate, TaskJobDetail
 from app.services import project as project_service
 from app.services import script as script_service
+from app.services import style_prompt as style_prompt_service
 from app.services.agent_gateway import ProviderModelGateway, ProviderModelGatewayError
 from app.services.prompt_registry import PromptRegistry, PromptRegistryError
 from app.utils.time_tools import utc_now
@@ -35,12 +35,9 @@ STORYBOARD_TABLE_PROMPT_NAME = settings.storyboard_table_prompt_name or "storybo
 SHOT_STATUS_VALUES = {STORYBOARD_STATUS_DRAFT, STORYBOARD_STATUS_LOCKED}
 
 EPISODE_CONTEXT_MAX_CHARS = 9000
-STYLE_CONTEXT_MAX_CHARS = 6000
-DIRECTOR_CONTEXT_MAX_CHARS = 6000
 ASSET_CONTEXT_MAX_ITEMS = 120
 FALLBACK_MAX_SHOTS = 80
 
-_SKILL_PATH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$")
 _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]")
 _SCRIPT_SCENE_HEADING_RE = re.compile(r"^(?:#{1,4}\s*)?(\d+\s*[-－]\s*\d+)\s+(.+?)\s*$")
 _SCRIPT_DIALOGUE_RE = re.compile(r"^([^：:\n]{1,40})[：:](.+)$")
@@ -116,9 +113,14 @@ async def generate_storyboard(
     model_id: str,
     art_style: str = "",
     director_style: str = "",
+    shot_public_ids: list[str] | None = None,
     gateway: Any | None = None,
 ) -> dict[str, Any]:
-    """为单个剧本分集生成并持久化分镜镜头。"""
+    """为单个剧本分集生成并持久化分镜镜头。
+
+    指定 shot_public_ids 时进入按镜头重生成模式：仍以整集上下文调用模型保证
+    行间连贯，但只持久化所选镜头对应的行，其余镜头保持原样。
+    """
 
     model_id = model_id.strip()
     if not model_id:
@@ -133,6 +135,12 @@ async def generate_storyboard(
         user_public_id,
         episode_public_id,
     )
+    target_indexes: set[int] = set()
+    for shot_public_id in _dedupe_public_ids(shot_public_ids):
+        shot = await load_shot_or_raise(session, int(project.id), user_public_id, shot_public_id)
+        if shot.episode_public_id != episode.public_id:
+            raise StoryboardServiceError(f"镜头 {shot.shot_index} 不属于目标分集，无法按镜头重生成")
+        target_indexes.add(int(shot.shot_index))
     timing.mark("project_and_episode_lookup", stage_started_at)
 
     stage_started_at = perf_counter()
@@ -147,25 +155,25 @@ async def generate_storyboard(
     stage_started_at = perf_counter()
     resolved_art_style = art_style.strip() or str(project.art_style or "").strip()
     resolved_director_style = director_style.strip() or str(project.director_manual or "").strip()
-    style_context = load_style_context(resolved_art_style, settings.visual_style_root, STYLE_CONTEXT_MAX_CHARS)
-    director_context = load_style_context(
-        resolved_director_style,
-        settings.director_manual_root,
-        DIRECTOR_CONTEXT_MAX_CHARS,
+    resolved_gateway = gateway or build_storyboard_gateway()
+    art_style_prompt, director_style_prompt = await style_prompt_service.ensure_project_style_prompts(
+        session,
+        project,
+        model_id=model_id,
+        gateway=resolved_gateway,
     )
-    timing.mark("style_context", stage_started_at)
+    timing.mark("style_prompt", stage_started_at)
 
     stage_started_at = perf_counter()
     messages = build_storyboard_messages(
         episode=episode,
         asset_context=asset_context,
         art_style=resolved_art_style,
-        art_style_context=style_context,
+        art_style_prompt=art_style_prompt,
         director_style=resolved_director_style,
-        director_style_context=director_context,
+        director_style_prompt=director_style_prompt,
     )
     prompt_trace = _model_prompt_trace(model_id=model_id, messages=messages)
-    resolved_gateway = gateway or build_storyboard_gateway()
     timing.mark("prompt_build", stage_started_at)
 
     raw = ""
@@ -190,6 +198,13 @@ async def generate_storyboard(
     if not parsed:
         prompt_trace["storyboard_timing"] = timing.payload()
         raise StoryboardServiceError("未能生成有效分镜，请检查剧本内容或模型输出", result=prompt_trace)
+    if target_indexes:
+        parsed = [row for row in parsed if int(row.get("shot_index") or 0) in target_indexes]
+        if not parsed:
+            prompt_trace["storyboard_timing"] = timing.payload()
+            raise StoryboardServiceError(
+                "模型输出未覆盖所选镜头，请重试或改用整集生成", result=prompt_trace
+            )
     timing.mark("parse_output", stage_started_at)
 
     stage_started_at = perf_counter()
@@ -202,6 +217,7 @@ async def generate_storyboard(
         art_style=resolved_art_style,
         director_style=resolved_director_style,
         model_id=model_id,
+        partial=bool(target_indexes),
     )
     timing.mark("write_storyboard", stage_started_at)
 
@@ -231,9 +247,9 @@ def build_storyboard_messages(
     episode: ScriptEpisode,
     asset_context: str,
     art_style: str,
-    art_style_context: str,
+    art_style_prompt: str,
     director_style: str,
-    director_style_context: str,
+    director_style_prompt: str,
 ) -> list[dict[str, str]]:
     system = load_storyboard_table_prompt()
     episode_body = (episode.body or "").strip()
@@ -244,8 +260,8 @@ def build_storyboard_messages(
             f"## 分集\nEP{episode.episode_index:02d} {episode.title or ''}".strip(),
             f"## 分集剧本正文\n{episode_body or '（无正文）'}",
             f"## 项目资产清单\n{asset_context or '（暂无资产）'}",
-            f"## 美术风格\nstyleKey: {art_style or '未指定'}\n{art_style_context or '（未提供美术风格手册）'}",
-            f"## 导演风格\ndirectorKey: {director_style or '未指定'}\n{director_style_context or '（未提供导演风格手册）'}",
+            f"## 美术风格提示词\nstyleKey: {art_style or '未指定'}\n{art_style_prompt or '（未提炼美术风格提示词）'}",
+            f"## 导演叙事提示词\ndirectorKey: {director_style or '未指定'}\n{director_style_prompt or '（未提炼导演叙事提示词）'}",
             "请只输出合法 JSON 数组。",
         ]
     )
@@ -322,37 +338,6 @@ def _merge_assets(assets: list[Asset]) -> list[Asset]:
         seen.add(key)
         result.append(asset)
     return result
-
-
-def load_style_context(style_key: str, configured_root: str, max_chars: int) -> str:
-    key = style_key.strip()
-    if not key or not _SKILL_PATH_PATTERN.fullmatch(key):
-        return ""
-    root = _project_path(configured_root)
-    style_dir = (root / key).resolve()
-    try:
-        style_dir.relative_to(root)
-    except ValueError:
-        return ""
-    if not style_dir.is_dir():
-        return ""
-    parts: list[str] = []
-    for path in sorted(style_dir.rglob("*.md")):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(style_dir).as_posix()
-        content = path.read_text(encoding="utf-8", errors="ignore").strip()
-        if content:
-            parts.append(f"### {relative}\n{content}")
-        if len("\n\n".join(parts)) >= max_chars:
-            break
-    text = "\n\n".join(parts)
-    return text[:max_chars]
-
-
-def _project_path(configured_path: str) -> Path:
-    configured = Path(configured_path).expanduser()
-    return configured.resolve() if configured.is_absolute() else (BASE_DIR / configured).resolve()
 
 
 def parse_storyboard_table(raw: str, asset_lookup: dict[str, dict[str, str]] | None = None) -> list[dict[str, Any]]:
@@ -446,15 +431,20 @@ def _asset_ids_from_row(
 
 
 def build_shot_prompt(description: str, item: dict[str, Any], asset_names: list[str]) -> str:
+    """拼接镜头生图提示词；资产以 @资产名 内联引用，正文已 @ 过的不再重复补引。"""
     parts = [
         description,
         _first_text(item.get("action")),
         _first_text(item.get("shotSize")),
         _first_text(item.get("cameraMove")),
         _first_text(item.get("lighting")),
-        f"可见资产：{'、'.join(asset_names)}" if asset_names else "",
     ]
-    return "；".join(part for part in parts if part)
+    prompt = "；".join(part for part in parts if part)
+    missing = [name for name in asset_names if name and f"@{name}" not in prompt]
+    if missing:
+        supplement = f"画面可见 {'、'.join(f'@{name}' for name in missing)}"
+        prompt = f"{prompt}；{supplement}" if prompt else supplement
+    return prompt
 
 
 def _normalize_lines(value: Any) -> list[dict[str, str]]:
@@ -564,7 +554,9 @@ async def persist_storyboard_rows(
     art_style: str,
     director_style: str,
     model_id: str,
+    partial: bool = False,
 ) -> dict[str, Any]:
+    """按镜头序号 upsert 分镜行；partial 模式只更新给到的行，不禁用缺席镜头。"""
     existing_statement = select(StoryboardShot).where(
         StoryboardShot.project_id == project_id,
         StoryboardShot.user_public_id == user_public_id,
@@ -622,12 +614,13 @@ async def persist_storyboard_rows(
         session.add(shot)
         result_shots.append(shot)
 
-    for shot in existing:
-        if shot.shot_index in incoming_indexes or shot.status == STORYBOARD_STATUS_LOCKED:
-            continue
-        shot.disabled_at = now
-        shot.updated_at = now
-        session.add(shot)
+    if not partial:
+        for shot in existing:
+            if shot.shot_index in incoming_indexes or shot.status == STORYBOARD_STATUS_LOCKED:
+                continue
+            shot.disabled_at = now
+            shot.updated_at = now
+            session.add(shot)
 
     await session.flush()
     result_shots.sort(key=lambda item: (item.episode_index, item.shot_index, item.id or 0))
@@ -641,6 +634,7 @@ async def submit_storyboard_generation_task(
     *,
     model_id: str,
     episode_public_ids: list[str] | None = None,
+    shot_public_ids: list[str] | None = None,
     art_style: str = "",
     director_style: str = "",
     engine: Any | None = None,
@@ -655,25 +649,32 @@ async def submit_storyboard_generation_task(
         user_public_id,
         model_id=model_id,
         episode_public_ids=episode_public_ids,
+        shot_public_ids=shot_public_ids,
         art_style=art_style,
         director_style=director_style,
     )
     if not items:
         raise StoryboardServiceError("没有可用于分镜生成的剧本分集")
 
+    selected_shot_count = sum(len(item.payload.get("shot_public_ids") or []) for item in items)
+    if selected_shot_count:
+        job_name = f"分镜脚本重生成：{selected_shot_count} 镜"
+    else:
+        job_name = "分镜表生成" if len(items) == 1 else f"分镜表批量生成：{len(items)} 集"
     resolved_engine = engine or default_async_task_engine
     return await resolved_engine.create_and_enqueue_task_job(
         session,
         TaskJobCreate(
             task_type=STORYBOARD_GENERATE_TASK_TYPE,
             queue_name=STORYBOARD_QUEUE_NAME,
-            name="分镜表生成" if len(items) == 1 else f"分镜表批量生成：{len(items)} 集",
+            name=job_name,
             created_by=user_public_id,
             payload={
                 "project_public_id": project_public_id,
                 "current_user_public_id": user_public_id,
                 "model_id": model_id,
                 "episode_public_ids": [item.payload["episode_public_id"] for item in items],
+                "shot_count": selected_shot_count,
                 "art_style": art_style,
                 "director_style": director_style,
             },
@@ -689,16 +690,35 @@ async def build_storyboard_task_items(
     *,
     model_id: str,
     episode_public_ids: list[str] | None = None,
+    shot_public_ids: list[str] | None = None,
     art_style: str = "",
     director_style: str = "",
 ) -> list[TaskItemCreate]:
-    episode_ids = _dedupe_public_ids(episode_public_ids)
-    if not episode_ids:
-        plans = await script_service.list_plans(session, project_public_id, user_public_id)
-        if not plans:
-            return []
-        _, episodes = await script_service.get_plan_detail(session, project_public_id, user_public_id, plans[0].public_id)
-        episode_ids = [episode.public_id for episode in episodes if episode.public_id]
+    # 按镜头重生成：把所选镜头按分集分组，每个分集一个子项、只重写选中的行。
+    shots_by_episode: dict[str, list[str]] = {}
+    resolved_shot_ids = _dedupe_public_ids(shot_public_ids)
+    if resolved_shot_ids:
+        selected_episode_ids = set(_dedupe_public_ids(episode_public_ids))
+        all_shots = await list_storyboard_shots(session, project_public_id, user_public_id)
+        by_public_id = {shot.public_id: shot for shot in all_shots}
+        for shot_public_id in resolved_shot_ids:
+            shot = by_public_id.get(shot_public_id)
+            if shot is None:
+                raise StoryboardShotNotFoundError(f"分镜镜头不存在：{shot_public_id}")
+            if selected_episode_ids and shot.episode_public_id not in selected_episode_ids:
+                continue
+            shots_by_episode.setdefault(shot.episode_public_id, []).append(shot.public_id)
+        if not shots_by_episode:
+            raise StoryboardServiceError("所选镜头不在目标分集内")
+        episode_ids = list(shots_by_episode.keys())
+    else:
+        episode_ids = _dedupe_public_ids(episode_public_ids)
+        if not episode_ids:
+            plans = await script_service.list_plans(session, project_public_id, user_public_id)
+            if not plans:
+                return []
+            _, episodes = await script_service.get_plan_detail(session, project_public_id, user_public_id, plans[0].public_id)
+            episode_ids = [episode.public_id for episode in episodes if episode.public_id]
 
     items: list[TaskItemCreate] = []
     for episode_public_id in episode_ids:
@@ -719,6 +739,7 @@ async def build_storyboard_task_items(
                     "episode_public_id": episode_public_id,
                     "episode_index": episode.episode_index,
                     "episode_title": episode.title,
+                    "shot_public_ids": shots_by_episode.get(episode_public_id, []),
                     "art_style": art_style,
                     "director_style": director_style,
                 },
@@ -773,6 +794,7 @@ async def update_storyboard_shot(
         "prompt",
         "negative_prompt",
         "reference_media_public_id",
+        "last_frame_media_public_id",
         "seed",
     }
     for key, value in fields.items():

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import Column, DateTime, Enum as SAEnum, ForeignKey, Integer, String, func
+from sqlalchemy import Column, DateTime, Enum as SAEnum, ForeignKey, Integer, String, Text, func
 from sqlmodel import Field, SQLModel
 
 from app.models.base import BaseModel
@@ -93,6 +93,16 @@ class Project(BaseModel, table=True):
             server_default="",
         ),
         description="导演技能。",
+    )
+    art_style_prompt: str = Field(
+        default="",
+        sa_column=Column("art_style_prompt", Text, nullable=False, default="", server_default=""),
+        description="从项目绑定艺术风格手册提炼固定的风格提示词，供分镜脚本与分镜图生成引用；重新绑定风格时清空。",
+    )
+    director_style_prompt: str = Field(
+        default="",
+        sa_column=Column("director_style_prompt", Text, nullable=False, default="", server_default=""),
+        description="从项目绑定导演风格手册提炼固定的叙事提示词，供分镜脚本与分镜图生成引用；重新绑定手册时清空。",
     )
     video_ratio: str = Field(
         default="9:16",
