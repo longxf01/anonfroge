@@ -38,6 +38,10 @@ const routes = [
     path: '/production',
     component: () => import('@/pages/Production.vue')
   },
+  {
+    path: '/editor',
+    component: () => import('@/pages/Editor.vue')
+  },
 ]
 
 

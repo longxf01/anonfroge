@@ -124,6 +124,30 @@ class StoryboardShot(BaseModel, table=True):
         ),
         description="分镜图公开标识。",
     )
+    first_frame_media_public_id: str = Field(
+        default="",
+        sa_column=Column(
+            "first_frame_media_public_id",
+            String(36),
+            nullable=False,
+            default="",
+            server_default="",
+            index=True,
+        ),
+        description="镜头视频生成使用的可选首帧图片公开标识。",
+    )
+    last_frame_media_public_id: str = Field(
+        default="",
+        sa_column=Column(
+            "last_frame_media_public_id",
+            String(36),
+            nullable=False,
+            default="",
+            server_default="",
+            index=True,
+        ),
+        description="镜头视频生成使用的可选尾帧图片公开标识。",
+    )
     seed: str = Field(
         default="",
         sa_column=Column("seed", String(60), nullable=False, default="", server_default=""),

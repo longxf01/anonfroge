@@ -159,18 +159,22 @@
               <i class="dot yellow"></i>
               <i class="dot green"></i>
             </span>
-            <h4>生成图片</h4>
+            <h4>{{ isVideoMedia ? '生成视频' : '生成图片' }}</h4>
           </div>
           <div class="viewer-title-actions">
             <span v-if="item.mediaPublicId" class="viewer-language">{{ item.mediaPublicId }}</span>
-            <button class="title-copy-btn" type="button" @click="copyViewerText('图片地址', imagePreviewUrl)">
-              {{ copiedLabel === '图片地址' ? '已复制!' : '复制地址' }}
+            <button
+              class="title-copy-btn"
+              type="button"
+              @click="copyViewerText(isVideoMedia ? '视频地址' : '图片地址', imagePreviewUrl)"
+            >
+              {{ copiedLabel === (isVideoMedia ? '视频地址' : '图片地址') ? '已复制!' : '复制地址' }}
             </button>
             <el-tooltip content="新窗口打开" placement="top">
               <button
                 class="title-icon-btn preview-icon-btn"
                 type="button"
-                aria-label="新窗口打开生成图片"
+                :aria-label="isVideoMedia ? '新窗口打开生成视频' : '新窗口打开生成图片'"
                 @click="openImageUrl"
               >
                 <el-icon><Link /></el-icon>
@@ -179,7 +183,16 @@
           </div>
         </div>
         <div class="image-preview-shell">
+          <video
+            v-if="isVideoMedia"
+            class="generated-video-preview"
+            :src="imagePreviewUrl"
+            controls
+            preload="metadata"
+            playsinline
+          ></video>
           <img
+            v-else
             class="generated-image-preview"
             :src="imagePreviewUrl"
             alt="异步任务生成图片"
@@ -247,6 +260,8 @@ const props = defineProps<{
   modelValue: boolean
   projectPublicId: string
   jobPublicId: string
+  /** 父批次任务类型，用于判定媒体产物按视频或图片展示。 */
+  jobTaskType?: string
   itemPublicId: string | null
   initialItem?: TaskItemResponse | null
 }>()
@@ -298,6 +313,9 @@ const outputCodeLanguage = computed(() => detectCodeLanguage(outputCopyText.valu
 const outputCodeMarkdown = computed(() => toCodeMarkdown(outputCopyText.value, outputCodeLanguage.value))
 
 const imagePreviewUrl = computed(() => item.value?.mediaUrl || '')
+
+/** 视频类批次（如 storyboard.shot_video）的媒体产物用 video 播放器展示。 */
+const isVideoMedia = computed(() => (props.jobTaskType || '').toLowerCase().includes('video'))
 
 const promptCopied = computed(() => copiedLabel.value === '任务提示词')
 
@@ -1098,6 +1116,17 @@ onBeforeUnmount(clearCopyState)
   object-fit: contain;
   border-radius: 8px;
   cursor: zoom-in;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
+}
+
+/* 视频类任务产物：原生播放器直接预览，尺寸约束与图片一致。 */
+.generated-video-preview {
+  display: block;
+  width: 100%;
+  max-height: calc(min(58vh, 520px) - 24px);
+  object-fit: contain;
+  border-radius: 8px;
+  background: #000;
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
 }
 </style>

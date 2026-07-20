@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",
+    "@webav/av-cliper": "^1.2.8",
     "axios": "^1.15.2",
     "element-plus": "^2.13.7",
     "mammoth": "^1.12.0",

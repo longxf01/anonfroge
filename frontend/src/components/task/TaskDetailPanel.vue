@@ -138,6 +138,7 @@
       v-model="itemDialogVisible"
       :project-public-id="projectPublicId"
       :job-public-id="jobPublicId"
+      :job-task-type="job?.taskType || ''"
       :item-public-id="openItemId"
       :initial-item="openItem"
     />
