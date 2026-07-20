@@ -11,12 +11,16 @@ from app.routers.base import BaseView, route
 from app.schemas.storyboard import (
     StoryboardGenerateRequest,
     StoryboardGenerateResult,
+    StoryboardGridImageRequest,
     StoryboardShotRead,
     StoryboardShotUpdate,
+    StoryboardShotVideoRequest,
 )
 from app.schemas.tasks import TaskJobDetail
 from app.services import project as project_service
+from app.services import shot_video as shot_video_service
 from app.services import storyboard as storyboard_service
+from app.services import storyboard_image as storyboard_image_service
 from app.services import tasks as task_service
 
 
@@ -29,7 +33,7 @@ STORYBOARD_ROUTE_MIDDLEWARES = [
 
 
 class StoryboardView(BaseView):
-    """Production storyboard workbench APIs."""
+    """分镜工作台的路由类"""
 
     router_prefix = "/projects/{project_public_id}/storyboards"
     router_tags = ["storyboard"]
@@ -80,6 +84,7 @@ class StoryboardView(BaseView):
                 current_user_public_id,
                 model_id=payload.model_id,
                 episode_public_ids=payload.episode_public_ids or None,
+                shot_public_ids=payload.shot_public_ids or None,
                 art_style=payload.art_style,
                 director_style=payload.director_style,
             )
@@ -91,6 +96,85 @@ class StoryboardView(BaseView):
             await session.rollback()
             self._raise_as_http(exc)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="分镜生成任务提交失败")
+
+    @route(
+        "/images/generate",
+        methods=["POST"],
+        response_model=TaskJobDetail,
+        status_code=status.HTTP_202_ACCEPTED,
+        middlewares=STORYBOARD_ROUTE_MIDDLEWARES,
+        summary="提交宫格分镜图生成任务",
+        description="按镜头顺序把选中镜头打包成宫格分镜图，每个画格对应一个不同分镜镜头，并裁切画格回写到对应镜头。",
+    )
+    async def generate_storyboard_grid_images(
+        self,
+        project_public_id: str,
+        payload: StoryboardGridImageRequest,
+        request: Request,
+        session: SessionDep,
+    ) -> TaskJobDetail:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            return await storyboard_image_service.submit_grid_image_task(
+                session,
+                project_public_id,
+                current_user_public_id,
+                grid_size=payload.grid_size,
+                image_size=payload.image_size,
+                episode_public_ids=payload.episode_public_ids or None,
+                shot_public_ids=payload.shot_public_ids or None,
+                only_missing=payload.only_missing,
+                model_id=payload.model_id,
+            )
+        except (
+            project_service.ProjectServiceError,
+            storyboard_service.StoryboardServiceError,
+            task_service.TaskServiceError,
+        ) as exc:
+            await session.rollback()
+            self._raise_as_http(exc)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="宫格分镜图任务提交失败")
+
+    @route(
+        "/videos/generate",
+        methods=["POST"],
+        response_model=TaskJobDetail,
+        status_code=status.HTTP_202_ACCEPTED,
+        middlewares=STORYBOARD_ROUTE_MIDDLEWARES,
+        summary="提交镜头视频生成任务",
+        description="以镜头分镜图为首帧做图生视频，每镜一个子项；默认仅为尚无选定视频的镜头生成，重复提交形成候选供择优。",
+    )
+    async def generate_storyboard_shot_videos(
+        self,
+        project_public_id: str,
+        payload: StoryboardShotVideoRequest,
+        request: Request,
+        session: SessionDep,
+    ) -> TaskJobDetail:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            return await shot_video_service.submit_shot_video_task(
+                session,
+                project_public_id,
+                current_user_public_id,
+                episode_public_ids=payload.episode_public_ids or None,
+                shot_public_ids=payload.shot_public_ids or None,
+                only_missing=payload.only_missing,
+                generate_audio=payload.generate_audio,
+                resolution=payload.resolution,
+                ratio=payload.ratio,
+                model_id=payload.model_id,
+                duration_seconds=payload.duration_seconds,
+                quantity=payload.quantity,
+            )
+        except (
+            project_service.ProjectServiceError,
+            storyboard_service.StoryboardServiceError,
+            task_service.TaskServiceError,
+        ) as exc:
+            await session.rollback()
+            self._raise_as_http(exc)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="镜头视频任务提交失败")
 
     @route(
         "/generate-sync",

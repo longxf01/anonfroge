@@ -90,10 +90,14 @@ export const getScriptPlanApi = (projectPublicId: string, planPublicId: string) 
   )
 )
 
-export const syncScriptPlanApi = (projectPublicId: string, title = '') => (
+export const syncScriptPlanApi = (
+  projectPublicId: string,
+  scriptContent: string,
+  title = '',
+) => (
   request.post<ScriptPlanDetail>(
     `${projectScriptPath(projectPublicId)}/sync`,
-    { title },
+    { title, scriptContent },
     { timeout: 60000 },
   )
 )

@@ -136,6 +136,7 @@ class ScriptView(BaseView):
                 project_public_id,
                 current_user_public_id,
                 title=payload.title,
+                script_content=payload.script_content,
             )
             await session.commit()
             plan, episodes = await script_service.get_plan_detail(

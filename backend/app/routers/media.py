@@ -99,6 +99,35 @@ class MediaView(BaseView):
         return Response(content=data, media_type=mime_type)
 
     @route(
+        "/{media_public_id}/select",
+        methods=["POST"],
+        response_model=MediaAssetRead,
+        middlewares=MEDIA_ROUTE_MIDDLEWARES,
+        summary="择优选定候选媒体",
+        description="把候选媒体设为其挂靠对象的选定媒体（final），同对象同类型的其他选定自动降级为普通候选。",
+    )
+    async def select_media(
+        self,
+        project_public_id: str,
+        media_public_id: str,
+        request: Request,
+        session: SessionDep,
+    ) -> MediaAssetRead:
+        current_user_public_id = self._current_user_public_id(request)
+        try:
+            media = await media_service.select_media_as_final(
+                session,
+                project_public_id,
+                current_user_public_id,
+                media_public_id=media_public_id,
+            )
+            await session.commit()
+        except (project_service.ProjectServiceError, media_service.MediaServiceError) as exc:
+            await session.rollback()
+            self._raise_as_http(exc)
+        return MediaAssetRead.model_validate(media)
+
+    @route(
         "",
         methods=["GET"],
         response_model=list[MediaAssetRead],

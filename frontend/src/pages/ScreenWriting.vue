@@ -421,7 +421,7 @@ const syncToScriptManage = async () => {
   }
   isSyncingScript.value = true
   try {
-    const { data } = await syncScriptPlanApi(projectPublicId.value)
+    const { data } = await syncScriptPlanApi(projectPublicId.value, workspace.value.script)
     ElMessage.success(`已同步到剧本管理：${data.episodes.length} 集`)
     router.push({ path: '/script', query: { projectId: projectPublicId.value, planId: data.publicId } })
   } catch (error) {

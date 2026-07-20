@@ -19,6 +19,7 @@ class ScriptSyncPayload(BaseModel):
     model_config = WRITE_SCHEMA_CONFIG
 
     title: str = Field(default="", max_length=200)
+    script_content: str = Field(default="", description="页面当前展示的剧本正文；留空时读取持久化工作区。")
 
 
 class ScriptPlanCreate(BaseModel):

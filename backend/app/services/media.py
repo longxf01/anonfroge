@@ -323,6 +323,77 @@ def _dedupe_text_list(values: list[str] | None) -> list[str]:
     return result
 
 
+def _image_dimensions(data: bytes) -> tuple[int, int]:
+    """读取图片字节的真实像素尺寸。"""
+
+    try:
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover - 取决于部署环境依赖
+        raise MediaServiceError("图片尺寸校验需要安装 pillow 依赖", retryable=False) from exc
+    try:
+        with Image.open(BytesIO(data)) as image:
+            width, height = image.size
+    except (OSError, ValueError) as exc:
+        raise MediaServiceError("参考图无法解析或文件已损坏", retryable=False) from exc
+    if width <= 0 or height <= 0:
+        raise MediaServiceError("参考图像素尺寸无效", retryable=False)
+    return int(width), int(height)
+
+
+def _normalize_image_payload(payload: dict[str, Any], *, width: int, height: int) -> dict[str, Any]:
+    """把首尾帧按目标像素居中裁切，并返回不修改原对象的新载荷。"""
+
+    target_width = int(width or 0)
+    target_height = int(height or 0)
+    if target_width <= 0 or target_height <= 0:
+        raise MediaServiceError("目标视频像素尺寸无效", retryable=False)
+    raw_data = payload.get("data")
+    if not isinstance(raw_data, (bytes, bytearray)) or not raw_data:
+        raise MediaServiceError("参考图内容为空", retryable=False)
+    data = bytes(raw_data)
+    source_width, source_height = _image_dimensions(data)
+    normalized = dict(payload)
+    normalized.update(
+        {
+            "source_width": source_width,
+            "source_height": source_height,
+            "width": target_width,
+            "height": target_height,
+        }
+    )
+    if (source_width, source_height) == (target_width, target_height):
+        return normalized
+
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:  # pragma: no cover - 取决于部署环境依赖
+        raise MediaServiceError("首尾帧规格化需要安装 pillow 依赖", retryable=False) from exc
+    try:
+        with Image.open(BytesIO(data)) as image:
+            has_alpha = image.mode in {"RGBA", "LA"} or "transparency" in image.info
+            converted = image.convert("RGBA" if has_alpha else "RGB")
+            fitted = ImageOps.fit(
+                converted,
+                (target_width, target_height),
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+            buffer = BytesIO()
+            fitted.save(buffer, format="PNG")
+    except (OSError, ValueError) as exc:
+        raise MediaServiceError("首尾帧居中裁切失败", retryable=False) from exc
+
+    filename = str(payload.get("filename") or "frame").rsplit(".", 1)[0]
+    normalized.update(
+        {
+            "filename": f"{filename}.png",
+            "mime_type": "image/png",
+            "data": buffer.getvalue(),
+        }
+    )
+    return normalized
+
+
 # ---------------------------------------------------------------------------
 # 媒体行加载 / 列举 / 内容分发 / 缩略图 / 删除
 # ---------------------------------------------------------------------------
@@ -349,6 +420,44 @@ async def get_media_asset(
 
     project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
     return await _load_media_or_raise(session, int(project.id), user_public_id, media_public_id)
+
+
+async def select_media_as_final(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    *,
+    media_public_id: str,
+) -> MediaAsset:
+    """把候选媒体择优设为选定：同挂靠对象同类型的其他选定媒体自动降级为普通生成。"""
+
+    project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    media = await _load_media_or_raise(session, int(project.id), user_public_id, media_public_id)
+    if media.status != MEDIA_STATUS_READY:
+        raise MediaServiceError("仅就绪状态的媒体可设为选定", retryable=False)
+    if not media.scope_type.strip() or not media.scope_public_id.strip():
+        raise MediaServiceError("仅挂靠业务对象的媒体可参与择优选定", retryable=False)
+
+    siblings = (
+        await session.exec(
+            select(MediaAsset).where(
+                MediaAsset.project_id == int(project.id),
+                MediaAsset.scope_type == media.scope_type,
+                MediaAsset.scope_public_id == media.scope_public_id,
+                MediaAsset.media_type == media.media_type,
+                MediaAsset.media_role == MEDIA_ROLE_FINAL,
+                MediaAsset.id != media.id,
+                MediaAsset.disabled_at.is_(None),
+            )
+        )
+    ).all()
+    for sibling in siblings:
+        sibling.media_role = MEDIA_ROLE_GENERATED
+        session.add(sibling)
+    media.media_role = MEDIA_ROLE_FINAL
+    session.add(media)
+    await session.flush()
+    return media
 
 
 async def list_media_assets(
@@ -552,6 +661,7 @@ async def upload_media(
     max_bytes = _UPLOAD_MAX_BYTES[resolved_type]
     if len(data) > max_bytes:
         raise MediaServiceError(f"文件过大，最大支持 {_UPLOAD_MAX_LABEL[resolved_type]}")
+    image_width, image_height = _image_dimensions(data) if resolved_type == MEDIA_TYPE_IMAGE else (0, 0)
 
     project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
     media = MediaAsset(
@@ -564,6 +674,8 @@ async def upload_media(
         scope_public_id=scope_public_id.strip(),
         media_role=(media_role or MEDIA_ROLE_REFERENCE).strip() or MEDIA_ROLE_REFERENCE,
         mime_type=mime_type or _DEFAULT_MIME_BY_TYPE[resolved_type],
+        width=image_width,
+        height=image_height,
         params=_dump_params({"filename": filename}),
     )
     session.add(media)
@@ -609,12 +721,35 @@ async def _load_media_file_payload(
         raise MediaNotFoundError("参考图文件不存在") from exc
     if not data:
         raise MediaServiceError("参考图内容为空", retryable=False)
+    width, height = _image_dimensions(data)
     return {
         "media_public_id": media.public_id,
         "filename": media.storage_key.rsplit("/", 1)[-1],
         "mime_type": mime_type,
         "data": data,
+        "width": width,
+        "height": height,
     }
+
+
+async def get_image_media_dimensions(
+    session: AsyncSession,
+    project_public_id: str,
+    user_public_id: str,
+    *,
+    media_public_id: str,
+) -> tuple[int, int]:
+    """读取项目内一张就绪图片的真实像素尺寸。"""
+
+    project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    payload = await _load_media_file_payload(
+        session,
+        project_id=int(project.id),
+        user_public_id=user_public_id,
+        media_public_id=media_public_id,
+        storage=get_media_storage(),
+    )
+    return int(payload["width"]), int(payload["height"])
 
 
 async def generate_video_media(
@@ -628,6 +763,9 @@ async def generate_video_media(
     first_frame_media_public_id: str = "",
     last_frame_media_public_id: str = "",
     reference_media_public_ids: list[str] | None = None,
+    expected_width: int = 0,
+    expected_height: int = 0,
+    generation_mode: str = "",
     scope_type: str = "",
     scope_public_id: str = "",
     media_role: str = MEDIA_ROLE_GENERATED,
@@ -657,6 +795,10 @@ async def generate_video_media(
 
     storage = get_media_storage()
     generation_params = dict(params or {})
+    target_width = int(expected_width or 0)
+    target_height = int(expected_height or 0)
+    if (target_width <= 0) != (target_height <= 0):
+        raise MediaServiceError("目标视频宽高必须同时提供", retryable=False)
     reference_ids = _dedupe_text_list(reference_media_public_ids)[:_VIDEO_REFERENCE_MAX_COUNT]
     first_frame_id = (first_frame_media_public_id or "").strip()
     last_frame_id = (last_frame_media_public_id or "").strip()
@@ -691,14 +833,29 @@ async def generate_video_media(
                 storage=storage,
             )
         )
+    if target_width > 0 and target_height > 0:
+        if first_frame is not None:
+            first_frame = _normalize_image_payload(first_frame, width=target_width, height=target_height)
+        if last_frame is not None:
+            last_frame = _normalize_image_payload(last_frame, width=target_width, height=target_height)
     if first_frame_id or last_frame_id or reference_ids:
         timing.mark("frame_media", stage_started_at)
 
+    source_payload = first_frame or (references[0] if references else last_frame)
+    source_width = int(source_payload.get("source_width") or source_payload.get("width") or 0) if source_payload else 0
+    source_height = (
+        int(source_payload.get("source_height") or source_payload.get("height") or 0) if source_payload else 0
+    )
     persisted_params = {
         **generation_params,
         "first_frame_media_public_id": first_frame_id,
         "last_frame_media_public_id": last_frame_id,
         "reference_media_public_ids": reference_ids,
+        "generation_mode": (generation_mode or "").strip(),
+        "source_width": source_width,
+        "source_height": source_height,
+        "expected_width": target_width,
+        "expected_height": target_height,
     }
     media = MediaAsset(
         project_id=int(project.id),
@@ -735,6 +892,14 @@ async def generate_video_media(
             **gen_kwargs,
         )
         timing.mark("video_model", stage_started_at)
+        if target_width > 0 and target_height > 0 and (output.width, output.height) != (
+            target_width,
+            target_height,
+        ):
+            raise MediaServiceError(
+                "生成视频尺寸与正式分镜图不一致："
+                f"期望 {target_width}x{target_height}，实际 {int(output.width or 0)}x{int(output.height or 0)}"
+            )
         stage_started_at = perf_counter()
         data = await _resolve_media_bytes(output, timeout=_generation_timeout_for(MEDIA_TYPE_VIDEO))
         timing.mark("media_bytes", stage_started_at)
@@ -972,10 +1137,10 @@ def _build_derivative_edit_prompt(prompt: str, *, asset: Asset, reference_count:
 
 
 def _image_edit_parameters_for_model(model_id: str) -> dict[str, Any]:
-    """返回当前模型适用的图片编辑增强参数。"""
+    """返回当前模型适用的图片编辑增强参数；仅 GPT Image 1 系列需要显式高保真。"""
 
     normalized = (model_id or "").strip().lower()
-    if normalized == "gpt-image-1" or normalized.startswith("gpt-image-1-") or normalized.startswith("gpt-image-1."):
+    if normalized == "gpt-image-1" or normalized.startswith(("gpt-image-1-", "gpt-image-1.")):
         return {"input_fidelity": "high"}
     return {}
 
@@ -1219,8 +1384,9 @@ async def _latest_asset_image_media_public_ids(
     project_id: int,
     user_public_id: str,
     asset_public_id: str,
+    limit: int = 1,
 ) -> list[str]:
-    """取指定资产可作为编辑参考的图片媒体，封面优先，其次最近生成图。"""
+    """取指定资产可作为编辑参考的图片媒体，封面优先，其次最近生成图，最多 limit 张。"""
 
     rows = (
         await session.exec(
@@ -1241,7 +1407,8 @@ async def _latest_asset_image_media_public_ids(
     if not rows:
         return []
     cover = next((media for media in rows if media.media_role == MEDIA_ROLE_FINAL), None)
-    return [(cover or rows[0]).public_id]
+    ordered = ([cover] if cover else []) + [media for media in rows if media is not cover]
+    return [media.public_id for media in ordered[: max(limit, 1)]]
 
 
 async def upload_asset_reference_image(

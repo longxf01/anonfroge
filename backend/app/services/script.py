@@ -10,7 +10,7 @@ import io
 import json
 import re
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from uuid import uuid4
 
@@ -26,6 +26,7 @@ from app.services.screenwriting.state import (
     acquire_session_lock,
     build_session_isolation_key,
     load_chat_session_state,
+    persist_session_state,
 )
 from app.utils.time_tools import utc_now
 
@@ -189,15 +190,22 @@ async def sync_current_workspace(
     user_public_id: str,
     *,
     title: str = "",
+    script_content: str = "",
 ) -> ScriptPlan:
     """加载当前剧本创作会话，把剧本工作区同步为剧本计划。
 
     标题缺省时依次取：用户传入 > 项目名称 > 「未命名剧本」。
+    请求携带正文时以页面当前内容为准，兼容流式预览尚未持久化的场景。
     """
     project = await project_service.get_project_or_raise(session, project_public_id, user_public_id)
+    requested_script = script_content.strip()
     lock = await acquire_session_lock(project_public_id, user_public_id)
     async with lock:
         state = await load_chat_session_state(session, project, project_public_id, user_public_id)
+        if requested_script and requested_script != state.workspace.script:
+            state.workspace = replace(state.workspace, script=requested_script)
+            state.active_tab = "script"
+            await persist_session_state(session, project_id=int(project.id or 0), state=state)
     config = state.workflow.get(WORKFLOW_PROJECT_CONFIG)
     config = dict(config) if isinstance(config, dict) else {}
     resolved_title = title.strip() or str(getattr(project, "name", "") or "").strip() or "未命名剧本"
@@ -205,7 +213,7 @@ async def sync_current_workspace(
         session,
         project_public_id,
         user_public_id,
-        script_content=state.workspace.script,
+        script_content=requested_script or state.workspace.script,
         title=resolved_title,
         config=config,
     )
